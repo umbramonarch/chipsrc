@@ -1,0 +1,24 @@
+{
+  "name": "chipsrc",
+  "version": "1.0.0",
+  "description": "Agent Code Intelligence CLI and plugin for firmware and software repositories (C, C++, Rust, Python, TypeScript, JavaScript): zero-LLM Tree-sitter AST indexing, module signature skeletons, and 1-turn symbol, type, call-graph, macro, and hardware cross-reference queries.",
+  "license": "MIT",
+  "author": {
+    "name": "umbramonarch",
+    "url": "https://github.com/umbramonarch"
+  },
+  "homepage": "https://github.com/umbramonarch/chipsrc",
+  "repository": "https://github.com/umbramonarch/chipsrc",
+  "keywords": [
+    "ast",
+    "call-graph",
+    "chipsrc",
+    "code-intelligence",
+    "embedded",
+    "firmware",
+    "knowledge-graph",
+    "rust",
+    "skill",
+    "tree-sitter"
+  ]
+}

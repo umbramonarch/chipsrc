@@ -1,0 +1,15 @@
+{
+  "name": "chipsrc",
+  "owner": {
+    "name": "umbramonarch",
+    "url": "https://github.com/umbramonarch"
+  },
+  "description": "Agent Code Intelligence CLI and skill for querying firmware and software repositories with minimal token usage.",
+  "plugins": [
+    {
+      "name": "chipsrc",
+      "source": "./",
+      "description": "CLI + Skill plugin that converts C, C++, Rust, Python, TypeScript, and JavaScript repositories into Hierarchical Agent Codebase Bundles and gives coding agents 1-turn symbol, type, call-graph, macro, and cross-reference queries."
+    }
+  ]
+}
