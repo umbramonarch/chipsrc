@@ -1,0 +1,20 @@
+# Rust / Cargo build artifacts
+/target/
+**/*.rs.bk
+
+# Python bytecode cache (hooks / scripts)
+__pycache__/
+*.py[cod]
+
+# Generated output directories
+/output/
+/out/
+
+# Environment & IDE
+.env
+.vscode/
+.idea/
+*.swp
+*.log
+.DS_Store
+Thumbs.db

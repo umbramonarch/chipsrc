@@ -1,0 +1,27 @@
+[package]
+name = "chipsrc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Core Tree-sitter AST indexing, call-graph extraction, cross-reference graph, and bundle emission library"
+
+[dependencies]
+blake3.workspace = true
+ignore.workspace = true
+memchr.workspace = true
+rayon.workspace = true
+regex.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tree-sitter.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-language.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true

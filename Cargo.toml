@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/chipsrc-core",
+    "crates/chipsrc-cli",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["anas.alshaer"]
+repository = "https://github.com/umbramonarch/chipsrc"
+description = "Convert firmware and software repositories into queryable Hierarchical Agent Codebase Bundles"
+
+[workspace.dependencies]
+anyhow = "1.0"
+blake3 = "1.8"
+clap = { version = "4.5", features = ["derive"] }
+ignore = "0.4.23"
+memchr = "2.7"
+rayon = "1.10"
+regex = "1.11"
+rustc-hash = "2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tree-sitter = "0.25.10"
+tree-sitter-language = "0.1"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-rust = "0.24.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-javascript = "0.25.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
