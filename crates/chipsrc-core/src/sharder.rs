@@ -56,20 +56,31 @@ pub fn build_section_shards(
                 units: Vec::new(),
             });
 
-        // If any file in the group is FirstParty, promote group scope & layer accordingly
-        if scope_sort_order(unit.scanned.scope) < scope_sort_order(entry.scope) {
-            entry.scope = unit.scanned.scope;
-            entry.arch_layer = unit.scanned.arch_layer;
-            let (_, new_title, new_mod) = derive_unit_shard_meta(unit);
-            entry.title = new_title;
-            entry.module_path = new_mod;
-        } else if unit.scanned.scope == entry.scope
-            && layer_sort_order(unit.scanned.arch_layer) < layer_sort_order(entry.arch_layer)
-        {
-            entry.arch_layer = unit.scanned.arch_layer;
-        }
-
         entry.units.push(unit);
+    }
+
+    // Resolve each shard group's dominant ownership scope from ALL of its files, so a single
+    // first-party file can never mask a majority-vendor module (and vice versa).
+    for group in group_map.values_mut() {
+        let scope = dominant_group_scope(&group.units, &group.module_path);
+        group.scope = scope;
+        group.arch_layer = if scope == FileScope::VendorSdk {
+            ArchLayer::VendorHal
+        } else {
+            group
+                .units
+                .iter()
+                .filter(|u| u.scanned.scope == scope)
+                .map(|u| u.scanned.arch_layer)
+                .min_by_key(|layer| layer_sort_order(*layer))
+                .unwrap_or(ArchLayer::Other)
+        };
+        let layer_str = group.arch_layer.as_str();
+        group.title = if group.module_path == "root" {
+            format!("Root Module ({layer_str})")
+        } else {
+            format!("{} ({layer_str})", group.module_path)
+        };
     }
 
     let active_vendor_set: FxHashSet<&str> = vendor_surface
@@ -90,25 +101,24 @@ pub fn build_section_shards(
         .map(|s| s.as_str())
         .collect();
 
-    // Filter or keep vendor groups when vendor_mode == VendorMode::Active
+    // Filter or keep vendor groups according to the requested vendor mode. In
+    // `VendorMode::Active` a vendor shard survives ONLY when first-party code actually
+    // references one of its headers, symbols, types, or macros.
     let has_non_vendor = group_map.values().any(|g| g.scope != FileScope::VendorSdk);
 
     let mut groups: Vec<RawShardGroup<'_>> = group_map
         .into_values()
         .filter(|g| {
-            if g.scope != FileScope::VendorSdk || vendor_mode == VendorMode::All || !has_non_vendor
-            {
+            if g.scope != FileScope::VendorSdk || !has_non_vendor {
                 return true;
             }
-            if vendor_mode == VendorMode::None {
-                return false;
+            match vendor_mode {
+                VendorMode::All => true,
+                VendorMode::None => false,
+                VendorMode::Active => {
+                    group_has_active_vendor_refs(g, &active_vendor_set, &active_header_set)
+                }
             }
-            // In VendorMode::Active, keep vendor shard if it has active symbols/MMIO/headers,
-            // or keep it as a compact summary shard if it defines symbols/macros
-            group_has_active_vendor_refs(g, &active_vendor_set, &active_header_set)
-                || g.units
-                    .iter()
-                    .any(|u| !u.symbols.is_empty() || !u.types.is_empty() || !u.macros.is_empty())
         })
         .collect();
 
@@ -224,6 +234,17 @@ pub fn build_section_shards(
         let section_id = format!("{:02}-{clean_slug}", idx + 1);
         let md_file = format!("{section_id}.md");
 
+        // A vendor shard rendered under `VendorMode::Active` is compacted down to the active
+        // hardware/SDK surface actually referenced by first-party code.
+        let compact_vendor = vendor_mode == VendorMode::Active
+            && has_non_vendor
+            && group.scope == FileScope::VendorSdk;
+        if compact_vendor {
+            group.units.retain(|u| {
+                unit_is_active_vendor_surface(u, &active_vendor_set, &active_header_set)
+            });
+        }
+
         group
             .units
             .sort_by(|a, b| a.scanned.rel_path.cmp(&b.scanned.rel_path));
@@ -280,6 +301,21 @@ pub fn build_section_shards(
                 .then_with(|| a.name.cmp(&b.name))
         });
 
+        // In `VendorMode::Active`, keep only vendor definitions that first-party code actually
+        // references; when nothing in a category is active, the full list is retained and the
+        // renderer caps it instead.
+        if compact_vendor {
+            shard_symbols = filter_active_vendor_items(shard_symbols, |rs: &RankedSymbol| {
+                active_vendor_set.contains(rs.symbol.name.as_str()) || rs.in_degree > 0
+            });
+            shard_types = filter_active_vendor_items(shard_types, |t: &ExtractedType| {
+                active_vendor_set.contains(t.name.as_str())
+            });
+            shard_macros = filter_active_vendor_items(shard_macros, |m: &ExtractedMacro| {
+                active_vendor_set.contains(m.name.as_str())
+            });
+        }
+
         let depends_on_sections: Vec<String> = depends_on_map
             .remove(&section_id)
             .map(|s| s.into_iter().collect())
@@ -300,7 +336,7 @@ pub fn build_section_shards(
             &depended_by_sections,
             &callees_by_caller,
             &active_vendor_set,
-            vendor_mode,
+            compact_vendor,
         );
 
         let token_estimate = markdown_body.len().div_ceil(4);
@@ -344,7 +380,7 @@ fn render_shard_markdown(
     depended_by_sections: &[String],
     callees_by_caller: &FxHashMap<&str, Vec<&str>>,
     active_vendor_set: &FxHashSet<&str>,
-    vendor_mode: VendorMode,
+    compact_vendor: bool,
 ) -> String {
     let mut lines: Vec<String> = Vec::with_capacity(128);
     let arch_layer_str = group.arch_layer.as_str();
@@ -424,12 +460,7 @@ fn render_shard_markdown(
     if shard_types.is_empty() {
         lines.push("_No types defined in this module._".to_string());
     } else {
-        let max_types = if group.scope == FileScope::VendorSdk && vendor_mode == VendorMode::Active
-        {
-            40
-        } else {
-            usize::MAX
-        };
+        let max_types = if compact_vendor { 40 } else { usize::MAX };
         for t in shard_types.iter().take(max_types) {
             let fields = if t.fields_summary.is_empty() {
                 "-".to_string()
@@ -502,23 +533,22 @@ fn render_shard_markdown(
     if shard_symbols.is_empty() {
         lines.push("_No functions or methods defined in this module._".to_string());
     } else {
-        let display_symbols: Vec<&RankedSymbol> =
-            if group.scope == FileScope::VendorSdk && vendor_mode == VendorMode::Active {
-                let active_only: Vec<&RankedSymbol> = shard_symbols
-                    .iter()
-                    .copied()
-                    .filter(|rs| {
-                        active_vendor_set.contains(rs.symbol.name.as_str()) || rs.in_degree > 0
-                    })
-                    .collect();
-                if active_only.is_empty() {
-                    shard_symbols.iter().copied().take(30).collect()
-                } else {
-                    active_only
-                }
+        let display_symbols: Vec<&RankedSymbol> = if compact_vendor {
+            let active_only: Vec<&RankedSymbol> = shard_symbols
+                .iter()
+                .copied()
+                .filter(|rs| {
+                    active_vendor_set.contains(rs.symbol.name.as_str()) || rs.in_degree > 0
+                })
+                .collect();
+            if active_only.is_empty() {
+                shard_symbols.iter().copied().take(30).collect()
             } else {
-                shard_symbols.to_vec()
-            };
+                active_only
+            }
+        } else {
+            shard_symbols.to_vec()
+        };
 
         for rs in &display_symbols {
             let s = &rs.symbol;
@@ -580,38 +610,94 @@ fn render_shard_markdown(
     lines.join("\n")
 }
 
+/// Resolves a shard group's dominant ownership scope from all of its files and its module path.
+///
+/// A group is `VendorSdk` when more than half of its files are vendor-owned OR when its module
+/// path itself resolves to a vendor SDK component. Otherwise the majority scope wins, with
+/// first-party ownership preferred on ties so test-only shards stay separated.
+fn dominant_group_scope(units: &[&ParsedFileUnit], module_path: &str) -> FileScope {
+    let total = units.len();
+    if total == 0 {
+        return FileScope::FirstParty;
+    }
+
+    let vendor_count = units
+        .iter()
+        .filter(|u| u.scanned.scope == FileScope::VendorSdk)
+        .count();
+    if vendor_count * 2 > total || crate::scanner::path_is_vendor_owned(module_path) {
+        return FileScope::VendorSdk;
+    }
+
+    let first_party_count = units
+        .iter()
+        .filter(|u| u.scanned.scope == FileScope::FirstParty)
+        .count();
+    let test_count = units
+        .iter()
+        .filter(|u| u.scanned.scope == FileScope::Test)
+        .count();
+    if first_party_count == 0 && test_count > 0 {
+        FileScope::Test
+    } else {
+        FileScope::FirstParty
+    }
+}
+
+/// Returns `true` when a vendor file participates in the active hardware/SDK surface referenced
+/// by first-party code (via an active header, symbol, type, or macro).
+fn unit_is_active_vendor_surface(
+    unit: &ParsedFileUnit,
+    active_vendor_set: &FxHashSet<&str>,
+    active_header_set: &FxHashSet<&str>,
+) -> bool {
+    if active_header_set
+        .iter()
+        .any(|h| unit.scanned.rel_path.ends_with(h))
+    {
+        return true;
+    }
+    unit.symbols
+        .iter()
+        .any(|s| active_vendor_set.contains(s.name.as_str()))
+        || unit
+            .types
+            .iter()
+            .any(|t| active_vendor_set.contains(t.name.as_str()))
+        || unit
+            .macros
+            .iter()
+            .any(|m| active_vendor_set.contains(m.name.as_str()))
+}
+
+/// Keeps only the items referenced by first-party code. When nothing in the list is active the
+/// original (deterministically sorted) list is returned so the renderer can cap it instead of
+/// emitting an empty category.
+fn filter_active_vendor_items<T, F>(items: Vec<&T>, is_active: F) -> Vec<&T>
+where
+    F: Fn(&T) -> bool,
+{
+    let active: Vec<&T> = items
+        .iter()
+        .copied()
+        .filter(|item| is_active(item))
+        .collect();
+    if active.is_empty() {
+        items
+    } else {
+        active
+    }
+}
+
 fn group_has_active_vendor_refs(
     group: &RawShardGroup<'_>,
     active_vendor_set: &FxHashSet<&str>,
     active_header_set: &FxHashSet<&str>,
 ) -> bool {
-    for u in &group.units {
-        if active_header_set
-            .iter()
-            .any(|h| u.scanned.rel_path.ends_with(h))
-        {
-            return true;
-        }
-        if u.symbols
-            .iter()
-            .any(|s| active_vendor_set.contains(s.name.as_str()))
-        {
-            return true;
-        }
-        if u.types
-            .iter()
-            .any(|t| active_vendor_set.contains(t.name.as_str()))
-        {
-            return true;
-        }
-        if u.macros
-            .iter()
-            .any(|m| active_vendor_set.contains(m.name.as_str()))
-        {
-            return true;
-        }
-    }
-    false
+    group
+        .units
+        .iter()
+        .any(|u| unit_is_active_vendor_surface(u, active_vendor_set, active_header_set))
 }
 
 fn derive_unit_shard_meta(unit: &ParsedFileUnit) -> (String, String, String) {
@@ -746,4 +832,309 @@ fn infer_repo_name(units: &[ParsedFileUnit]) -> String {
 
 fn escape_yaml(val: &str) -> String {
     val.replace('\\', "/").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{
+        ExtractedSymbol, LanguageKind, ScannedFile, SymbolKind, TypeKind, Visibility,
+    };
+    use std::path::PathBuf;
+
+    fn make_unit(rel_path: &str, scope: FileScope, arch_layer: ArchLayer) -> ParsedFileUnit {
+        ParsedFileUnit {
+            scanned: ScannedFile {
+                rel_path: rel_path.to_string(),
+                abs_path: PathBuf::from(rel_path),
+                language: LanguageKind::C,
+                scope,
+                arch_layer,
+                size_bytes: 128,
+                mtime_secs: 0,
+                blake3_hash: "0123456789abcdef".to_string(),
+                line_count: 16,
+            },
+            symbols: Vec::new(),
+            types: Vec::new(),
+            macros: Vec::new(),
+            imports: Vec::new(),
+            raw_calls: Vec::new(),
+            raw_xrefs: Vec::new(),
+            parse_errors: 0,
+        }
+    }
+
+    fn add_symbol(unit: &mut ParsedFileUnit, name: &str) {
+        unit.symbols.push(ExtractedSymbol {
+            symbol_id: format!("{}::{}", unit.scanned.rel_path, name),
+            name: name.to_string(),
+            qualified_name: name.to_string(),
+            kind: SymbolKind::Function,
+            visibility: Visibility::Public,
+            file: unit.scanned.rel_path.clone(),
+            start_line: 1,
+            end_line: 3,
+            signature: format!("void {name}(void)"),
+            doc_summary: String::new(),
+            enclosing_type: None,
+            scope: unit.scanned.scope,
+            arch_layer: unit.scanned.arch_layer,
+            section_id: String::new(),
+        });
+    }
+
+    fn add_type(unit: &mut ParsedFileUnit, name: &str) {
+        unit.types.push(ExtractedType {
+            type_id: format!("{}::{}", unit.scanned.rel_path, name),
+            name: name.to_string(),
+            kind: TypeKind::Struct,
+            visibility: Visibility::Public,
+            file: unit.scanned.rel_path.clone(),
+            start_line: 1,
+            end_line: 5,
+            fields_summary: "field: u32".to_string(),
+            doc_summary: String::new(),
+            scope: unit.scanned.scope,
+            arch_layer: unit.scanned.arch_layer,
+            section_id: String::new(),
+        });
+    }
+
+    fn add_macro(unit: &mut ParsedFileUnit, name: &str, kind: MacroKind) {
+        unit.macros.push(ExtractedMacro {
+            name: name.to_string(),
+            kind,
+            value_or_args: "0x1U".to_string(),
+            hex_addr: None,
+            file: unit.scanned.rel_path.clone(),
+            line: 2,
+            scope: unit.scanned.scope,
+            arch_layer: unit.scanned.arch_layer,
+            section_id: String::new(),
+            description: String::new(),
+        });
+    }
+
+    fn build(
+        units: &[ParsedFileUnit],
+        vendor_surface: &VendorSurfaceSummary,
+        vendor_mode: VendorMode,
+    ) -> (Vec<SectionSummary>, Vec<SectionShard>) {
+        let mut ranked_symbols: Vec<RankedSymbol> = units
+            .iter()
+            .flat_map(|u| u.symbols.iter().cloned())
+            .map(|symbol| RankedSymbol {
+                symbol,
+                pagerank: 0.5,
+                in_degree: 0,
+                out_degree: 0,
+                is_god_node: false,
+                is_entrypoint: false,
+                scc_id: None,
+            })
+            .collect();
+        let mut types: Vec<ExtractedType> =
+            units.iter().flat_map(|u| u.types.iter().cloned()).collect();
+        let mut macros: Vec<ExtractedMacro> = units
+            .iter()
+            .flat_map(|u| u.macros.iter().cloned())
+            .collect();
+        let mut calls: Vec<ResolvedCallEdge> = Vec::new();
+        let mut xrefs: Vec<XrefEntry> = Vec::new();
+
+        build_section_shards(
+            units,
+            &mut ranked_symbols,
+            &mut types,
+            &mut macros,
+            &mut calls,
+            &mut xrefs,
+            vendor_surface,
+            vendor_mode,
+        )
+    }
+
+    #[test]
+    fn test_majority_vendor_group_stays_vendor() {
+        let mut units = vec![
+            make_unit(
+                "fw/drvs/My_DriverLib/foo.c",
+                FileScope::VendorSdk,
+                ArchLayer::VendorHal,
+            ),
+            make_unit(
+                "fw/drvs/My_DriverLib/bar.c",
+                FileScope::VendorSdk,
+                ArchLayer::VendorHal,
+            ),
+            make_unit("fw/drvs/pwm.c", FileScope::FirstParty, ArchLayer::Drivers),
+        ];
+        add_symbol(&mut units[0], "driverlib_foo_init");
+
+        let surface = VendorSurfaceSummary::default();
+        let (summaries, shards) = build(&units, &surface, VendorMode::All);
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].module_path, "fw/drvs");
+        assert_eq!(summaries[0].scope, "vendor_sdk");
+        assert_eq!(summaries[0].arch_layer, "vendor_hal");
+        assert_eq!(summaries[0].title, "fw/drvs (vendor_hal)");
+        assert!(shards[0].markdown_body.contains("scope: \"vendor_sdk\""));
+    }
+
+    #[test]
+    fn test_minority_vendor_group_stays_first_party() {
+        let units = vec![
+            make_unit("fw/drvs/pwm.c", FileScope::FirstParty, ArchLayer::Drivers),
+            make_unit("fw/drvs/motor.c", FileScope::FirstParty, ArchLayer::Drivers),
+            make_unit(
+                "fw/drvs/register_map.c",
+                FileScope::VendorSdk,
+                ArchLayer::VendorHal,
+            ),
+        ];
+
+        let surface = VendorSurfaceSummary::default();
+        let (summaries, _) = build(&units, &surface, VendorMode::All);
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].scope, "first_party");
+        assert_eq!(summaries[0].arch_layer, "drvs");
+        assert_eq!(summaries[0].title, "fw/drvs (drvs)");
+    }
+
+    #[test]
+    fn test_vendor_module_path_forces_vendor_scope() {
+        // Even when the files were (mis)classified as first-party, a vendor module path wins.
+        let mut unit = make_unit(
+            "references/libs/STM32Cube/bar.c",
+            FileScope::FirstParty,
+            ArchLayer::Libs,
+        );
+        add_symbol(&mut unit, "cube_bar_init");
+
+        let surface = VendorSurfaceSummary::default();
+        let (summaries, _) = build(&[unit], &surface, VendorMode::All);
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].module_path, "references/libs");
+        assert_eq!(summaries[0].scope, "vendor_sdk");
+        assert_eq!(summaries[0].arch_layer, "vendor_hal");
+    }
+
+    #[test]
+    fn test_active_mode_drops_unreferenced_vendor_shards() {
+        let mut cmsis = make_unit(
+            "vendor/cmsis/device.h",
+            FileScope::VendorSdk,
+            ArchLayer::VendorHal,
+        );
+        add_symbol(&mut cmsis, "hal_enable");
+        add_symbol(&mut cmsis, "hal_never_used");
+        add_type(&mut cmsis, "TIM_TypeDef");
+        add_macro(&mut cmsis, "BUSY_FLAG", MacroKind::Bitmask);
+
+        let mut legacy = make_unit(
+            "vendor/legacy/old_drv.c",
+            FileScope::VendorSdk,
+            ArchLayer::VendorHal,
+        );
+        add_symbol(&mut legacy, "legacy_unused_init");
+
+        let mut app = make_unit("src/app/main.c", FileScope::FirstParty, ArchLayer::App);
+        add_symbol(&mut app, "app_main");
+
+        let units = vec![cmsis, legacy, app];
+        let surface = VendorSurfaceSummary {
+            total_vendor_files: 2,
+            total_vendor_symbols: 3,
+            active_vendor_symbols: vec!["hal_enable".to_string()],
+            active_mmio_registers: Vec::new(),
+            active_vendor_headers: Vec::new(),
+        };
+
+        let (active_summaries, active_shards) = build(&units, &surface, VendorMode::Active);
+        assert_eq!(active_summaries.len(), 2);
+        assert!(active_summaries
+            .iter()
+            .all(|s| s.module_path != "vendor/legacy"));
+
+        let cmsis_shard = active_shards
+            .iter()
+            .find(|s| s.summary.module_path == "vendor/cmsis")
+            .expect("active vendor shard kept");
+        assert!(cmsis_shard.markdown_body.contains("hal_enable"));
+        assert!(!cmsis_shard.markdown_body.contains("hal_never_used"));
+        assert_eq!(cmsis_shard.files, vec!["vendor/cmsis/device.h".to_string()]);
+
+        // `VendorMode::All` keeps every vendor shard with its full symbol surface.
+        let (all_summaries, all_shards) = build(&units, &surface, VendorMode::All);
+        assert_eq!(all_summaries.len(), 3);
+        let all_cmsis = all_shards
+            .iter()
+            .find(|s| s.summary.module_path == "vendor/cmsis")
+            .expect("vendor shard in all mode");
+        assert!(all_cmsis.markdown_body.contains("hal_never_used"));
+    }
+
+    #[test]
+    fn test_active_mode_keeps_vendor_shards_without_first_party_code() {
+        // A vendor-only repository must still produce shards in active mode.
+        let mut unit = make_unit(
+            "vendor/cmsis/device.h",
+            FileScope::VendorSdk,
+            ArchLayer::VendorHal,
+        );
+        add_symbol(&mut unit, "unused_hal");
+
+        let surface = VendorSurfaceSummary::default();
+        let (summaries, _) = build(&[unit], &surface, VendorMode::Active);
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].scope, "vendor_sdk");
+        assert_eq!(summaries[0].arch_layer, "vendor_hal");
+    }
+
+    #[test]
+    fn test_active_mode_compacts_units_to_active_surface() {
+        let mut active_header = make_unit(
+            "vendor/hal/active_reg.h",
+            FileScope::VendorSdk,
+            ArchLayer::VendorHal,
+        );
+        add_symbol(&mut active_header, "ACTIVE_REG_READ");
+
+        let mut idle_header = make_unit(
+            "vendor/hal/idle_reg.h",
+            FileScope::VendorSdk,
+            ArchLayer::VendorHal,
+        );
+        add_symbol(&mut idle_header, "IDLE_REG_READ");
+
+        let mut app = make_unit(
+            "src/drvs/motor.c",
+            FileScope::FirstParty,
+            ArchLayer::Drivers,
+        );
+        add_symbol(&mut app, "motor_step");
+
+        let units = vec![active_header, idle_header, app];
+        let surface = VendorSurfaceSummary {
+            total_vendor_files: 2,
+            total_vendor_symbols: 2,
+            active_vendor_symbols: vec!["ACTIVE_REG_READ".to_string()],
+            active_mmio_registers: Vec::new(),
+            active_vendor_headers: vec!["vendor/hal/active_reg.h".to_string()],
+        };
+
+        let (_, shards) = build(&units, &surface, VendorMode::Active);
+        let hal_shard = shards
+            .iter()
+            .find(|s| s.summary.module_path == "vendor/hal")
+            .expect("vendor/hal shard");
+        assert_eq!(hal_shard.files, vec!["vendor/hal/active_reg.h".to_string()]);
+        assert!(hal_shard.markdown_body.contains("ACTIVE_REG_READ"));
+        assert!(!hal_shard.markdown_body.contains("IDLE_REG_READ"));
+    }
 }

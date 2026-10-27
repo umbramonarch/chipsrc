@@ -78,7 +78,20 @@ pub fn parse_source_str(scanned: &ScannedFile, source: &str) -> Result<ParsedFil
         .set_language(&ts_lang)
         .map_err(|e| ChipsrcError::ParserConfig(e.to_string()))?;
 
-    let tree = parser.parse(source.as_bytes(), None).ok_or_else(|| {
+    // Tree-sitter parses un-preprocessed C/C++. Uppercase storage/qualifier macros written in
+    // front of declarations (`STATIC void f(void)`, `__STATIC_INLINE ...`) are therefore CST
+    // errors. Rewrite those standalone identifier tokens to same-byte-length valid C keywords
+    // so every node range still maps 1:1 onto the original `source` bytes.
+    let normalized_source = match scanned.language {
+        LanguageKind::C | LanguageKind::Cpp => normalize_c_qualifier_macros(source),
+        _ => None,
+    };
+    let parse_bytes: &[u8] = match normalized_source.as_deref() {
+        Some(bytes) => bytes,
+        None => source.as_bytes(),
+    };
+
+    let tree = parser.parse(parse_bytes, None).ok_or_else(|| {
         ChipsrcError::ParserConfig(format!(
             "Tree-sitter returned None for {}",
             scanned.rel_path
@@ -194,6 +207,180 @@ fn is_c_or_cpp_header(rel_path: &str) -> bool {
         || lower.ends_with(".hh")
         || lower.ends_with(".hxx")
         || lower.ends_with(".inl")
+}
+
+/// Standalone uppercase storage-class / qualifier macros that routinely precede declarations in
+/// C and C++ firmware/SDK code, paired with an **exactly same-byte-length** valid-C replacement.
+///
+/// Rewriting them before Tree-sitter parsing removes false `ERROR` nodes (which otherwise inflate
+/// `parse_errors` and hide `static` visibility) while keeping every byte offset, line, and column
+/// produced by the parser identical to the original source.
+const C_QUALIFIER_NORMALIZATIONS: &[(&str, &str)] = &[
+    ("__STATIC_FORCEINLINE", "static inline       "),
+    ("__STATIC_INLINE", "static inline  "),
+    ("SYSCONFIG_WEAK", "              "),
+    ("__INTERRUPT", "           "),
+    ("__RAMFUNC", "         "),
+    ("__INLINE", "inline  "),
+    ("__PACKED", "        "),
+    ("STATIC", "static"),
+    ("CONST", "const"),
+    ("INLINE", "inline"),
+    ("__WEAK", "      "),
+    ("__IRQ", "     "),
+];
+
+/// Uppercase qualifier macros that imply C `static` storage class / internal linkage.
+const C_STATIC_QUALIFIER_MACROS: &[&str] = &["STATIC", "__STATIC_INLINE", "__STATIC_FORCEINLINE"];
+
+fn is_c_ident_start(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphabetic()
+}
+
+fn is_c_ident_continue(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
+}
+
+/// Returns true when the bytes between `line_start` and `pos` make the current physical line a
+/// preprocessor directive (first non-whitespace byte is `#`). Directive lines are never rewritten
+/// so `#define STATIC static` and `#ifdef __WEAK` keep their exact original semantics.
+fn line_is_preproc_directive(bytes: &[u8], line_start: usize, pos: usize) -> bool {
+    for &b in bytes.get(line_start..pos).unwrap_or_default() {
+        if b == b' ' || b == b'\t' || b == b'\r' {
+            continue;
+        }
+        return b == b'#';
+    }
+    false
+}
+
+/// Byte-length-preserving normalization of [`C_QUALIFIER_NORMALIZATIONS`] tokens.
+///
+/// Identifier tokens inside string literals, character literals, line/block comments, and
+/// preprocessor directives (including backslash-continued ones) are left untouched. Returns
+/// `None` when no rewrite is needed so callers can avoid an allocation.
+fn normalize_c_qualifier_macros(source: &str) -> Option<Vec<u8>> {
+    let bytes = source.as_bytes();
+    let mut out: Option<Vec<u8>> = None;
+    let mut i = 0usize;
+    let mut line_start = 0usize;
+    // Set when the *current* physical line continues a preprocessor directive via a trailing `\`.
+    let mut in_continued_directive = false;
+    // Cached "is the current physical line a preprocessor directive" answer for this line.
+    let mut line_directive_known = false;
+    let mut line_directive = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if b == b'\n' {
+            let mut last_sig = 0u8;
+            for &c in bytes[line_start..i].iter().rev() {
+                if c != b' ' && c != b'\t' && c != b'\r' {
+                    last_sig = c;
+                    break;
+                }
+            }
+            let continues = last_sig == b'\\'
+                && (in_continued_directive || line_is_preproc_directive(bytes, line_start, i));
+            in_continued_directive = continues;
+            line_start = i + 1;
+            // A continued directive line is known up front; otherwise resolve it lazily on the
+            // first identifier token of the line.
+            line_directive_known = continues;
+            line_directive = continues;
+            i += 1;
+            continue;
+        }
+
+        // Line comment: never rewritten.
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Block comment: never rewritten, but keep line bookkeeping accurate.
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i < bytes.len() {
+                if bytes[i] == b'\n' {
+                    line_start = i + 1;
+                    in_continued_directive = false;
+                    line_directive_known = false;
+                    line_directive = false;
+                    i += 1;
+                    continue;
+                }
+                if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // String / character literal: never rewritten.
+        if b == b'"' || b == b'\'' {
+            let quote = b;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'\n' {
+                    line_start = i + 1;
+                    in_continued_directive = false;
+                    line_directive_known = false;
+                    line_directive = false;
+                    i += 1;
+                    break;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        if is_c_ident_start(b) {
+            let start = i;
+            while i < bytes.len() && is_c_ident_continue(bytes[i]) {
+                i += 1;
+            }
+            if !line_directive_known {
+                line_directive = line_is_preproc_directive(bytes, line_start, start);
+                line_directive_known = true;
+            }
+            if !line_directive {
+                let token = &bytes[start..i];
+                if let Some(&(_, replacement)) = C_QUALIFIER_NORMALIZATIONS
+                    .iter()
+                    .find(|(from, _)| from.as_bytes() == token)
+                {
+                    debug_assert_eq!(
+                        token.len(),
+                        replacement.len(),
+                        "C qualifier normalization must preserve byte length"
+                    );
+                    out.get_or_insert_with(|| bytes.to_vec())
+                        .get_mut(start..i)
+                        .expect("in-range token slice")
+                        .copy_from_slice(replacement.as_bytes());
+                }
+            }
+            continue;
+        }
+
+        i += 1;
+    }
+
+    out
 }
 
 struct ExtractContext<'a> {
@@ -376,7 +563,21 @@ fn extract_c_cpp_function(
     let fn_decl = find_first_descendant_of_kind(node, "function_declarator")?;
     let decl_target = fn_decl.child_by_field_name("declarator").unwrap_or(fn_decl);
     let raw_decl_name = extract_declarator_name(decl_target, ctx.bytes)?;
-    if raw_decl_name.is_empty() {
+    if raw_decl_name.is_empty()
+        || matches!(
+            raw_decl_name.as_str(),
+            "if" | "else"
+                | "for"
+                | "while"
+                | "switch"
+                | "return"
+                | "sizeof"
+                | "typeof"
+                | "alignof"
+                | "_Static_assert"
+                | "static_assert"
+        )
+    {
         return None;
     }
 
@@ -413,10 +614,18 @@ fn extract_c_cpp_function(
     }
 
     let full_text = node_text(node, ctx.bytes);
-    let visibility = if full_text.starts_with("static ")
-        || full_text.contains("\nstatic ")
-        || full_text.contains(" static ")
-    {
+    // Only the declaration header (everything before the body brace) decides linkage, so a
+    // `static` local declared inside the body cannot mark the function itself as static.
+    let header_end = node
+        .child_by_field_name("body")
+        .map(|b| b.start_byte())
+        .unwrap_or_else(|| node.end_byte());
+    let decl_header = if header_end > node.start_byte() && header_end <= ctx.bytes.len() {
+        std::str::from_utf8(&ctx.bytes[node.start_byte()..header_end]).unwrap_or(full_text)
+    } else {
+        full_text
+    };
+    let visibility = if c_decl_header_is_static(decl_header) {
         Visibility::Static
     } else {
         Visibility::Public
@@ -453,6 +662,16 @@ fn extract_c_cpp_function(
         arch_layer: ctx.scanned.arch_layer,
         section_id: ctx.section_id.to_string(),
     })
+}
+
+/// Returns true when a C/C++ declaration header (the text preceding the body brace) carries a
+/// `static` storage-class specifier — either written directly or expressed through a common
+/// uppercase qualifier macro that [`normalize_c_qualifier_macros`] rewrites to `static` before
+/// Tree-sitter parsing.
+fn c_decl_header_is_static(decl_header: &str) -> bool {
+    decl_header
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|tok| tok == "static" || C_STATIC_QUALIFIER_MACROS.contains(&tok))
 }
 
 fn extract_c_typedef(ctx: &mut ExtractContext<'_>, node: Node<'_>) {
@@ -2037,7 +2256,7 @@ fn extract_preceding_doc(lines: &[&str], start_line: usize) -> String {
 
         if in_block_comment {
             let cleaned = clean_doc_line(trimmed);
-            if !cleaned.is_empty() {
+            if !cleaned.is_empty() && !is_decorative_doc_line(&cleaned) {
                 doc_lines.push(cleaned);
             }
             if trimmed.starts_with("/*") {
@@ -2055,12 +2274,12 @@ fn extract_preceding_doc(lines: &[&str], start_line: usize) -> String {
                 && !trimmed.starts_with("#pragma"))
         {
             let cleaned = clean_doc_line(trimmed);
-            if !cleaned.is_empty() {
+            if !cleaned.is_empty() && !is_decorative_doc_line(&cleaned) {
                 doc_lines.push(cleaned);
             }
         } else if trimmed.ends_with("*/") {
             let cleaned = clean_doc_line(trimmed);
-            if !cleaned.is_empty() {
+            if !cleaned.is_empty() && !is_decorative_doc_line(&cleaned) {
                 doc_lines.push(cleaned);
             }
             if trimmed.starts_with("/*") {
@@ -2080,10 +2299,24 @@ fn extract_preceding_doc(lines: &[&str], start_line: usize) -> String {
     doc_lines.reverse();
     let first_meaningful = doc_lines
         .into_iter()
-        .find(|l| !l.is_empty() && !l.starts_with('@') && !l.starts_with("\\brief"))
+        .find(|l| {
+            !l.is_empty()
+                && !is_decorative_doc_line(l)
+                && !l.starts_with('@')
+                && !l.starts_with("\\brief")
+        })
         .unwrap_or_default();
 
     truncate_str(&first_meaningful, 160)
+}
+
+/// Returns true when a comment line carries no descriptive text — i.e. it is an empty line or a
+/// purely decorative ASCII divider/banner (`----`, `====`, `****`, `####`, `~~~~`, `____`, ...).
+///
+/// Such lines are ignored when locating the doc summary of a symbol or type, so a decorative
+/// divider placed directly above or below a real description does not hide it.
+fn is_decorative_doc_line(cleaned: &str) -> bool {
+    !cleaned.chars().any(|c| c.is_alphanumeric())
 }
 
 fn clean_doc_line(trimmed: &str) -> String {
@@ -2410,5 +2643,119 @@ export const formatPacket = (pkt: Packet): string => {
             .symbols
             .iter()
             .any(|s| s.name == "formatPacket" && s.visibility == Visibility::Public));
+    }
+
+    #[test]
+    fn test_c_qualifier_macro_normalization_lengths() {
+        for (from, to) in C_QUALIFIER_NORMALIZATIONS {
+            assert_eq!(
+                from.len(),
+                to.len(),
+                "normalization for `{from}` must preserve byte length"
+            );
+        }
+    }
+
+    #[test]
+    fn test_c_qualifier_macros_normalized_for_parsing_and_visibility() {
+        let src = r#"
+#include <stdint.h>
+
+#define STATIC static
+#define VENDOR_FAST __STATIC_INLINE
+
+STATIC void helper_reset(void) {
+    uint32_t tmp = 0;
+    STATIC_guard(&tmp);
+}
+
+__STATIC_INLINE void fast_op(void) {
+    do_fast();
+}
+
+__STATIC_FORCEINLINE void forced_op(void) {
+    do_forced();
+}
+
+const void *CONST_PTR;
+
+static void plain_static(void) {}
+
+void public_entry(void) {
+    static uint32_t call_count = 0;
+    (void)call_count;
+}
+"#;
+        let scanned = dummy_scanned("fw/drvs/qualifier_macros.c", LanguageKind::C);
+        let unit = parse_source_str(&scanned, src).expect("parse C file");
+
+        // Uppercase storage/qualifier macros must no longer produce CST error nodes.
+        assert_eq!(
+            unit.parse_errors, 0,
+            "qualifier macros must not produce Tree-sitter errors"
+        );
+
+        let vis = |name: &str| {
+            unit.symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing symbol {name}"))
+                .visibility
+        };
+        assert_eq!(vis("helper_reset"), Visibility::Static);
+        assert_eq!(vis("fast_op"), Visibility::Static);
+        assert_eq!(vis("forced_op"), Visibility::Static);
+        assert_eq!(vis("plain_static"), Visibility::Static);
+        // A `static` local inside the body must not leak into the function's linkage.
+        assert_eq!(vis("public_entry"), Visibility::Public);
+
+        // The `#define STATIC static` directive itself must still be extracted as a macro and
+        // must not be rewritten by the pre-normalization pass.
+        assert!(
+            unit.macros.iter().any(|m| m.name == "STATIC"),
+            "`#define STATIC static` must still be extracted: {:?}",
+            unit.macros.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+        assert!(unit.macros.iter().any(|m| m.name == "VENDOR_FAST"));
+    }
+
+    #[test]
+    fn test_doc_summary_skips_ascii_divider_lines() {
+        let src = r#"
+// Initializes the peripheral clock tree.
+//-------------------------------------------------------------------------//
+void foo_init(void) {
+    do_init();
+}
+
+//---------------------------------------------------------------------//
+void divider_only_init(void) {
+    do_init();
+}
+
+/* ===================================================================== */
+void banner_only_init(void) {}
+
+/* Configures the DMA channel.
+ * ===================================================================== */
+void baz_init(void) {}
+"#;
+        let scanned = dummy_scanned("fw/drvs/divider_docs.c", LanguageKind::C);
+        let unit = parse_source_str(&scanned, src).expect("parse C file");
+        assert_eq!(unit.parse_errors, 0);
+
+        let doc = |name: &str| {
+            unit.symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing symbol {name}"))
+                .doc_summary
+                .clone()
+        };
+        assert_eq!(doc("foo_init"), "Initializes the peripheral clock tree.");
+        assert_eq!(doc("baz_init"), "Configures the DMA channel.");
+        // Divider-only comment blocks must not become a doc summary.
+        assert_eq!(doc("divider_only_init"), "");
+        assert_eq!(doc("banner_only_init"), "");
     }
 }

@@ -1,6 +1,7 @@
 use crate::model::{
-    ExtractedImport, ExtractedMacro, ExtractedSymbol, ExtractedType, FileScope, MacroKind,
-    ParsedFileUnit, ResolutionTier, ResolvedCallEdge, VendorSurfaceSummary, XrefEntry,
+    ExtractedImport, ExtractedMacro, ExtractedSymbol, ExtractedType, FileScope, LanguageKind,
+    MacroKind, ParsedFileUnit, ResolutionTier, ResolvedCallEdge, SymbolKind, VendorSurfaceSummary,
+    Visibility, XrefEntry,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
@@ -34,6 +35,13 @@ pub fn resolve_and_link(
             .then_with(|| a.symbol_id.cmp(&b.symbol_id))
     });
     symbols.dedup_by(|a, b| a.symbol_id == b.symbol_id && a.start_line == b.start_line);
+
+    // 1b. Deduplicate C/C++ header prototypes against their `.c`/`.cpp` implementations.
+    // Without this, a caller that `#include`s a header resolves the call to the header
+    // prototype (`in > 0, out = 0`) instead of the implementation (`out > 0`), which severs the
+    // call graph at every module boundary. Matched prototypes are removed and their doc summary
+    // is transferred to the implementation when the implementation has no doc comment.
+    merge_c_family_header_prototypes(&mut symbols);
 
     let mut types: Vec<ExtractedType> =
         units.iter().flat_map(|u| u.types.iter().cloned()).collect();
@@ -75,8 +83,16 @@ pub fn resolve_and_link(
     // 3. Resolve every RawCallSite across units
     let mut calls: Vec<ResolvedCallEdge> = Vec::new();
 
+    // File -> language lookup used to keep cross-language name collisions from resolving.
+    let mut file_languages: FxHashMap<&str, LanguageKind> = FxHashMap::default();
+    file_languages.reserve(units.len());
+    for unit in units {
+        file_languages.insert(unit.scanned.rel_path.as_str(), unit.scanned.language);
+    }
+
     for unit in units {
         let unit_sec_id = infer_unit_section_id(unit);
+        let unit_language = unit.scanned.language;
 
         for raw in &unit.raw_calls {
             let caller_idx = by_file_name_line
@@ -115,13 +131,34 @@ pub fn resolve_and_link(
                 .get(raw.callee_name.as_str())
                 .or_else(|| by_name.get(short_callee));
 
+            // Language-family compatibility: a caller may only resolve to a symbol defined in a
+            // compatible language family. This keeps e.g. Python `session.commit()` from binding
+            // to a JavaScript `commit()` helper that merely shares the same leaf name.
+            let candidate_indices: Vec<usize> = candidates
+                .map(|indices| {
+                    indices
+                        .iter()
+                        .copied()
+                        .filter(|&idx| {
+                            languages_compatible(
+                                Some(unit_language),
+                                resolve_file_language(symbols[idx].file.as_str(), &file_languages),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
             let (callee_id, tier) = resolve_callee_candidates(
-                raw.caller_file.as_str(),
-                &caller_section_id,
+                CallerSite {
+                    file: raw.caller_file.as_str(),
+                    section_id: &caller_section_id,
+                    language: Some(unit_language),
+                },
                 short_callee,
                 raw.receiver_or_qualifier.as_deref(),
                 &unit.imports,
-                candidates.map(|v| v.as_slice()).unwrap_or(&[]),
+                &candidate_indices,
                 &symbols,
             );
 
@@ -258,20 +295,34 @@ pub fn resolve_and_link(
     (symbols, types, macros, calls, xrefs, vendor_surface)
 }
 
+/// Caller-side context needed to resolve a single call site.
+struct CallerSite<'a> {
+    file: &'a str,
+    section_id: &'a str,
+    language: Option<LanguageKind>,
+}
+
 fn resolve_callee_candidates(
-    caller_file: &str,
-    caller_section_id: &str,
+    caller: CallerSite<'_>,
     callee_name: &str,
     receiver_or_qualifier: Option<&str>,
     imports: &[ExtractedImport],
     candidate_indices: &[usize],
     symbols: &[ExtractedSymbol],
 ) -> (String, ResolutionTier) {
-    if candidate_indices.is_empty() {
-        return (
+    let caller_file = caller.file;
+    let caller_section_id = caller.section_id;
+    let caller_language = caller.language;
+
+    let unresolved = || {
+        (
             format!("external::{callee_name}"),
             ResolutionTier::ExternalOrMacro,
-        );
+        )
+    };
+
+    if candidate_indices.is_empty() {
+        return unresolved();
     }
 
     // Tier 1: Defined in the same file
@@ -297,6 +348,25 @@ fn resolve_callee_candidates(
         );
     }
 
+    // Built-in / qualified-call safeguards before any name-based guessing.
+    match receiver_or_qualifier {
+        // Unqualified call to a standard language built-in that is not defined in this file.
+        None => {
+            if is_language_builtin(callee_name, caller_language) {
+                return unresolved();
+            }
+        }
+        // `module.func()` where `module` is an imported module/symbol that does not exist in the
+        // repository (e.g. `import subprocess; subprocess.run(...)`, `time.sleep(...)`).
+        Some(qual) => {
+            if !is_self_or_class_receiver(qual)
+                && is_external_module_qualifier(qual, imports, candidate_indices, symbols)
+            {
+                return unresolved();
+            }
+        }
+    }
+
     // Tier 2: Caller file's imports reference the defining file's stem/module or explicitly import callee_name
     let mut import_matches: Vec<(usize, usize)> = Vec::new();
     for &idx in candidate_indices {
@@ -320,16 +390,28 @@ fn resolve_callee_candidates(
         );
     }
 
+    // `obj.method()` / `value.method()` receivers may only bind to methods of a matching type or
+    // to symbols living in a module named by the qualifier. Ubiquitous container/IO/lifecycle
+    // member names are never guessed blindly.
+    let mut eligible: Vec<usize> = candidate_indices.to_vec();
+    if let Some(qual) = receiver_or_qualifier.filter(|q| !is_self_or_class_receiver(q)) {
+        let ubiquitous_member = is_ubiquitous_member_name(callee_name);
+        eligible.retain(|&idx| qualified_candidate_allowed(qual, ubiquitous_member, &symbols[idx]));
+        if eligible.is_empty() {
+            return unresolved();
+        }
+    }
+
     // Tier 3: Exactly 1 definition across the entire repository
-    if candidate_indices.len() == 1 {
+    if eligible.len() == 1 {
         return (
-            symbols[candidate_indices[0]].symbol_id.clone(),
+            symbols[eligible[0]].symbol_id.clone(),
             ResolutionTier::UniqueGlobal,
         );
     }
 
     // Tier 4: Multiple definitions across repository -> pick closest directory/section, then first-party over vendor, then lexicographically first symbol_id
-    let mut ranked_candidates: Vec<usize> = candidate_indices.to_vec();
+    let mut ranked_candidates: Vec<usize> = eligible;
     ranked_candidates.sort_by(|&idx_a, &idx_b| {
         let a = &symbols[idx_a];
         let b = &symbols[idx_b];
@@ -363,6 +445,466 @@ fn resolve_callee_candidates(
         symbols[ranked_candidates[0]].symbol_id.clone(),
         ResolutionTier::AmbiguousName,
     )
+}
+
+/// Standard library built-in callables per language family. Calls to these names are resolved as
+/// external unless the symbol is defined in the *same* file (Tier 1), which prevents an unrelated
+/// repository symbol that happens to share the name from capturing a built-in call.
+const C_BUILTINS: &[&str] = &[
+    "sizeof", "offsetof", "malloc", "calloc", "realloc", "free", "memcpy", "memset", "memmove",
+    "memcmp", "strlen", "strcmp", "strncmp", "snprintf", "printf", "fprintf",
+];
+
+const PYTHON_BUILTINS: &[&str] = &[
+    "open",
+    "print",
+    "len",
+    "int",
+    "str",
+    "float",
+    "bool",
+    "bytes",
+    "list",
+    "dict",
+    "set",
+    "tuple",
+    "range",
+    "enumerate",
+    "zip",
+    "map",
+    "filter",
+    "sorted",
+    "reversed",
+    "min",
+    "max",
+    "sum",
+    "abs",
+    "any",
+    "all",
+    "isinstance",
+    "issubclass",
+    "getattr",
+    "setattr",
+    "hasattr",
+    "delattr",
+    "super",
+    "type",
+    "repr",
+    "id",
+    "hash",
+    "hex",
+    "oct",
+    "bin",
+    "ord",
+    "chr",
+    "iter",
+    "next",
+    "callable",
+    "vars",
+    "dir",
+];
+
+const JS_BUILTINS: &[&str] = &[
+    "parseInt",
+    "parseFloat",
+    "isNaN",
+    "isFinite",
+    "setTimeout",
+    "clearTimeout",
+    "setInterval",
+    "clearInterval",
+    "fetch",
+    "require",
+    "alert",
+    "confirm",
+    "prompt",
+];
+
+/// Ubiquitous container / IO / lifecycle member names. When such a name is invoked on an arbitrary
+/// variable receiver (`session.commit()`, `data.get()`, `thread.start()`) it is almost always a
+/// standard-library or third-party object method, never a repository function.
+const UBIQUITOUS_MEMBER_NAMES: &[&str] = &[
+    "get",
+    "set",
+    "add",
+    "pop",
+    "remove",
+    "clear",
+    "update",
+    "append",
+    "extend",
+    "insert",
+    "keys",
+    "values",
+    "items",
+    "commit",
+    "rollback",
+    "flush",
+    "close",
+    "open",
+    "read",
+    "write",
+    "seek",
+    "start",
+    "stop",
+    "run",
+    "join",
+    "sleep",
+    "wait",
+    "notify",
+    "acquire",
+    "release",
+    "split",
+    "strip",
+    "lstrip",
+    "rstrip",
+    "replace",
+    "format",
+    "encode",
+    "decode",
+    "lower",
+    "upper",
+    "startswith",
+    "endswith",
+    "find",
+    "index",
+    "count",
+    "copy",
+    "clone",
+    "iter",
+    "into_iter",
+    "collect",
+    "unwrap",
+    "expect",
+    "ok",
+    "err",
+    "map_err",
+    "and_then",
+    "or_else",
+    "push",
+    "slice",
+    "splice",
+    "forEach",
+    "includes",
+    "indexOf",
+    "toString",
+    "valueOf",
+    "then",
+    "catch",
+    "finally",
+    "info",
+    "debug",
+    "warning",
+    "warn",
+    "error",
+    "critical",
+    "exception",
+    "log",
+];
+
+const C_FAMILY_HEADER_EXTENSIONS: &[&str] = &["h", "hpp", "hh", "hxx"];
+const C_FAMILY_IMPLEMENTATION_EXTENSIONS: &[&str] = &["c", "cc", "cpp", "cxx"];
+
+fn source_extension(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    let (stem, ext) = file_name.rsplit_once('.')?;
+    if stem.is_empty() {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
+}
+
+fn is_c_family_header(path: &str) -> bool {
+    source_extension(path).is_some_and(|ext| C_FAMILY_HEADER_EXTENSIONS.contains(&ext.as_str()))
+}
+
+fn is_c_family_implementation(path: &str) -> bool {
+    source_extension(path)
+        .is_some_and(|ext| C_FAMILY_IMPLEMENTATION_EXTENSIONS.contains(&ext.as_str()))
+}
+
+/// Collapses C/C++ header prototypes into the `.c`/`.cc`/`.cpp`/`.cxx` symbol that implements them.
+///
+/// Header prototypes are only dropped when a matching implementation actually exists, so
+/// header-only code (`static inline` helpers, vendor SDK headers without a translation unit, and
+/// declaration-only interfaces) is fully preserved.
+fn merge_c_family_header_prototypes(symbols: &mut Vec<ExtractedSymbol>) {
+    if symbols.is_empty() {
+        return;
+    }
+
+    // Index implementation symbols by (leaf name, enclosing type).
+    let mut implementations: FxHashMap<(String, Option<String>), Vec<usize>> = FxHashMap::default();
+    for (idx, sym) in symbols.iter().enumerate() {
+        if !is_c_family_implementation(&sym.file) || sym.visibility == Visibility::Static {
+            continue;
+        }
+        implementations
+            .entry(symbol_key(sym))
+            .or_default()
+            .push(idx);
+    }
+    if implementations.is_empty() {
+        return;
+    }
+
+    let mut doc_transfers: Vec<(usize, String)> = Vec::new();
+    let mut removed: FxHashSet<usize> = FxHashSet::default();
+
+    for (proto_idx, proto) in symbols.iter().enumerate() {
+        // Only a non-static, non-inline declaration in a C/C++ header can be a forward prototype.
+        if !is_c_family_header(&proto.file) || proto.visibility == Visibility::Static {
+            continue;
+        }
+        if proto
+            .signature
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| matches!(tok, "inline" | "__inline" | "__inline__" | "INLINE"))
+        {
+            continue;
+        }
+
+        let Some(candidates) = implementations.get(&symbol_key(proto)) else {
+            continue;
+        };
+
+        // Prefer the implementation in the same shard, then first-party over vendor/test code,
+        // then the lexicographically first symbol id for determinism.
+        let best = candidates.iter().copied().min_by(|&a, &b| {
+            let sec_a = symbols[a].section_id != proto.section_id;
+            let sec_b = symbols[b].section_id != proto.section_id;
+            sec_a
+                .cmp(&sec_b)
+                .then_with(|| scope_rank(symbols[a].scope).cmp(&scope_rank(symbols[b].scope)))
+                .then_with(|| symbols[a].symbol_id.cmp(&symbols[b].symbol_id))
+        });
+
+        if let Some(best) = best {
+            if !proto.doc_summary.is_empty() {
+                doc_transfers.push((best, proto.doc_summary.clone()));
+            }
+            removed.insert(proto_idx);
+        }
+    }
+
+    if removed.is_empty() {
+        return;
+    }
+
+    for (idx, doc_summary) in doc_transfers {
+        let target = &mut symbols[idx];
+        if target.doc_summary.is_empty() {
+            target.doc_summary = doc_summary;
+        }
+    }
+
+    let mut kept = std::mem::take(symbols);
+    *symbols = kept
+        .drain(..)
+        .enumerate()
+        .filter_map(|(idx, sym)| (!removed.contains(&idx)).then_some(sym))
+        .collect();
+}
+
+fn symbol_key(sym: &ExtractedSymbol) -> (String, Option<String>) {
+    (
+        sym.name.to_ascii_lowercase(),
+        sym.enclosing_type.as_ref().map(|t| t.to_ascii_lowercase()),
+    )
+}
+
+fn language_family(lang: LanguageKind) -> u8 {
+    match lang {
+        LanguageKind::C | LanguageKind::Cpp => 0,
+        LanguageKind::Rust => 1,
+        LanguageKind::Python => 2,
+        LanguageKind::TypeScript
+        | LanguageKind::Tsx
+        | LanguageKind::JavaScript
+        | LanguageKind::Jsx => 3,
+    }
+}
+
+fn languages_compatible(caller: Option<LanguageKind>, callee: Option<LanguageKind>) -> bool {
+    match (caller, callee) {
+        (Some(a), Some(b)) => language_family(a) == language_family(b),
+        // Unknown languages are never filtered out.
+        _ => true,
+    }
+}
+
+fn resolve_file_language(
+    file: &str,
+    file_languages: &FxHashMap<&str, LanguageKind>,
+) -> Option<LanguageKind> {
+    file_languages.get(file).copied().or_else(|| {
+        source_extension(file).and_then(|ext| LanguageKind::from_extension(ext.as_str()))
+    })
+}
+
+fn is_language_builtin(name: &str, caller_language: Option<LanguageKind>) -> bool {
+    let in_c = C_BUILTINS.contains(&name);
+    let in_python = PYTHON_BUILTINS.contains(&name);
+    let in_js = JS_BUILTINS.contains(&name);
+
+    match caller_language {
+        Some(LanguageKind::C | LanguageKind::Cpp) => in_c,
+        Some(LanguageKind::Python) => in_python,
+        Some(
+            LanguageKind::TypeScript
+            | LanguageKind::Tsx
+            | LanguageKind::JavaScript
+            | LanguageKind::Jsx,
+        ) => in_js,
+        // Rust has no free-function builtins in this table; `std` calls are path-qualified.
+        Some(LanguageKind::Rust) => false,
+        None => in_c || in_python || in_js,
+    }
+}
+
+fn is_ubiquitous_member_name(name: &str) -> bool {
+    UBIQUITOUS_MEMBER_NAMES.contains(&name)
+}
+
+fn qualifier_leaf(qualifier: &str) -> &str {
+    qualifier
+        .trim()
+        .rsplit(['.', ':', '-', '>'])
+        .next()
+        .unwrap_or(qualifier)
+        .trim()
+}
+
+/// True when the qualifier is directly the instance/class receiver (`self`, `cls`, `this`, `super`)
+/// rather than a member attribute chain (`self._queue`), variable, or module name.
+fn is_self_or_class_receiver(qualifier: &str) -> bool {
+    let trimmed = qualifier.trim();
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "self" | "cls" | "this" | "super"
+    )
+}
+
+/// True when `qualifier` names a module/file stem, so `qualifier.member()` may legitimately refer
+/// to a repository-level function defined in that module.
+fn module_qualifier_matches(qualifier: &str, def_file: &str) -> bool {
+    let leaf = qualifier_leaf(qualifier);
+    if leaf.is_empty() {
+        return false;
+    }
+
+    let normalized = def_file.replace('\\', "/");
+    let mut segments = normalized.rsplit('/');
+    let file_name = segments.next().unwrap_or(normalized.as_str());
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(file_name);
+    if stem.eq_ignore_ascii_case(leaf) {
+        return true;
+    }
+
+    // Module directories (`pkg/module/mod.rs`, `pkg/module/__init__.py`) also name the module.
+    segments
+        .next()
+        .is_some_and(|dir| dir.eq_ignore_ascii_case(leaf))
+}
+
+fn qualified_candidate_allowed(
+    qualifier: &str,
+    ubiquitous_member: bool,
+    sym: &ExtractedSymbol,
+) -> bool {
+    // A method of the type named by the qualifier always answers the call.
+    if let Some(enclosing) = sym.enclosing_type.as_deref() {
+        if enclosing.eq_ignore_ascii_case(qualifier) {
+            return true;
+        }
+        // Ubiquitous container/IO/lifecycle methods of unrelated types are never guessed.
+        return !ubiquitous_member;
+    }
+
+    if matches!(sym.kind, SymbolKind::Function | SymbolKind::Entrypoint) {
+        // A standalone function only answers `qualifier.name()` when the qualifier names its module.
+        return module_qualifier_matches(qualifier, &sym.file);
+    }
+
+    !ubiquitous_member
+}
+
+fn normalize_import_path(raw_path: &str) -> String {
+    raw_path
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '<' | '>'))
+        .replace("::", "/")
+        .replace('\\', "/")
+}
+
+/// True when the import path names the given repository source file.
+fn import_references_file(import_path: &str, def_file: &str) -> bool {
+    let raw = strip_source_extension(normalize_import_path(import_path).trim_start_matches("./"));
+    let def = strip_source_extension(&def_file.replace('\\', "/"));
+    if raw.is_empty() || def.is_empty() {
+        return false;
+    }
+    def == raw || def.ends_with(&format!("/{raw}"))
+}
+
+fn import_mentions_name(imp: &ExtractedImport, qualifier: &str, leaf: &str) -> bool {
+    let normalized = normalize_import_path(&imp.raw_path);
+    let segments: Vec<&str> = normalized
+        .split(['/', '.', ':'])
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    let matches = |segment: &&str| {
+        segment.eq_ignore_ascii_case(leaf) || segment.eq_ignore_ascii_case(qualifier)
+    };
+
+    if let Some(top) = segments.first() {
+        if matches(top) {
+            return true;
+        }
+    }
+
+    if let Some(last) = segments.last() {
+        if matches(last) {
+            return true;
+        }
+    }
+
+    imp.imported_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(leaf) || name.eq_ignore_ascii_case(qualifier))
+}
+
+/// True when `qualifier` is an imported module/symbol that does not resolve to any repository
+/// candidate file (e.g. `import subprocess` or `import time` in a Python module).
+fn is_external_module_qualifier(
+    qualifier: &str,
+    imports: &[ExtractedImport],
+    candidate_indices: &[usize],
+    symbols: &[ExtractedSymbol],
+) -> bool {
+    let leaf = qualifier_leaf(qualifier);
+    if leaf.is_empty() {
+        return false;
+    }
+
+    for imp in imports {
+        if !import_mentions_name(imp, qualifier, leaf) {
+            continue;
+        }
+        let references_repo_file = candidate_indices
+            .iter()
+            .any(|&idx| import_references_file(&imp.raw_path, &symbols[idx].file));
+        if !references_repo_file {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn match_import_for_candidate(
@@ -717,6 +1259,78 @@ mod tests {
     use crate::model::{ArchLayer, LanguageKind, ScannedFile, SymbolKind, Visibility};
     use std::path::PathBuf;
 
+    fn sample_scanned_with_language(
+        rel_path: &str,
+        scope: FileScope,
+        layer: ArchLayer,
+        language: LanguageKind,
+    ) -> ScannedFile {
+        let mut scanned = sample_scanned(rel_path, scope, layer);
+        scanned.language = language;
+        scanned
+    }
+
+    fn sample_prototype(
+        file: &str,
+        name: &str,
+        line: usize,
+        scope: FileScope,
+        layer: ArchLayer,
+        section_id: &str,
+        doc_summary: &str,
+    ) -> ExtractedSymbol {
+        let mut symbol = sample_symbol(file, name, line, scope, layer, section_id);
+        symbol.end_line = line;
+        symbol.signature = format!("void {name}(void);");
+        symbol.doc_summary = doc_summary.to_string();
+        symbol
+    }
+
+    fn sample_call(
+        caller_file: &str,
+        caller_name: &str,
+        caller_start_line: usize,
+        callee_name: &str,
+        receiver_or_qualifier: Option<&str>,
+        call_line: usize,
+    ) -> crate::model::RawCallSite {
+        crate::model::RawCallSite {
+            caller_file: caller_file.to_string(),
+            caller_name: caller_name.to_string(),
+            caller_start_line,
+            callee_name: callee_name.to_string(),
+            receiver_or_qualifier: receiver_or_qualifier.map(ToOwned::to_owned),
+            call_line,
+        }
+    }
+
+    fn sample_unit(
+        rel_path: &str,
+        scope: FileScope,
+        layer: ArchLayer,
+        language: LanguageKind,
+        symbols: Vec<ExtractedSymbol>,
+        imports: Vec<ExtractedImport>,
+        raw_calls: Vec<crate::model::RawCallSite>,
+    ) -> ParsedFileUnit {
+        ParsedFileUnit {
+            scanned: sample_scanned_with_language(rel_path, scope, layer, language),
+            symbols,
+            types: Vec::new(),
+            macros: Vec::new(),
+            imports,
+            raw_calls,
+            raw_xrefs: Vec::new(),
+            parse_errors: 0,
+        }
+    }
+
+    fn find_call<'a>(calls: &'a [ResolvedCallEdge], callee_name: &str) -> &'a ResolvedCallEdge {
+        calls
+            .iter()
+            .find(|c| c.callee_name == callee_name)
+            .unwrap_or_else(|| panic!("missing resolved call edge for {callee_name}"))
+    }
     fn sample_scanned(rel_path: &str, scope: FileScope, layer: ArchLayer) -> ScannedFile {
         ScannedFile {
             rel_path: rel_path.to_string(),
@@ -943,5 +1557,300 @@ mod tests {
         assert!(vendor
             .active_mmio_registers
             .contains(&"GPIOA->MODER".to_string()));
+    }
+
+    #[test]
+    fn test_python_object_and_module_calls_do_not_bind_to_unrelated_symbols() {
+        // Python caller with object/module receivers.
+        let unit_tool = sample_unit(
+            "scripts/tool.py",
+            FileScope::FirstParty,
+            ArchLayer::Libs,
+            LanguageKind::Python,
+            vec![sample_symbol(
+                "scripts/tool.py",
+                "run_tool",
+                10,
+                FileScope::FirstParty,
+                ArchLayer::Libs,
+                "scripts",
+            )],
+            vec![ExtractedImport {
+                file: "scripts/tool.py".to_string(),
+                line: 1,
+                raw_path: "time".to_string(),
+                imported_names: Vec::new(),
+                is_system: false,
+            }],
+            vec![
+                // `session.commit()`: a DB session object, not a repository function.
+                sample_call(
+                    "scripts/tool.py",
+                    "run_tool",
+                    10,
+                    "commit",
+                    Some("session"),
+                    11,
+                ),
+                // `dict.get()`
+                sample_call("scripts/tool.py", "run_tool", 10, "get", Some("dict"), 12),
+                // `time.sleep()`: stdlib module import that is not part of the repository.
+                sample_call("scripts/tool.py", "run_tool", 10, "sleep", Some("time"), 13),
+                // `len(...)`: Python builtin.
+                sample_call("scripts/tool.py", "run_tool", 10, "len", None, 14),
+                // `codec.encode_frame(...)`: module-qualified call that *does* live in the repo.
+                sample_call(
+                    "scripts/tool.py",
+                    "run_tool",
+                    10,
+                    "encode_frame",
+                    Some("codec"),
+                    15,
+                ),
+            ],
+        );
+
+        // JavaScript helpers that merely share the same leaf names.
+        let unit_js = sample_unit(
+            "frontend/db.js",
+            FileScope::FirstParty,
+            ArchLayer::Libs,
+            LanguageKind::JavaScript,
+            vec![
+                sample_symbol(
+                    "frontend/db.js",
+                    "commit",
+                    3,
+                    FileScope::FirstParty,
+                    ArchLayer::Libs,
+                    "frontend",
+                ),
+                sample_symbol(
+                    "frontend/db.js",
+                    "sleep",
+                    8,
+                    FileScope::FirstParty,
+                    ArchLayer::Libs,
+                    "frontend",
+                ),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        // An unrelated Python `def get()` / `def len()` elsewhere in the repository.
+        let unit_helpers = sample_unit(
+            "scripts/helpers.py",
+            FileScope::FirstParty,
+            ArchLayer::Libs,
+            LanguageKind::Python,
+            vec![sample_symbol(
+                "scripts/helpers.py",
+                "get",
+                4,
+                FileScope::FirstParty,
+                ArchLayer::Libs,
+                "scripts",
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let unit_sizes = sample_unit(
+            "scripts/sizes.py",
+            FileScope::FirstParty,
+            ArchLayer::Libs,
+            LanguageKind::Python,
+            vec![sample_symbol(
+                "scripts/sizes.py",
+                "len",
+                4,
+                FileScope::FirstParty,
+                ArchLayer::Libs,
+                "scripts",
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        // A Python `def sleep()` in another module (must not capture `time.sleep()`).
+        let unit_timing = sample_unit(
+            "scripts/timing.py",
+            FileScope::FirstParty,
+            ArchLayer::Libs,
+            LanguageKind::Python,
+            vec![sample_symbol(
+                "scripts/timing.py",
+                "sleep",
+                6,
+                FileScope::FirstParty,
+                ArchLayer::Libs,
+                "scripts",
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        // The module-qualified target.
+        let unit_codec = sample_unit(
+            "scripts/codec.py",
+            FileScope::FirstParty,
+            ArchLayer::Libs,
+            LanguageKind::Python,
+            vec![sample_symbol(
+                "scripts/codec.py",
+                "encode_frame",
+                5,
+                FileScope::FirstParty,
+                ArchLayer::Libs,
+                "scripts",
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let (_symbols, _types, _macros, calls, _xrefs, _vendor) = resolve_and_link(&[
+            unit_tool,
+            unit_js,
+            unit_helpers,
+            unit_sizes,
+            unit_timing,
+            unit_codec,
+        ]);
+
+        assert_eq!(calls.len(), 5);
+
+        for callee in ["commit", "get", "sleep", "len"] {
+            let edge = find_call(&calls, callee);
+            assert_eq!(
+                edge.tier,
+                ResolutionTier::ExternalOrMacro,
+                "`{callee}` must not bind to a same-named repository symbol"
+            );
+            assert_eq!(edge.callee_id, format!("external::{callee}"));
+        }
+
+        // Module-qualified calls that name a real repository module still resolve.
+        let codec_edge = find_call(&calls, "encode_frame");
+        assert_eq!(codec_edge.tier, ResolutionTier::UniqueGlobal);
+        assert_eq!(codec_edge.callee_id, "scripts/codec.py::encode_frame");
+    }
+
+    #[test]
+    fn test_c_header_prototype_merges_with_implementation() {
+        let unit_header = sample_unit(
+            "src/drvs/drvAdc.h",
+            FileScope::FirstParty,
+            ArchLayer::Drivers,
+            LanguageKind::C,
+            vec![
+                sample_prototype(
+                    "src/drvs/drvAdc.h",
+                    "adc_GetValue",
+                    8,
+                    FileScope::FirstParty,
+                    ArchLayer::Drivers,
+                    "src-drvs",
+                    "Reads the latest ADC conversion result.",
+                ),
+                // Header-only `static inline` helper: must never be dropped.
+                {
+                    let mut symbol = sample_symbol(
+                        "src/drvs/drvAdc.h",
+                        "drvAdc_IsReady",
+                        12,
+                        FileScope::FirstParty,
+                        ArchLayer::Drivers,
+                        "src-drvs",
+                    );
+                    symbol.visibility = Visibility::Static;
+                    symbol
+                },
+                // Declaration-only interface with no translation unit implementation.
+                sample_prototype(
+                    "src/drvs/drvAdc.h",
+                    "adc_Config",
+                    20,
+                    FileScope::FirstParty,
+                    ArchLayer::Drivers,
+                    "src-drvs",
+                    "",
+                ),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let unit_impl = sample_unit(
+            "src/drvs/drvAdc.c",
+            FileScope::FirstParty,
+            ArchLayer::Drivers,
+            LanguageKind::C,
+            vec![sample_symbol(
+                "src/drvs/drvAdc.c",
+                "adc_GetValue",
+                10,
+                FileScope::FirstParty,
+                ArchLayer::Drivers,
+                "src-drvs",
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let unit_app = sample_unit(
+            "src/app/main.c",
+            FileScope::FirstParty,
+            ArchLayer::App,
+            LanguageKind::C,
+            vec![sample_symbol(
+                "src/app/main.c",
+                "main",
+                5,
+                FileScope::FirstParty,
+                ArchLayer::App,
+                "src-app",
+            )],
+            vec![ExtractedImport {
+                file: "src/app/main.c".to_string(),
+                line: 1,
+                raw_path: "drvs/drvAdc.h".to_string(),
+                imported_names: Vec::new(),
+                is_system: false,
+            }],
+            vec![
+                sample_call("src/app/main.c", "main", 5, "adc_GetValue", None, 7),
+                // Header prototype without a `.c` implementation keeps resolving to the header.
+                sample_call("src/app/main.c", "main", 5, "adc_Config", None, 8),
+            ],
+        );
+
+        let (symbols, _types, _macros, calls, _xrefs, _vendor) =
+            resolve_and_link(&[unit_header, unit_impl, unit_app]);
+
+        let ids: Vec<&str> = symbols.iter().map(|s| s.symbol_id.as_str()).collect();
+        assert!(
+            !ids.contains(&"src/drvs/drvAdc.h::adc_GetValue"),
+            "redundant header prototype must be merged into the implementation"
+        );
+        assert!(ids.contains(&"src/drvs/drvAdc.c::adc_GetValue"));
+        assert!(ids.contains(&"src/drvs/drvAdc.h::drvAdc_IsReady"));
+        assert!(ids.contains(&"src/drvs/drvAdc.h::adc_Config"));
+
+        let impl_symbol = symbols
+            .iter()
+            .find(|s| s.symbol_id == "src/drvs/drvAdc.c::adc_GetValue")
+            .expect("implementation symbol");
+        assert_eq!(
+            impl_symbol.doc_summary,
+            "Reads the latest ADC conversion result."
+        );
+
+        let get_value = find_call(&calls, "adc_GetValue");
+        assert_eq!(get_value.tier, ResolutionTier::ImportResolved);
+        assert_eq!(get_value.callee_id, "src/drvs/drvAdc.c::adc_GetValue");
+
+        let config = find_call(&calls, "adc_Config");
+        assert_eq!(config.callee_id, "src/drvs/drvAdc.h::adc_Config");
     }
 }

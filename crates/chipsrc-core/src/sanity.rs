@@ -1,4 +1,4 @@
-use crate::model::{BundleIndexes, ParsedFileUnit, SanityReport, SectionShard};
+use crate::model::{BundleIndexes, FileScope, ParsedFileUnit, SanityReport, SectionShard};
 
 /// Computes structural conversion health, parse coverage, call resolution rate,
 /// token compression ratio, architectural warnings, and overall sanity score (0..=100).
@@ -7,11 +7,23 @@ pub fn compute_sanity_report(
     indexes: &BundleIndexes,
     sections: &[SectionShard],
 ) -> SanityReport {
-    let parse_clean_ratio = if units.is_empty() {
+    let primary_units: Vec<&ParsedFileUnit> = {
+        let non_vendor: Vec<&ParsedFileUnit> = units
+            .iter()
+            .filter(|u| u.scanned.scope != FileScope::VendorSdk)
+            .collect();
+        if non_vendor.is_empty() {
+            units.iter().collect()
+        } else {
+            non_vendor
+        }
+    };
+
+    let parse_clean_ratio = if primary_units.is_empty() {
         1.0
     } else {
-        let clean = units.iter().filter(|u| u.parse_errors == 0).count();
-        clean as f64 / (units.len() as f64)
+        let clean = primary_units.iter().filter(|u| u.parse_errors == 0).count();
+        clean as f64 / (primary_units.len() as f64)
     };
 
     let call_resolution_ratio = if indexes.calls.is_empty() {
@@ -47,13 +59,13 @@ pub fn compute_sanity_report(
     let mut warnings = Vec::new();
     let mut score: i32 = 100;
 
-    let files_with_errors = units.iter().filter(|u| u.parse_errors > 0).count();
+    let files_with_errors = primary_units.iter().filter(|u| u.parse_errors > 0).count();
     if files_with_errors > 0 {
         let penalty = (((1.0 - parse_clean_ratio) * 25.0).round() as i32).clamp(1, 25);
         score -= penalty;
         warnings.push(format!(
             "{files_with_errors}/{} file(s) reported Tree-sitter syntax errors (clean parse ratio: {:.1}%).",
-            units.len(),
+            primary_units.len(),
             parse_clean_ratio * 100.0
         ));
     }

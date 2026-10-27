@@ -6,6 +6,19 @@ All notable changes to this project are listed here. Versions follow
 
 ## [Unreleased]
 
+### Fixed
+
+- **Vendor SDK & Documentation Asset Filtering (`scanner.rs`, `sharder.rs`)**:
+  - Added composite vendor directory token classification (`driverlib`, `cmsis`, `stm32`, `freertos`, `third_party`, `3rdparty`, `vendor`, `hal_driver`) and reference directory rules (`references`, `reference`, `deps`, `bundled`, `svd`).
+  - Excluded static documentation output folders (`_static`, `doxygen`, `html`, `site`, `coverage`, `htmlcov`, `wheelhouse`) and bundled third-party JavaScript assets (`*.min.js`, `jquery*`, `modernizr*`, `underscore*`, `bootstrap*`, `mermaid*`, `prettify*`, `searchdata*`, `navtree*`, `dynsections*`).
+  - Changed shard group scope resolution to dominant/majority ownership and compacted `VendorMode::Active` vendor shards to active hardware/SDK symbols, types, macros, and headers.
+- **C/C++ Preprocessor Qualifier Normalization & Doc Summaries (`parser.rs`, `sanity.rs`)**:
+  - Added byte-length-preserving normalization for C/C++ storage and qualifier macros (`STATIC`, `CONST`, `INLINE`, `__STATIC_INLINE`, `__STATIC_FORCEINLINE`, `SYSCONFIG_WEAK`, `__WEAK`, `__IRQ`, `__INTERRUPT`, `__RAMFUNC`, `__PACKED`) before Tree-sitter parsing, eliminating false CST syntax errors while preserving exact byte/line coordinates and `static` visibility detection.
+  - Filtered C control-flow keywords from misparsed conditional blocks and skipped decorative ASCII divider lines when extracting doc summaries.
+- **Cross-Language Call Isolation, Header Prototype Merging & Layer Edges (`resolver.rs`, `graph.rs`)**:
+  - Merged C/C++ forward header prototype declarations into matching `.c`/`.cpp` implementations and transferred header docstrings when needed so `#include` callers resolve directly to the implementation.
+  - Restricted call resolution to compatible language families (`C/C++`, `Rust`, `Python`, `TS/JS`), guarded language built-ins and external module/member receivers (`obj.get()`, `session.commit()`, `time.sleep()`), and limited layer-violation edges to high-confidence resolutions and unambiguous module stems.
+
 ## [1.0.0] - 2026-10-27
 
 ### Added

@@ -12,7 +12,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-/// Excluded build/artifact/cache directories skipped unconditionally during walking.
+/// Excluded build/artifact/cache and generated documentation/static-asset directories
+/// skipped unconditionally during walking (`_static`, `doxygen`, `html`, ... contain bundled
+/// JS/CSS/HTML documentation assets rather than project source code).
 const IGNORED_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -27,9 +29,18 @@ const IGNORED_DIRS: &[&str] = &[
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    "_static",
+    "doxygen",
+    "html",
+    "site",
+    "coverage",
+    "htmlcov",
+    ".tox",
+    ".nox",
+    "wheelhouse",
 ];
 
-/// Path components indicating third-party / vendor SDK ownership.
+/// Path components indicating third-party / vendor SDK ownership (exact segment match).
 const VENDOR_COMPONENTS: &[&str] = &[
     "vendor",
     "third_party",
@@ -43,14 +54,62 @@ const VENDOR_COMPONENTS: &[&str] = &[
     "freertos",
     "middlewares",
     "submodules",
+    "references",
+    "reference",
+    "deps",
+    "bundled",
+    "svd",
+];
+
+/// Substring tokens that identify a vendor SDK directory even when the directory name embeds the
+/// token in a composite name (e.g. `My_DriverLib`, `STM32Cube`, `hal_driver`).
+const VENDOR_DIR_TOKENS: &[&str] = &[
+    "driverlib",
+    "cmsis",
+    "stm32",
+    "freertos",
+    "third_party",
+    "3rdparty",
+    "vendor",
+    "hal_driver",
 ];
 
 /// Path components indicating test / benchmark / evaluation code.
 const TEST_COMPONENTS: &[&str] = &["tests", "test", "evals", "benches"];
 
-/// Walks `repo_path` respecting `.gitignore` and `.claudeignore`, classifies each supported
-/// source file by language, ownership scope, and architectural layer, and returns the sorted
-/// file list along with a 16-character BLAKE3 repository fingerprint.
+/// Filename prefixes of bundled/minified third-party JavaScript assets emitted by documentation
+/// generators (Sphinx, Doxygen, MkDocs, JSDoc) rather than authored project source.
+const BUNDLED_ASSET_PREFIXES: &[&str] = &[
+    "jquery",
+    "modernizr",
+    "underscore",
+    "bootstrap",
+    "mermaid",
+    "prettify",
+    "searchdata",
+    "navtree",
+    "dynsections",
+];
+
+/// Returns `true` for minified or documentation-generator bundled third-party JavaScript assets,
+/// which carry no first-party source structure worth indexing.
+fn is_bundled_js_asset(lower_filename: &str) -> bool {
+    if !(lower_filename.ends_with(".js")
+        || lower_filename.ends_with(".mjs")
+        || lower_filename.ends_with(".cjs"))
+    {
+        return false;
+    }
+    lower_filename.ends_with(".min.js")
+        || BUNDLED_ASSET_PREFIXES
+            .iter()
+            .any(|prefix| lower_filename.starts_with(prefix))
+}
+
+/// Walks `repo_path` respecting `.gitignore`, `.claudeignore`, and `.graphifyignore`, skips
+/// generated documentation assets and minified/bundled third-party JavaScript, classifies each
+/// supported source file by language, ownership scope, and architectural layer, and returns the
+/// sorted file list along with a 16-character BLAKE3 repository fingerprint.
 pub fn scan_repository(
     repo_path: &Path,
     vendor_mode: VendorMode,
@@ -101,6 +160,16 @@ pub fn scan_repository(
         let Some(language) = LanguageKind::from_extension(ext) else {
             continue;
         };
+
+        // Skip minified / bundled third-party documentation JavaScript assets.
+        let lower_filename = abs_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_ascii_lowercase())
+            .unwrap_or_default();
+        if is_bundled_js_asset(&lower_filename) {
+            continue;
+        }
 
         let meta = match entry.metadata() {
             Ok(m) => m,
@@ -274,14 +343,39 @@ fn normalize_rel_path(path: &Path) -> String {
         .join("/")
 }
 
+/// Deterministically reports whether a repository-relative path (file path or module directory)
+/// belongs to a vendor SDK / third-party component rather than first-party project code.
+///
+/// `size_bytes = 0` disables the large-generated-header heuristic, so no file content is needed.
+pub(crate) fn path_is_vendor_owned(rel_path: &str) -> bool {
+    if classify_file_scope(rel_path, 0, b"") == FileScope::VendorSdk {
+        return true;
+    }
+    // Module paths carry no trailing filename, so token-match every segment as well.
+    rel_path
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .any(|seg| VENDOR_DIR_TOKENS.iter().any(|token| seg.contains(token)))
+}
+
 fn classify_file_scope(rel_path: &str, size_bytes: u64, bytes: &[u8]) -> FileScope {
-    let parts: Vec<&str> = rel_path.split('/').collect();
+    let parts: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
     let filename = parts.last().copied().unwrap_or(rel_path);
     let lower_filename = filename.to_ascii_lowercase();
+    let dir_segments = &parts[..parts.len().saturating_sub(1)];
 
+    // 1. Vendor SDK ownership: exact path-component match (`vendor/`, `cmsis/`, ...) or a
+    // composite directory name embedding a vendor token (`My_DriverLib`, `STM32Cube`, ...).
     for part in &parts {
         let lower = part.to_ascii_lowercase();
         if VENDOR_COMPONENTS.contains(&lower.as_str()) {
+            return FileScope::VendorSdk;
+        }
+    }
+    for seg in dir_segments {
+        let lower = seg.to_ascii_lowercase();
+        if VENDOR_DIR_TOKENS.iter().any(|token| lower.contains(token)) {
             return FileScope::VendorSdk;
         }
     }
@@ -296,9 +390,17 @@ fn classify_file_scope(rel_path: &str, size_bytes: u64, bytes: &[u8]) -> FileSco
         return FileScope::VendorSdk;
     }
 
+    // 2. Test / benchmark / evaluation code, including composite directory names such as
+    // `test_utils/` or `motor_tests/`.
     for part in &parts {
         let lower = part.to_ascii_lowercase();
         if TEST_COMPONENTS.contains(&lower.as_str()) {
+            return FileScope::Test;
+        }
+    }
+    for seg in dir_segments {
+        let lower = seg.to_ascii_lowercase();
+        if lower.starts_with("test_") || lower.ends_with("_test") || lower.ends_with("_tests") {
             return FileScope::Test;
         }
     }
@@ -455,5 +557,163 @@ mod tests {
             classify_arch_layer("crates/chipsrc-cli/src/main.rs", scope4),
             ArchLayer::Cli
         );
+    }
+
+    #[test]
+    fn test_classify_composite_vendor_directories() {
+        // Composite directory names embedding a vendor token must still be vendor-owned.
+        let driverlib = classify_file_scope("drvs/My_DriverLib/foo.c", 500, b"void f(void) {}");
+        assert_eq!(driverlib, FileScope::VendorSdk);
+        assert_eq!(
+            classify_arch_layer("drvs/My_DriverLib/foo.c", driverlib),
+            ArchLayer::VendorHal
+        );
+
+        let stm32 =
+            classify_file_scope("references/libs/STM32Cube/bar.c", 500, b"void bar(void) {}");
+        assert_eq!(stm32, FileScope::VendorSdk);
+
+        let cmsis_core = classify_file_scope(
+            "fw/platform/CMSIS_CORE/startup.c",
+            500,
+            b"void Reset_Handler(void) {}",
+        );
+        assert_eq!(cmsis_core, FileScope::VendorSdk);
+
+        let hal_driver =
+            classify_file_scope("fw/hal_driver/uart.c", 500, b"void uart_init(void) {}");
+        assert_eq!(hal_driver, FileScope::VendorSdk);
+
+        // Plain exact components still resolve to vendor ownership.
+        assert_eq!(
+            classify_file_scope(
+                "fw/deps/zlib/inflate.c",
+                300,
+                b"int inflate(void) { return 0; }"
+            ),
+            FileScope::VendorSdk
+        );
+
+        // First-party composite names that do not embed a vendor token stay first-party.
+        assert_eq!(
+            classify_file_scope("fw/drvs/motor_driver/pwm.c", 500, b"void pwm(void) {}"),
+            FileScope::FirstParty
+        );
+        assert_eq!(
+            classify_file_scope("fw/drvs/pwm.c", 500, b"void pwm(void) {}"),
+            FileScope::FirstParty
+        );
+    }
+
+    #[test]
+    fn test_path_is_vendor_owned_module_paths() {
+        assert!(path_is_vendor_owned("vendor/cmsis"));
+        assert!(path_is_vendor_owned("references/libs"));
+        assert!(path_is_vendor_owned("drvs/My_DriverLib"));
+        assert!(!path_is_vendor_owned("src/app"));
+        assert!(!path_is_vendor_owned("src/drvs"));
+        assert!(!path_is_vendor_owned("root"));
+        assert!(!path_is_vendor_owned(""));
+    }
+
+    #[test]
+    fn test_classify_composite_test_directories() {
+        assert_eq!(
+            classify_file_scope("fw/test_utils/helpers.c", 500, b"void h(void) {}"),
+            FileScope::Test
+        );
+        assert_eq!(
+            classify_file_scope("fw/motor_tests/harness.c", 500, b"void h(void) {}"),
+            FileScope::Test
+        );
+        assert_eq!(
+            classify_file_scope("fw/bench_test/bench.c", 500, b"void b(void) {}"),
+            FileScope::Test
+        );
+        assert_eq!(
+            classify_arch_layer(
+                "fw/test_utils/helpers.c",
+                classify_file_scope("fw/test_utils/helpers.c", 500, b"void h(void) {}")
+            ),
+            ArchLayer::Tests
+        );
+    }
+
+    #[test]
+    fn test_bundled_js_asset_detection() {
+        assert!(is_bundled_js_asset("jquery.min.js"));
+        assert!(is_bundled_js_asset("jquery.js"));
+        assert!(is_bundled_js_asset("modernizr-2.8.3.min.js"));
+        assert!(is_bundled_js_asset("underscore.js"));
+        assert!(is_bundled_js_asset("bootstrap.min.js"));
+        assert!(is_bundled_js_asset("mermaid.min.js"));
+        assert!(is_bundled_js_asset("prettify.min.js"));
+        assert!(is_bundled_js_asset("searchdata.js"));
+        assert!(is_bundled_js_asset("navtree.js"));
+        assert!(is_bundled_js_asset("dynsections.js"));
+        assert!(is_bundled_js_asset("runtime.min.js"));
+
+        assert!(!is_bundled_js_asset("app.js"));
+        assert!(!is_bundled_js_asset("motor_control.js"));
+        assert!(!is_bundled_js_asset("main.ts"));
+        assert!(!is_bundled_js_asset("minified.h"));
+    }
+
+    #[test]
+    fn test_ignored_dirs_include_docs_and_static_assets() {
+        for dir in [
+            "_static",
+            "doxygen",
+            "html",
+            "site",
+            "coverage",
+            "htmlcov",
+            ".tox",
+            ".nox",
+            "wheelhouse",
+            "node_modules",
+            "target",
+        ] {
+            assert!(
+                IGNORED_DIRS.contains(&dir),
+                "Expected IGNORED_DIRS to contain '{dir}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_repository_skips_docs_and_honors_graphifyignore() {
+        let root = std::env::temp_dir().join(format!(
+            "chipsrc_scanner_ignore_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("docs/_static")).unwrap();
+        std::fs::create_dir_all(root.join("doxygen/html")).unwrap();
+        std::fs::create_dir_all(root.join("generated")).unwrap();
+
+        std::fs::write(root.join("src/app.c"), "int app_main(void) { return 0; }\n").unwrap();
+        std::fs::write(
+            root.join("docs/_static/jquery.min.js"),
+            "!function(){}();\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("doxygen/html/searchdata.js"), "var x = 1;\n").unwrap();
+        std::fs::write(
+            root.join("generated/skip_me.c"),
+            "int skipped(void) { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".claudeignore"), "generated/\n").unwrap();
+
+        let (files, fingerprint) =
+            scan_repository(&root, VendorMode::All, 4 * 1024 * 1024).expect("scan_repository");
+        let rel_paths: Vec<&str> = files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert_eq!(rel_paths, vec!["src/app.c"]);
+        assert_eq!(fingerprint.len(), 16);
+        assert_eq!(files[0].scope, FileScope::FirstParty);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

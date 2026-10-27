@@ -1,8 +1,8 @@
 use crate::model::{
-    ArchLayer, CyclicCluster, ExtractedSymbol, FileScope, LayerDependencyEdge, ParsedFileUnit,
-    RankedSymbol, ResolvedCallEdge, SymbolKind, Visibility,
+    ArchLayer, CyclicCluster, ExtractedSymbol, FileScope, LanguageKind, LayerDependencyEdge,
+    ParsedFileUnit, RankedSymbol, ResolutionTier, ResolvedCallEdge, SymbolKind, Visibility,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -327,6 +327,89 @@ fn compute_tarjan_sccs(
     (clusters, node_scc_ids)
 }
 
+/// File stems that are too generic to identify a specific module across a repository.
+const GENERIC_IMPORT_STEMS: &[&str] = &[
+    "main", "config", "common", "utils", "types", "index", "mod", "lib", "test",
+];
+
+fn is_generic_import_stem(stem: &str) -> bool {
+    GENERIC_IMPORT_STEMS.contains(&stem)
+}
+
+const SOURCE_EXTENSIONS: &[&str] = &[
+    "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "inl", "rs", "py", "pyi", "ts", "tsx", "mts",
+    "cts", "js", "jsx", "mjs", "cjs",
+];
+
+/// Candidate module stems referenced by an import path, ordered from most to least specific.
+///
+/// Grouped imports (`use a::b::{c, d}`) only name modules in their prefix, and relative segments
+/// (`super`, `self`, `crate`) never name a module.
+fn import_module_stems(clean_path: &str) -> Vec<String> {
+    let head = clean_path.split('{').next().unwrap_or(clean_path);
+    let mut stems: Vec<String> = Vec::new();
+
+    for segment in head.split(['/', ':', '\\']).rev() {
+        let trimmed = segment
+            .trim()
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.');
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        if matches!(lower.as_str(), "*" | "self" | "super" | "crate") {
+            continue;
+        }
+
+        let stem = match lower.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() && SOURCE_EXTENSIONS.contains(&ext) => {
+                stem.to_string()
+            }
+            _ => lower.clone(),
+        };
+        let stem = stem
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            .to_string();
+        if !stem.is_empty() && !stems.contains(&stem) {
+            stems.push(stem);
+        }
+    }
+
+    stems
+}
+
+fn language_family(lang: LanguageKind) -> u8 {
+    match lang {
+        LanguageKind::C | LanguageKind::Cpp => 0,
+        LanguageKind::Rust => 1,
+        LanguageKind::Python => 2,
+        LanguageKind::TypeScript
+        | LanguageKind::Tsx
+        | LanguageKind::JavaScript
+        | LanguageKind::Jsx => 3,
+    }
+}
+
+/// An import edge is only trusted between compatible language families, or between two
+/// first-party files (where build-system glue may legitimately cross languages).
+fn import_target_compatible(
+    importer_language: LanguageKind,
+    importer_scope: FileScope,
+    target_language: LanguageKind,
+    target_scope: FileScope,
+) -> bool {
+    language_family(importer_language) == language_family(target_language)
+        || (importer_scope == FileScope::FirstParty && target_scope == FileScope::FirstParty)
+}
+
+fn is_high_confidence_tier(tier: ResolutionTier) -> bool {
+    matches!(
+        tier,
+        ResolutionTier::SameFile | ResolutionTier::ImportResolved | ResolutionTier::UniqueGlobal
+    )
+}
+
 fn compute_layer_edges(
     symbols: &[ExtractedSymbol],
     calls: &[ResolvedCallEdge],
@@ -334,7 +417,10 @@ fn compute_layer_edges(
 ) -> Vec<LayerDependencyEdge> {
     let mut sym_layer: FxHashMap<&str, (ArchLayer, FileScope)> = FxHashMap::default();
     let mut file_layer: FxHashMap<&str, (ArchLayer, FileScope)> = FxHashMap::default();
-    let mut stem_layer: FxHashMap<String, (ArchLayer, FileScope)> = FxHashMap::default();
+    let mut file_language: FxHashMap<&str, LanguageKind> = FxHashMap::default();
+    let mut stem_layer: FxHashMap<String, (ArchLayer, FileScope, LanguageKind)> =
+        FxHashMap::default();
+    let mut ambiguous_stems: FxHashSet<String> = FxHashSet::default();
 
     for sym in symbols {
         sym_layer.insert(sym.symbol_id.as_str(), (sym.arch_layer, sym.scope));
@@ -344,24 +430,39 @@ fn compute_layer_edges(
     }
 
     for u in units {
-        file_layer.insert(
-            u.scanned.rel_path.as_str(),
-            (u.scanned.arch_layer, u.scanned.scope),
-        );
-        if let Some(stem) = Path::new(&u.scanned.rel_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-        {
-            stem_layer
-                .entry(stem.to_ascii_lowercase())
-                .or_insert((u.scanned.arch_layer, u.scanned.scope));
+        let rel_path = u.scanned.rel_path.as_str();
+        file_layer.insert(rel_path, (u.scanned.arch_layer, u.scanned.scope));
+        file_language.insert(rel_path, u.scanned.language);
+
+        if let Some(stem) = Path::new(rel_path).file_stem().and_then(|s| s.to_str()) {
+            let key = stem.to_ascii_lowercase();
+            match stem_layer.get(&key) {
+                // A stem mapping to more than one architectural layer cannot identify a module.
+                Some(existing) if existing.0 != u.scanned.arch_layer => {
+                    ambiguous_stems.insert(key);
+                }
+                Some(_) => {}
+                None => {
+                    stem_layer.insert(
+                        key,
+                        (u.scanned.arch_layer, u.scanned.scope, u.scanned.language),
+                    );
+                }
+            }
         }
     }
 
     let mut edge_counts: BTreeMap<(ArchLayer, ArchLayer), (usize, usize)> = BTreeMap::new();
 
     for call in calls {
-        if !call.tier.is_resolved() {
+        // Only high-confidence resolutions contribute to layer dependency edges; ambiguous name
+        // guesses must never trigger a false architectural violation.
+        if !is_high_confidence_tier(call.tier) {
+            continue;
+        }
+        // Standard MCU boot vector handover (e.g. Reset_Handler -> main / HardFault_Handler)
+        // is startup entry dispatch rather than an upward architectural violation.
+        if matches!(call.caller_name.as_str(), "Reset_Handler" | "_start") {
             continue;
         }
         let from_info = sym_layer
@@ -379,6 +480,9 @@ fn compute_layer_edges(
 
     for u in units {
         let from_l = u.scanned.arch_layer;
+        let importer_language = u.scanned.language;
+        let importer_scope = u.scanned.scope;
+
         for imp in &u.imports {
             let clean = imp
                 .raw_path
@@ -387,18 +491,36 @@ fn compute_layer_edges(
                 .replace("::", "/")
                 .replace('\\', "/");
 
-            let matched_layer = file_layer.get(clean.as_str()).copied().or_else(|| {
-                let stem = Path::new(&clean)
-                    .file_stem()
-                    .and_then(|s| s.to_str())?
-                    .to_ascii_lowercase();
-                stem_layer.get(&stem).copied()
-            });
+            let mut matched: Option<(ArchLayer, FileScope, Option<LanguageKind>)> = None;
 
-            if let Some((to_l, _)) = matched_layer {
-                if from_l != to_l {
-                    edge_counts.entry((from_l, to_l)).or_default().1 += 1;
+            if let Some(&(layer, scope)) = file_layer.get(clean.as_str()) {
+                matched = Some((layer, scope, file_language.get(clean.as_str()).copied()));
+            } else if !imp.is_system {
+                for key in import_module_stems(&clean) {
+                    // Stem-only matches are only trusted for unambiguous, non-generic module names.
+                    if is_generic_import_stem(&key) || ambiguous_stems.contains(&key) {
+                        continue;
+                    }
+                    if let Some(&(layer, scope, language)) = stem_layer.get(&key) {
+                        matched = Some((layer, scope, Some(language)));
+                        break;
+                    }
                 }
+            }
+
+            let Some((to_l, to_scope, to_language)) = matched else {
+                continue;
+            };
+
+            let compatible = match to_language {
+                Some(language) => {
+                    import_target_compatible(importer_language, importer_scope, language, to_scope)
+                }
+                None => true,
+            };
+
+            if compatible && from_l != to_l {
+                edge_counts.entry((from_l, to_l)).or_default().1 += 1;
             }
         }
     }
@@ -546,5 +668,165 @@ mod tests {
         assert!(layer_edges
             .iter()
             .any(|e| e.from_layer == "drvs" && e.to_layer == "app" && e.is_upward_violation));
+    }
+
+    fn make_call(caller_id: &str, callee_id: &str, tier: ResolutionTier) -> ResolvedCallEdge {
+        let caller_name = caller_id.rsplit("::").next().unwrap_or(caller_id);
+        let callee_name = callee_id.rsplit("::").next().unwrap_or(callee_id);
+        ResolvedCallEdge {
+            caller_id: caller_id.to_string(),
+            caller_name: caller_name.to_string(),
+            callee_name: callee_name.to_string(),
+            callee_id: callee_id.to_string(),
+            file: format!("src/{caller_name}.c"),
+            line: 1,
+            tier,
+            section_id: "src".to_string(),
+        }
+    }
+
+    fn make_unit(
+        rel_path: &str,
+        scope: FileScope,
+        layer: ArchLayer,
+        language: LanguageKind,
+        imports: Vec<crate::model::ExtractedImport>,
+    ) -> ParsedFileUnit {
+        ParsedFileUnit {
+            scanned: crate::model::ScannedFile {
+                rel_path: rel_path.to_string(),
+                abs_path: std::path::PathBuf::from(rel_path),
+                language,
+                scope,
+                arch_layer: layer,
+                size_bytes: 128,
+                mtime_secs: 0,
+                blake3_hash: "hash".to_string(),
+                line_count: 10,
+            },
+            symbols: Vec::new(),
+            types: Vec::new(),
+            macros: Vec::new(),
+            imports,
+            raw_calls: Vec::new(),
+            raw_xrefs: Vec::new(),
+            parse_errors: 0,
+        }
+    }
+
+    fn make_import(file: &str, raw_path: &str) -> crate::model::ExtractedImport {
+        crate::model::ExtractedImport {
+            file: file.to_string(),
+            line: 1,
+            raw_path: raw_path.to_string(),
+            imported_names: Vec::new(),
+            is_system: false,
+        }
+    }
+
+    #[test]
+    fn test_ambiguous_name_calls_do_not_create_upward_layer_violations() {
+        let symbols = vec![
+            make_sym("s::main", "main", SymbolKind::Entrypoint, ArchLayer::App),
+            make_sym(
+                "s::drv_x",
+                "drv_x",
+                SymbolKind::Function,
+                ArchLayer::Drivers,
+            ),
+        ];
+
+        let calls = vec![
+            // High-confidence downward dependency: app -> drvs.
+            make_call("s::main", "s::drv_x", ResolutionTier::UniqueGlobal),
+            // Low-confidence name guess that points upward: drvs -> app.
+            make_call("s::drv_x", "s::main", ResolutionTier::AmbiguousName),
+        ];
+
+        let (_, _, _, layer_edges, _) = analyze_graph(symbols, &calls, &[]);
+
+        assert!(
+            layer_edges.iter().all(|e| !e.is_upward_violation),
+            "AmbiguousName edges must not produce upward layer violations: {layer_edges:?}"
+        );
+        assert!(layer_edges
+            .iter()
+            .all(|e| !(e.from_layer == "drvs" && e.to_layer == "app")));
+
+        let downward = layer_edges
+            .iter()
+            .find(|e| e.from_layer == "app" && e.to_layer == "drvs")
+            .expect("high-confidence downward edge must still be counted");
+        assert_eq!(downward.call_count, 1);
+    }
+
+    #[test]
+    fn test_import_layer_edges_require_unambiguous_module_stems() {
+        let units = vec![
+            make_unit(
+                "src/app/main.c",
+                FileScope::FirstParty,
+                ArchLayer::App,
+                LanguageKind::C,
+                vec![
+                    // Unambiguous module stem -> counted.
+                    make_import("src/app/main.c", "pwm"),
+                    // Same stem in two different layers -> ambiguous, skipped.
+                    make_import("src/app/main.c", "state"),
+                    // Generic filename stem -> skipped.
+                    make_import("src/app/main.c", "config"),
+                ],
+            ),
+            make_unit(
+                "src/drvs/pwm.h",
+                FileScope::FirstParty,
+                ArchLayer::Drivers,
+                LanguageKind::C,
+                Vec::new(),
+            ),
+            make_unit(
+                "src/drvs/state.h",
+                FileScope::FirstParty,
+                ArchLayer::Drivers,
+                LanguageKind::C,
+                Vec::new(),
+            ),
+            make_unit(
+                "src/core/state.h",
+                FileScope::FirstParty,
+                ArchLayer::Core,
+                LanguageKind::C,
+                Vec::new(),
+            ),
+            make_unit(
+                "src/drvs/config.h",
+                FileScope::FirstParty,
+                ArchLayer::Drivers,
+                LanguageKind::C,
+                Vec::new(),
+            ),
+            // Cross-language, non-first-party importer of the C `pwm` module -> skipped.
+            make_unit(
+                "vendor/py/bind.py",
+                FileScope::VendorSdk,
+                ArchLayer::VendorHal,
+                LanguageKind::Python,
+                vec![make_import("vendor/py/bind.py", "pwm")],
+            ),
+        ];
+
+        let (_, _, _, layer_edges, _) = analyze_graph(Vec::new(), &[], &units);
+
+        assert_eq!(
+            layer_edges.len(),
+            1,
+            "only the unambiguous, compatible cross-layer import should be counted: {layer_edges:?}"
+        );
+        let edge = &layer_edges[0];
+        assert_eq!(edge.from_layer, "app");
+        assert_eq!(edge.to_layer, "drvs");
+        assert_eq!(edge.import_count, 1);
+        assert_eq!(edge.call_count, 0);
+        assert!(!edge.is_upward_violation);
     }
 }
