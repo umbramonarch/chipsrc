@@ -6,18 +6,26 @@ All notable changes to this project are listed here. Versions follow
 
 ## [Unreleased]
 
+### Added
+
+- **Single-File Component (`.astro`, `.vue`, `.svelte`) & JSX/TSX Extraction (`model.rs`, `parser.rs`)**:
+  - Added byte-aligned SFC preprocessing (`preprocess_sfc_to_tsx`) that preserves exact 1:1 byte and line coordinates across frontmatter (`---`), `<script>` blocks, and component templates.
+  - Added component symbol synthesis, JSX/template PascalCase component usage call/xref edges (`<Component />`), nested helper arrow-function extraction, HTTP route handler entrypoint classification (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `ALL`), and exported constant indexing.
+
 ### Fixed
 
-- **Vendor SDK & Documentation Asset Filtering (`scanner.rs`, `sharder.rs`)**:
-  - Added composite vendor directory token classification (`driverlib`, `cmsis`, `stm32`, `freertos`, `third_party`, `3rdparty`, `vendor`, `hal_driver`) and reference directory rules (`references`, `reference`, `deps`, `bundled`, `svd`).
-  - Excluded static documentation output folders (`_static`, `doxygen`, `html`, `site`, `coverage`, `htmlcov`, `wheelhouse`) and bundled third-party JavaScript assets (`*.min.js`, `jquery*`, `modernizr*`, `underscore*`, `bootstrap*`, `mermaid*`, `prettify*`, `searchdata*`, `navtree*`, `dynsections*`).
-  - Changed shard group scope resolution to dominant/majority ownership and compacted `VendorMode::Active` vendor shards to active hardware/SDK symbols, types, macros, and headers.
-- **C/C++ Preprocessor Qualifier Normalization & Doc Summaries (`parser.rs`, `sanity.rs`)**:
-  - Added byte-length-preserving normalization for C/C++ storage and qualifier macros (`STATIC`, `CONST`, `INLINE`, `__STATIC_INLINE`, `__STATIC_FORCEINLINE`, `SYSCONFIG_WEAK`, `__WEAK`, `__IRQ`, `__INTERRUPT`, `__RAMFUNC`, `__PACKED`) before Tree-sitter parsing, eliminating false CST syntax errors while preserving exact byte/line coordinates and `static` visibility detection.
-  - Filtered C control-flow keywords from misparsed conditional blocks and skipped decorative ASCII divider lines when extracting doc summaries.
-- **Cross-Language Call Isolation, Header Prototype Merging & Layer Edges (`resolver.rs`, `graph.rs`)**:
-  - Merged C/C++ forward header prototype declarations into matching `.c`/`.cpp` implementations and transferred header docstrings when needed so `#include` callers resolve directly to the implementation.
-  - Restricted call resolution to compatible language families (`C/C++`, `Rust`, `Python`, `TS/JS`), guarded language built-ins and external module/member receivers (`obj.get()`, `session.commit()`, `time.sleep()`), and limited layer-violation edges to high-confidence resolutions and unambiguous module stems.
+- **Vendor-Neutral SDK & Asset Classification (`scanner.rs`, `sharder.rs`)**:
+  - Replaced hardcoded chip/vendor tokens with structural composite directory sub-token classification (`driverlib`, `cmsis`, `thirdparty`, `3rdparty`, `vendor`, `svd`, `sdk`, `bundled`, `submodules`, `middlewares`) and root-scoped reference directories (`references/`, `reference/`).
+  - Removed overly broad directory exclusions (`html`, `site`) and refined bundled JavaScript asset detection (`*.min.js`, `*.bundle.js`, versioned doc-generator scripts) so first-party modules (`bootstrap.js`, `site/`, `html/`) are never dropped.
+  - Changed shard group scope resolution to dominant/majority ownership, synchronized fallback `ArchLayer::Other` symbol/type/macro layers with their module shard, and filtered `VendorMode::Active` shards strictly to retained active files.
+- **Context-Aware C/C++ Qualifier Normalization & Signature Extraction (`parser.rs`, `sanity.rs`)**:
+  - Replaced hardcoded vendor macro tables with structural top-level (`brace_depth == 0 && paren_depth == 0`) declaration-context normalization for `STATIC`, `CONST`, `INLINE`, `*_STATIC_INLINE`, `*_FORCEINLINE`, `*_WEAK`, `*_IRQ`, `*_INTERRUPT`, `*_RAMFUNC`, and `*_PACKED`, preserving `enum { STATIC = 0, CONST = 1 };` and exact byte lengths.
+  - Fixed `extract_clean_signature` to use AST block body boundaries and parenthesis-aware brace splitting so destructured parameters (`({ request }) =>`) and object literals are never truncated.
+  - Filtered C control-flow keywords from misparsed conditional blocks and skipped decorative ASCII divider banners (`---- label ----`, `====`) when extracting doc summaries.
+- **Cross-Language Call Isolation, Relative Import Resolution & Query Precision (`resolver.rs`, `graph.rs`, `query.rs`)**:
+  - Merged C/C++ forward header prototype declarations into matching `.c`/`.cpp` implementations with exact case and parameter-arity checking.
+  - Added caller `enclosing_type` binding for `self`/`this`/`cls` receivers, import-aware builtin guards, relative import path normalization (`./`, `../`), and receiver filtering in Tier 2 (`ImportResolved`).
+  - Improved 1-turn CLI queries (`sym`, `type`, `callers`, `callees`) to suppress low-confidence substring matches when exact symbol/type matches exist.
 
 ## [1.0.0] - 2026-10-27
 

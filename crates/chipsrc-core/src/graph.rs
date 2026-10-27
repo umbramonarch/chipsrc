@@ -132,8 +132,13 @@ pub fn analyze_graph(
                     && in_degree == 0
                     && out_degree > 0);
 
+            let mut symbol = sym.clone();
+            if is_entrypoint && symbol.kind == SymbolKind::Function {
+                symbol.kind = SymbolKind::Entrypoint;
+            }
+
             RankedSymbol {
-                symbol: sym.clone(),
+                symbol,
                 pagerank: ranks[i],
                 in_degree,
                 out_degree,
@@ -336,11 +341,6 @@ fn is_generic_import_stem(stem: &str) -> bool {
     GENERIC_IMPORT_STEMS.contains(&stem)
 }
 
-const SOURCE_EXTENSIONS: &[&str] = &[
-    "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx", "inl", "rs", "py", "pyi", "ts", "tsx", "mts",
-    "cts", "js", "jsx", "mjs", "cjs",
-];
-
 /// Candidate module stems referenced by an import path, ordered from most to least specific.
 ///
 /// Grouped imports (`use a::b::{c, d}`) only name modules in their prefix, and relative segments
@@ -363,7 +363,9 @@ fn import_module_stems(clean_path: &str) -> Vec<String> {
         }
 
         let stem = match lower.rsplit_once('.') {
-            Some((stem, ext)) if !stem.is_empty() && SOURCE_EXTENSIONS.contains(&ext) => {
+            Some((stem, ext))
+                if !stem.is_empty() && LanguageKind::from_extension(ext).is_some() =>
+            {
                 stem.to_string()
             }
             _ => lower.clone(),
@@ -379,18 +381,6 @@ fn import_module_stems(clean_path: &str) -> Vec<String> {
     stems
 }
 
-fn language_family(lang: LanguageKind) -> u8 {
-    match lang {
-        LanguageKind::C | LanguageKind::Cpp => 0,
-        LanguageKind::Rust => 1,
-        LanguageKind::Python => 2,
-        LanguageKind::TypeScript
-        | LanguageKind::Tsx
-        | LanguageKind::JavaScript
-        | LanguageKind::Jsx => 3,
-    }
-}
-
 /// An import edge is only trusted between compatible language families, or between two
 /// first-party files (where build-system glue may legitimately cross languages).
 fn import_target_compatible(
@@ -399,7 +389,7 @@ fn import_target_compatible(
     target_language: LanguageKind,
     target_scope: FileScope,
 ) -> bool {
-    language_family(importer_language) == language_family(target_language)
+    importer_language.language_family() == target_language.language_family()
         || (importer_scope == FileScope::FirstParty && target_scope == FileScope::FirstParty)
 }
 
@@ -416,14 +406,18 @@ fn compute_layer_edges(
     units: &[ParsedFileUnit],
 ) -> Vec<LayerDependencyEdge> {
     let mut sym_layer: FxHashMap<&str, (ArchLayer, FileScope)> = FxHashMap::default();
+    let mut sym_kind: FxHashMap<&str, SymbolKind> = FxHashMap::default();
     let mut file_layer: FxHashMap<&str, (ArchLayer, FileScope)> = FxHashMap::default();
     let mut file_language: FxHashMap<&str, LanguageKind> = FxHashMap::default();
+    let mut no_ext_layer: FxHashMap<String, (ArchLayer, FileScope, LanguageKind)> =
+        FxHashMap::default();
     let mut stem_layer: FxHashMap<String, (ArchLayer, FileScope, LanguageKind)> =
         FxHashMap::default();
     let mut ambiguous_stems: FxHashSet<String> = FxHashSet::default();
 
     for sym in symbols {
         sym_layer.insert(sym.symbol_id.as_str(), (sym.arch_layer, sym.scope));
+        sym_kind.insert(sym.symbol_id.as_str(), sym.kind);
         file_layer
             .entry(sym.file.as_str())
             .or_insert((sym.arch_layer, sym.scope));
@@ -433,6 +427,18 @@ fn compute_layer_edges(
         let rel_path = u.scanned.rel_path.as_str();
         file_layer.insert(rel_path, (u.scanned.arch_layer, u.scanned.scope));
         file_language.insert(rel_path, u.scanned.language);
+
+        let norm_rel = rel_path.replace('\\', "/");
+        let without_ext = match norm_rel.rsplit_once('.') {
+            Some((prefix, ext)) if LanguageKind::from_extension(ext).is_some() => {
+                prefix.to_string()
+            }
+            _ => norm_rel.clone(),
+        };
+        no_ext_layer.insert(
+            without_ext,
+            (u.scanned.arch_layer, u.scanned.scope, u.scanned.language),
+        );
 
         if let Some(stem) = Path::new(rel_path).file_stem().and_then(|s| s.to_str()) {
             let key = stem.to_ascii_lowercase();
@@ -460,9 +466,15 @@ fn compute_layer_edges(
         if !is_high_confidence_tier(call.tier) {
             continue;
         }
-        // Standard MCU boot vector handover (e.g. Reset_Handler -> main / HardFault_Handler)
-        // is startup entry dispatch rather than an upward architectural violation.
-        if matches!(call.caller_name.as_str(), "Reset_Handler" | "_start") {
+        // Boot / startup entrypoints or vector table handlers in BSP / VendorHal dispatching into
+        // application entrypoints are startup vector handovers rather than upward layer violations.
+        let is_startup_dispatch = sym_kind
+            .get(call.caller_id.as_str())
+            .is_some_and(|k| matches!(k, SymbolKind::Entrypoint | SymbolKind::Isr))
+            && sym_layer
+                .get(call.caller_id.as_str())
+                .is_some_and(|(l, _)| matches!(l, ArchLayer::VendorHal | ArchLayer::Bsp));
+        if is_startup_dispatch || matches!(call.caller_name.as_str(), "Reset_Handler" | "_start") {
             continue;
         }
         let from_info = sym_layer
@@ -495,7 +507,18 @@ fn compute_layer_edges(
 
             if let Some(&(layer, scope)) = file_layer.get(clean.as_str()) {
                 matched = Some((layer, scope, file_language.get(clean.as_str()).copied()));
-            } else if !imp.is_system {
+            } else if let Some(rel_target) =
+                resolve_relative_path_no_ext(&u.scanned.rel_path, &clean)
+            {
+                if let Some(&(layer, scope, lang)) = no_ext_layer
+                    .get(&rel_target)
+                    .or_else(|| no_ext_layer.get(&format!("{rel_target}/index")))
+                {
+                    matched = Some((layer, scope, Some(lang)));
+                }
+            }
+
+            if matched.is_none() && !imp.is_system {
                 for key in import_module_stems(&clean) {
                     // Stem-only matches are only trusted for unambiguous, non-generic module names.
                     if is_generic_import_stem(&key) || ambiguous_stems.contains(&key) {
@@ -557,6 +580,32 @@ fn compute_layer_edges(
     });
 
     edges
+}
+
+fn resolve_relative_path_no_ext(caller_file: &str, clean_import: &str) -> Option<String> {
+    if !clean_import.starts_with("./") && !clean_import.starts_with("../") {
+        return None;
+    }
+    let caller_norm = caller_file.replace('\\', "/");
+    let mut stack: Vec<&str> = caller_norm.split('/').collect();
+    if !stack.is_empty() {
+        stack.pop();
+    }
+    for seg in clean_import.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    let joined = stack.join("/");
+    let stripped = match joined.rsplit_once('.') {
+        Some((prefix, ext)) if LanguageKind::from_extension(ext).is_some() => prefix.to_string(),
+        _ => joined,
+    };
+    Some(stripped)
 }
 
 #[cfg(test)]

@@ -78,13 +78,19 @@ pub fn parse_source_str(scanned: &ScannedFile, source: &str) -> Result<ParsedFil
         .set_language(&ts_lang)
         .map_err(|e| ChipsrcError::ParserConfig(e.to_string()))?;
 
-    // Tree-sitter parses un-preprocessed C/C++. Uppercase storage/qualifier macros written in
-    // front of declarations (`STATIC void f(void)`, `__STATIC_INLINE ...`) are therefore CST
-    // errors. Rewrite those standalone identifier tokens to same-byte-length valid C keywords
-    // so every node range still maps 1:1 onto the original `source` bytes.
-    let normalized_source = match scanned.language {
-        LanguageKind::C | LanguageKind::Cpp => normalize_c_qualifier_macros(source),
-        _ => None,
+    let is_sfc = is_sfc_file(&scanned.rel_path);
+
+    // Prepare a byte-length- and line-preserving parse buffer when needed:
+    // - For C/C++: rewrite top-level uppercase qualifier/attribute macros to valid C keywords/spaces.
+    // - For Single-File Components (`.astro`, `.vue`, `.svelte`): project frontmatter and
+    //   `<script>` blocks into TSX while blanking template markup with spaces (`\n` preserved).
+    let normalized_source = if is_sfc {
+        Some(preprocess_sfc_to_tsx(source, &scanned.rel_path))
+    } else {
+        match scanned.language {
+            LanguageKind::C | LanguageKind::Cpp => normalize_c_qualifier_macros(source),
+            _ => None,
+        }
     };
     let parse_bytes: &[u8] = match normalized_source.as_deref() {
         Some(bytes) => bytes,
@@ -121,6 +127,10 @@ pub fn parse_source_str(scanned: &ScannedFile, source: &str) -> Result<ParsedFil
 
     let root = tree.root_node();
     walk_ast(&mut ctx, root, None, None);
+
+    if is_sfc {
+        extract_sfc_component_and_template(&mut ctx, source);
+    }
 
     // For C/C++ header files (.h / .hpp), include prototype declarations that do not already
     // have an inline function_definition in the same header.
@@ -209,29 +219,10 @@ fn is_c_or_cpp_header(rel_path: &str) -> bool {
         || lower.ends_with(".inl")
 }
 
-/// Standalone uppercase storage-class / qualifier macros that routinely precede declarations in
-/// C and C++ firmware/SDK code, paired with an **exactly same-byte-length** valid-C replacement.
-///
-/// Rewriting them before Tree-sitter parsing removes false `ERROR` nodes (which otherwise inflate
-/// `parse_errors` and hide `static` visibility) while keeping every byte offset, line, and column
-/// produced by the parser identical to the original source.
-const C_QUALIFIER_NORMALIZATIONS: &[(&str, &str)] = &[
-    ("__STATIC_FORCEINLINE", "static inline       "),
-    ("__STATIC_INLINE", "static inline  "),
-    ("SYSCONFIG_WEAK", "              "),
-    ("__INTERRUPT", "           "),
-    ("__RAMFUNC", "         "),
-    ("__INLINE", "inline  "),
-    ("__PACKED", "        "),
-    ("STATIC", "static"),
-    ("CONST", "const"),
-    ("INLINE", "inline"),
-    ("__WEAK", "      "),
-    ("__IRQ", "     "),
-];
-
-/// Uppercase qualifier macros that imply C `static` storage class / internal linkage.
-const C_STATIC_QUALIFIER_MACROS: &[&str] = &["STATIC", "__STATIC_INLINE", "__STATIC_FORCEINLINE"];
+fn is_sfc_file(rel_path: &str) -> bool {
+    let lower = rel_path.to_ascii_lowercase();
+    lower.ends_with(".astro") || lower.ends_with(".vue") || lower.ends_with(".svelte")
+}
 
 fn is_c_ident_start(b: u8) -> bool {
     b == b'_' || b.is_ascii_alphabetic()
@@ -254,21 +245,101 @@ fn line_is_preproc_directive(bytes: &[u8], line_start: usize, pos: usize) -> boo
     false
 }
 
-/// Byte-length-preserving normalization of [`C_QUALIFIER_NORMALIZATIONS`] tokens.
+/// Classifies a top-level C/C++ uppercase qualifier/attribute macro token into the valid C
+/// keyword prefix (`"static inline"`, `"static"`, `"inline"`, `"const"`, or `""` for pure
+/// attribute/weak/section/ISR macros) that should replace it while preserving exact byte length.
+fn classify_c_qualifier_macro_replacement(token: &[u8]) -> Option<&'static [u8]> {
+    let s = std::str::from_utf8(token).ok()?;
+    if s.len() < 3
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        || !s.bytes().any(|b| b.is_ascii_uppercase())
+    {
+        return None;
+    }
+
+    if s == "STATIC" {
+        return Some(b"static");
+    }
+    if s == "CONST" {
+        return Some(b"const");
+    }
+    if s.len() >= 13
+        && (s == "__STATIC_INLINE"
+            || s == "__STATIC_FORCEINLINE"
+            || s == "STATIC_INLINE"
+            || s == "STATIC_FORCEINLINE"
+            || s.ends_with("_STATIC_INLINE")
+            || s.ends_with("_STATIC_FORCEINLINE"))
+    {
+        return Some(b"static inline");
+    }
+    if s.len() >= 6
+        && (s == "INLINE"
+            || s == "__INLINE"
+            || s == "__INLINE__"
+            || s == "FORCEINLINE"
+            || s == "__FORCEINLINE"
+            || s.ends_with("_INLINE")
+            || s.ends_with("_FORCEINLINE"))
+    {
+        return Some(b"inline");
+    }
+    if matches!(
+        s,
+        "WEAK"
+            | "__WEAK"
+            | "__IRQ"
+            | "__INTERRUPT"
+            | "__RAMFUNC"
+            | "RAMFUNC"
+            | "__PACKED"
+            | "PACKED"
+    ) || s.ends_with("_WEAK")
+        || s.ends_with("_IRQ")
+        || s.ends_with("_INTERRUPT")
+        || s.ends_with("_RAMFUNC")
+        || s.ends_with("_PACKED")
+        || s.ends_with("_ATTR")
+        || s.ends_with("_ATTRIBUTE")
+    {
+        return Some(b"");
+    }
+
+    None
+}
+
+/// Returns true when the token ending at `after_token` is followed on the same declaration by
+/// another identifier or pointer `*` (e.g. `STATIC void f(void)` or `CONST char *p`), rather than
+/// `=`, `,`, `;`, `)`, or `}` (such as `enum { STATIC = 0, CONST = 1 };`).
+fn is_followed_by_c_decl_token(bytes: &[u8], mut pos: usize) -> bool {
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b' ' | b'\t' | b'\r' | b'\n' => pos += 1,
+            b'*' => return true,
+            b if is_c_ident_start(b) => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Byte-length-preserving normalization of top-level C/C++ storage-class and attribute macros.
 ///
-/// Identifier tokens inside string literals, character literals, line/block comments, and
-/// preprocessor directives (including backslash-continued ones) are left untouched. Returns
-/// `None` when no rewrite is needed so callers can avoid an allocation.
+/// Only rewrites qualifier tokens at top-level (`brace_depth == 0 && paren_depth == 0`) that are
+/// followed by a declaration type/identifier token, leaving `enum { STATIC = 0 }`, preprocessor
+/// directives, comments, and literals completely untouched.
 fn normalize_c_qualifier_macros(source: &str) -> Option<Vec<u8>> {
     let bytes = source.as_bytes();
     let mut out: Option<Vec<u8>> = None;
     let mut i = 0usize;
     let mut line_start = 0usize;
-    // Set when the *current* physical line continues a preprocessor directive via a trailing `\`.
     let mut in_continued_directive = false;
-    // Cached "is the current physical line a preprocessor directive" answer for this line.
     let mut line_directive_known = false;
     let mut line_directive = false;
+    let mut brace_depth = 0u32;
+    let mut paren_depth = 0u32;
 
     while i < bytes.len() {
         let b = bytes[i];
@@ -285,8 +356,6 @@ fn normalize_c_qualifier_macros(source: &str) -> Option<Vec<u8>> {
                 && (in_continued_directive || line_is_preproc_directive(bytes, line_start, i));
             in_continued_directive = continues;
             line_start = i + 1;
-            // A continued directive line is known up front; otherwise resolve it lazily on the
-            // first identifier token of the line.
             line_directive_known = continues;
             line_directive = continues;
             i += 1;
@@ -348,6 +417,30 @@ fn normalize_c_qualifier_macros(source: &str) -> Option<Vec<u8>> {
             continue;
         }
 
+        match b {
+            b'{' => {
+                brace_depth = brace_depth.saturating_add(1);
+                i += 1;
+                continue;
+            }
+            b'}' => {
+                brace_depth = brace_depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+            b'(' => {
+                paren_depth = paren_depth.saturating_add(1);
+                i += 1;
+                continue;
+            }
+            b')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
         if is_c_ident_start(b) {
             let start = i;
             while i < bytes.len() && is_c_ident_continue(bytes[i]) {
@@ -357,21 +450,15 @@ fn normalize_c_qualifier_macros(source: &str) -> Option<Vec<u8>> {
                 line_directive = line_is_preproc_directive(bytes, line_start, start);
                 line_directive_known = true;
             }
-            if !line_directive {
+            if !line_directive && brace_depth == 0 && paren_depth == 0 {
                 let token = &bytes[start..i];
-                if let Some(&(_, replacement)) = C_QUALIFIER_NORMALIZATIONS
-                    .iter()
-                    .find(|(from, _)| from.as_bytes() == token)
-                {
-                    debug_assert_eq!(
-                        token.len(),
-                        replacement.len(),
-                        "C qualifier normalization must preserve byte length"
-                    );
-                    out.get_or_insert_with(|| bytes.to_vec())
-                        .get_mut(start..i)
-                        .expect("in-range token slice")
-                        .copy_from_slice(replacement.as_bytes());
+                if let Some(kw) = classify_c_qualifier_macro_replacement(token) {
+                    if kw.len() <= token.len() && is_followed_by_c_decl_token(bytes, i) {
+                        let buf = out.get_or_insert_with(|| bytes.to_vec());
+                        let dst = &mut buf[start..i];
+                        dst.fill(b' ');
+                        dst[..kw.len()].copy_from_slice(kw);
+                    }
                 }
             }
             continue;
@@ -671,7 +758,12 @@ fn extract_c_cpp_function(
 fn c_decl_header_is_static(decl_header: &str) -> bool {
     decl_header
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .any(|tok| tok == "static" || C_STATIC_QUALIFIER_MACROS.contains(&tok))
+        .any(|tok| {
+            tok == "static"
+                || tok == "STATIC"
+                || tok.contains("STATIC_INLINE")
+                || tok.contains("STATIC_FORCEINLINE")
+        })
 }
 
 fn extract_c_typedef(ctx: &mut ExtractContext<'_>, node: Node<'_>) {
@@ -1669,7 +1761,7 @@ fn handle_ts_js_node(
     next_enclosing_fn: &mut Option<(String, usize)>,
 ) {
     match kind {
-        "class_declaration" | "interface_declaration" => {
+        "class_declaration" | "abstract_class_declaration" | "interface_declaration" => {
             if let Some(ty_name) = extract_ts_js_type(ctx, node, kind) {
                 *next_enclosing_type = Some(ty_name);
             }
@@ -1687,21 +1779,78 @@ fn handle_ts_js_node(
             }
         }
         "variable_declarator" => {
-            if enclosing_fn.is_none() {
-                if let Some(sym) = extract_ts_js_arrow_or_const(ctx, node, enclosing_type) {
-                    *next_enclosing_fn = Some((sym.name.clone(), sym.start_line));
-                    ctx.symbols.push(sym);
-                }
+            if let Some(sym) = extract_ts_js_arrow_or_const(ctx, node, enclosing_type, enclosing_fn)
+            {
+                *next_enclosing_fn = Some((sym.name.clone(), sym.start_line));
+                ctx.symbols.push(sym);
             }
         }
         "import_statement" => {
             extract_ts_js_import(ctx, node, enclosing_fn);
+        }
+        "export_statement" => {
+            if node.child_by_field_name("source").is_some() {
+                extract_ts_js_import(ctx, node, enclosing_fn);
+            }
+        }
+        "jsx_opening_element" | "jsx_self_closing_element" => {
+            extract_jsx_component_use(ctx, node, enclosing_fn);
         }
         "call_expression" | "new_expression" => {
             extract_call_site(ctx, node, enclosing_fn);
         }
         _ => {}
     }
+}
+
+fn extract_jsx_component_use(
+    ctx: &mut ExtractContext<'_>,
+    node: Node<'_>,
+    enclosing_fn: Option<(&str, usize)>,
+) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let raw_name = normalize_whitespace(node_text(name_node, ctx.bytes));
+    let Some((callee_name, receiver_or_qualifier)) = parse_callee_expression(&raw_name) else {
+        return;
+    };
+    if !callee_name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+    {
+        return;
+    }
+
+    let (caller_name, caller_start_line) = match enclosing_fn {
+        Some((name, start)) => (name.to_string(), start),
+        None => ("<module_init>".to_string(), 1),
+    };
+    let call_line = node.start_position().row + 1;
+    let context_line = ctx
+        .lines
+        .get(call_line.saturating_sub(1))
+        .map(|l| l.trim().to_string())
+        .unwrap_or_else(|| truncate_str(&normalize_whitespace(node_text(node, ctx.bytes)), 120));
+
+    ctx.raw_calls.push(RawCallSite {
+        caller_file: ctx.scanned.rel_path.clone(),
+        caller_name: caller_name.clone(),
+        caller_start_line,
+        callee_name: callee_name.clone(),
+        receiver_or_qualifier,
+        call_line,
+    });
+
+    ctx.raw_xrefs.push(RawXrefSite {
+        file: ctx.scanned.rel_path.clone(),
+        line: call_line,
+        enclosing_symbol: Some(caller_name),
+        target_name: callee_name,
+        category: "call".to_string(),
+        context: truncate_str(&context_line, 120),
+    });
 }
 
 fn extract_ts_js_function(
@@ -1771,22 +1920,25 @@ fn extract_ts_js_arrow_or_const(
     ctx: &mut ExtractContext<'_>,
     node: Node<'_>,
     enclosing_type: Option<&str>,
+    enclosing_fn: Option<(&str, usize)>,
 ) -> Option<ExtractedSymbol> {
     let name_node = node.child_by_field_name("name")?;
     let name = node_text(name_node, ctx.bytes).trim().to_string();
-    if name.is_empty() {
+    if name.is_empty() || !is_valid_identifier(&name) {
         return None;
     }
     let val_node = node.child_by_field_name("value")?;
     let vkind = val_node.kind();
 
     let decl_parent = node.parent().unwrap_or(node);
-    let is_exported = decl_parent
+    let export_wrapper = decl_parent
         .parent()
-        .is_some_and(|p| p.kind() == "export_statement");
+        .filter(|p| p.kind() == "export_statement");
+    let is_exported = export_wrapper.is_some();
+    let outer_decl = export_wrapper.unwrap_or(decl_parent);
 
     if vkind == "arrow_function" || vkind == "function_expression" || vkind == "function" {
-        let start_line = decl_parent.start_position().row + 1;
+        let start_line = outer_decl.start_position().row + 1;
         let end_line = node.end_position().row + 1;
         let doc_summary = extract_preceding_doc(ctx.lines, start_line);
         let visibility = if is_exported {
@@ -1794,7 +1946,7 @@ fn extract_ts_js_arrow_or_const(
         } else {
             Visibility::Internal
         };
-        let full_text = node_text(decl_parent, ctx.bytes);
+        let full_text = node_text(outer_decl, ctx.bytes);
         let kind = classify_symbol_kind(
             &name,
             enclosing_type,
@@ -1807,7 +1959,7 @@ fn extract_ts_js_arrow_or_const(
             None => name.clone(),
         };
         let symbol_id = format!("{}::{}", ctx.scanned.rel_path, qualified_name);
-        let signature = extract_clean_signature(decl_parent, ctx.bytes);
+        let signature = extract_clean_signature(outer_decl, ctx.bytes);
 
         return Some(ExtractedSymbol {
             symbol_id,
@@ -1827,13 +1979,85 @@ fn extract_ts_js_arrow_or_const(
         });
     }
 
-    // Check top-level SCREAMING_SNAKE_CASE constant
-    if is_screaming_snake_case(&name) {
+    if enclosing_fn.is_some() {
+        return None;
+    }
+
+    // Exported function/handler alias: e.g. `export const GET = methodNotAllowed;`
+    if is_exported && vkind == "identifier" {
+        let target_ident = node_text(val_node, ctx.bytes).trim();
+        let references_known_fn = ctx.symbols.iter().any(|s| s.name == target_ident);
+        if is_http_method_handler(&name) || references_known_fn {
+            let start_line = outer_decl.start_position().row + 1;
+            let end_line = node.end_position().row + 1;
+            let doc_summary = extract_preceding_doc(ctx.lines, start_line);
+            let full_text = node_text(outer_decl, ctx.bytes);
+            let kind = classify_symbol_kind(
+                &name,
+                enclosing_type,
+                false,
+                ctx.scanned.arch_layer,
+                full_text,
+            );
+            let qualified_name = match enclosing_type {
+                Some(enc) => format!("{enc}::{name}"),
+                None => name.clone(),
+            };
+            let symbol_id = format!("{}::{}", ctx.scanned.rel_path, qualified_name);
+            let signature = extract_clean_signature(outer_decl, ctx.bytes);
+
+            if is_valid_identifier(target_ident) {
+                ctx.raw_calls.push(RawCallSite {
+                    caller_file: ctx.scanned.rel_path.clone(),
+                    caller_name: name.clone(),
+                    caller_start_line: start_line,
+                    callee_name: target_ident.to_string(),
+                    receiver_or_qualifier: None,
+                    call_line: start_line,
+                });
+                ctx.raw_xrefs.push(RawXrefSite {
+                    file: ctx.scanned.rel_path.clone(),
+                    line: start_line,
+                    enclosing_symbol: Some(name.clone()),
+                    target_name: target_ident.to_string(),
+                    category: "call".to_string(),
+                    context: truncate_str(&normalize_whitespace(full_text), 120),
+                });
+            }
+
+            return Some(ExtractedSymbol {
+                symbol_id,
+                name,
+                qualified_name,
+                kind,
+                visibility: Visibility::Public,
+                file: ctx.scanned.rel_path.clone(),
+                start_line,
+                end_line,
+                signature,
+                doc_summary,
+                enclosing_type: enclosing_type.map(ToOwned::to_owned),
+                scope: ctx.scanned.scope,
+                arch_layer: ctx.scanned.arch_layer,
+                section_id: ctx.section_id.to_string(),
+            });
+        }
+    }
+
+    // Check top-level SCREAMING_SNAKE_CASE constant or exported module constant
+    let is_const_decl = node_text(decl_parent, ctx.bytes)
+        .trim_start()
+        .starts_with("const ");
+    if is_screaming_snake_case(&name) || (is_exported && is_const_decl) {
         let raw_val = normalize_whitespace(node_text(val_node, ctx.bytes));
         let (mut kind, hex_addr, mut description) = classify_macro_value(&name, &raw_val, false);
         if kind == MacroKind::ObjectMacro {
             kind = MacroKind::Constant;
-            description = "Module constant".to_string();
+            description = if is_exported {
+                "Exported constant".to_string()
+            } else {
+                "Module constant".to_string()
+            };
         }
         let line = node.start_position().row + 1;
         ctx.macros.push(ExtractedMacro {
@@ -1851,6 +2075,13 @@ fn extract_ts_js_arrow_or_const(
     }
 
     None
+}
+
+fn is_http_method_handler(name: &str) -> bool {
+    matches!(
+        name,
+        "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS" | "ALL"
+    )
 }
 
 fn extract_ts_js_type(
@@ -2095,8 +2326,10 @@ fn parse_callee_expression(raw: &str) -> Option<(String, Option<String>)> {
         (Some(q.trim().to_string()), l.trim())
     } else if let Some((q, l)) = cleaned.rsplit_once("->") {
         (Some(q.trim().to_string()), l.trim())
-    } else if let Some((q, l)) = cleaned.rsplit_once('.') {
+    } else if let Some((q, l)) = cleaned.rsplit_once("?.") {
         (Some(q.trim().to_string()), l.trim())
+    } else if let Some((q, l)) = cleaned.rsplit_once('.') {
+        (Some(q.trim().trim_end_matches('?').to_string()), l.trim())
     } else {
         (None, cleaned)
     };
@@ -2151,10 +2384,11 @@ fn classify_symbol_kind(
         return SymbolKind::Method;
     }
 
-    // 5. Top-level CLI/API entrypoints
-    if matches!(arch_layer, ArchLayer::Cli | ArchLayer::Api)
+    // 5. Top-level CLI/API/App entrypoints
+    if matches!(arch_layer, ArchLayer::Cli | ArchLayer::Api | ArchLayer::App)
         && (name.starts_with("cmd_")
             || name.starts_with("handle_")
+            || is_http_method_handler(name)
             || full_text.contains("@app.")
             || full_text.contains("@router."))
     {
@@ -2205,10 +2439,33 @@ fn extract_declarator_name(node: Node<'_>, bytes: &[u8]) -> Option<String> {
 
 fn extract_clean_signature(node: Node<'_>, bytes: &[u8]) -> String {
     let start = node.start_byte();
-    let end = node
-        .child_by_field_name("body")
-        .map(|b| b.start_byte())
-        .unwrap_or_else(|| node.end_byte());
+    let mut has_block_body = false;
+    let end = if let Some(body) = node.child_by_field_name("body") {
+        has_block_body = true;
+        body.start_byte()
+    } else if let Some(fn_node) = find_first_descendant_of_kind(node, "arrow_function")
+        .or_else(|| find_first_descendant_of_kind(node, "function_expression"))
+        .or_else(|| find_first_descendant_of_kind(node, "function"))
+        .or_else(|| find_first_descendant_of_kind(node, "generator_function"))
+    {
+        if let Some(body) = fn_node.child_by_field_name("body") {
+            if matches!(
+                body.kind(),
+                "statement_block" | "compound_statement" | "block"
+            ) {
+                has_block_body = true;
+                body.start_byte()
+            } else {
+                // Concise expression-body arrow function: keep the declaration header or one-liner
+                has_block_body = true;
+                node.end_byte()
+            }
+        } else {
+            node.end_byte()
+        }
+    } else {
+        node.end_byte()
+    };
 
     let slice = if end > start && end <= bytes.len() {
         std::str::from_utf8(&bytes[start..end]).unwrap_or("")
@@ -2216,8 +2473,12 @@ fn extract_clean_signature(node: Node<'_>, bytes: &[u8]) -> String {
         node_text(node, bytes)
     };
 
-    // Cut at `{` if body start was not a named field (e.g. arrow function or prototype)
-    let before_brace = slice.split('{').next().unwrap_or(slice);
+    // Only cut at `{` outside `(...)` when no block body boundary was resolved via AST
+    let before_brace = if has_block_body {
+        slice
+    } else {
+        split_at_top_level_brace(slice)
+    };
     let normalized = normalize_whitespace(before_brace);
     let trimmed = normalized
         .trim_end_matches('{')
@@ -2226,6 +2487,19 @@ fn extract_clean_signature(node: Node<'_>, bytes: &[u8]) -> String {
         .trim();
 
     truncate_str(trimmed, 160)
+}
+
+fn split_at_top_level_brace(slice: &str) -> &str {
+    let mut paren_depth = 0usize;
+    for (idx, ch) in slice.char_indices() {
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '{' if paren_depth == 0 => return &slice[..idx],
+            _ => {}
+        }
+    }
+    slice
 }
 
 fn extract_preceding_doc(lines: &[&str], start_line: usize) -> String {
@@ -2316,7 +2590,16 @@ fn extract_preceding_doc(lines: &[&str], start_line: usize) -> String {
 /// Such lines are ignored when locating the doc summary of a symbol or type, so a decorative
 /// divider placed directly above or below a real description does not hide it.
 fn is_decorative_doc_line(cleaned: &str) -> bool {
-    !cleaned.chars().any(|c| c.is_alphanumeric())
+    if !cleaned.chars().any(|c| c.is_alphanumeric()) {
+        return true;
+    }
+    let trimmed = cleaned.trim();
+    if (trimmed.starts_with("---") && trimmed.ends_with("---"))
+        || (trimmed.starts_with("===") && trimmed.ends_with("==="))
+    {
+        return true;
+    }
+    false
 }
 
 fn clean_doc_line(trimmed: &str) -> String {
@@ -2426,6 +2709,387 @@ fn is_screaming_snake_case(s: &str) -> bool {
         && s.bytes().any(|b| b.is_ascii_uppercase())
         && s.bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+// ============================================================================
+// Single-File Component (`.astro`, `.vue`, `.svelte`) Preprocessing & Template Extraction
+// ============================================================================
+
+/// Builds a byte-aligned TSX buffer of the exact same byte length as `source`, preserving all
+/// `\n` and `\r` characters at their original byte offsets while blanking non-script markup to
+/// spaces (`b' '`). Copies Astro `---` frontmatter and `<script>` blocks verbatim so Tree-sitter
+/// TSX parses all embedded TypeScript/JavaScript with 1:1 line and byte coordinates.
+fn preprocess_sfc_to_tsx(source: &str, rel_path: &str) -> Vec<u8> {
+    let bytes = source.as_bytes();
+    let mut out: Vec<u8> = bytes
+        .iter()
+        .map(|&b| if b == b'\n' || b == b'\r' { b } else { b' ' })
+        .collect();
+
+    for (start, end) in collect_sfc_code_ranges(source, rel_path) {
+        if start < end && end <= bytes.len() {
+            out[start..end].copy_from_slice(&bytes[start..end]);
+        }
+    }
+
+    out
+}
+
+fn collect_sfc_code_ranges(source: &str, rel_path: &str) -> Vec<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut ranges = Vec::new();
+    let mut scan_pos = 0usize;
+
+    // 1. Astro frontmatter fence `--- ... ---` at top of file
+    if rel_path.to_ascii_lowercase().ends_with(".astro") {
+        let mut p = 0usize;
+        if source.starts_with('\u{feff}') {
+            p += '\u{feff}'.len_utf8();
+        }
+        while p < len && matches!(bytes[p], b' ' | b'\t' | b'\r' | b'\n') {
+            p += 1;
+        }
+        if source[p..].starts_with("---") {
+            let mut line_end = p + 3;
+            while line_end < len && matches!(bytes[line_end], b' ' | b'\t' | b'\r') {
+                line_end += 1;
+            }
+            if line_end < len && bytes[line_end] == b'\n' {
+                let fm_start = line_end + 1;
+                let mut cur = fm_start;
+                while cur < len {
+                    let mut line_p = cur;
+                    while line_p < len && matches!(bytes[line_p], b' ' | b'\t') {
+                        line_p += 1;
+                    }
+                    if source[line_p..].starts_with("---") {
+                        let mut after_fence = line_p + 3;
+                        while after_fence < len
+                            && matches!(bytes[after_fence], b' ' | b'\t' | b'\r')
+                        {
+                            after_fence += 1;
+                        }
+                        if after_fence == len || bytes[after_fence] == b'\n' {
+                            ranges.push((fm_start, cur));
+                            scan_pos = if after_fence < len {
+                                after_fence + 1
+                            } else {
+                                len
+                            };
+                            break;
+                        }
+                    }
+                    match bytes[cur..].iter().position(|&b| b == b'\n') {
+                        Some(nl) => cur += nl + 1,
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. `<script ...> ... </script>` blocks
+    let mut i = scan_pos;
+    while i + 7 <= len {
+        if bytes[i] == b'<' && source[i + 1..].len() >= 6 {
+            let candidate = &bytes[i + 1..i + 7];
+            if candidate.eq_ignore_ascii_case(b"script") {
+                let next_b = bytes.get(i + 7).copied().unwrap_or(b'>');
+                if matches!(next_b, b'>' | b' ' | b'\t' | b'\r' | b'\n' | b'/') {
+                    // Find closing `>` of opening `<script...>` tag
+                    let mut tag_end = i + 7;
+                    let mut in_quote: u8 = 0;
+                    while tag_end < len {
+                        let b = bytes[tag_end];
+                        if in_quote != 0 {
+                            if b == in_quote {
+                                in_quote = 0;
+                            }
+                        } else if b == b'"' || b == b'\'' {
+                            in_quote = b;
+                        } else if b == b'>' {
+                            break;
+                        }
+                        tag_end += 1;
+                    }
+                    if tag_end >= len {
+                        break;
+                    }
+                    // Skip self-closing `<script ... />`
+                    let mut before_gt = tag_end;
+                    while before_gt > i && matches!(bytes[before_gt - 1], b' ' | b'\t' | b'\r') {
+                        before_gt -= 1;
+                    }
+                    if before_gt > i && bytes[before_gt - 1] == b'/' {
+                        i = tag_end + 1;
+                        continue;
+                    }
+
+                    let body_start = tag_end + 1;
+                    let mut close_idx = body_start;
+                    let mut found_close = None;
+                    while close_idx + 9 <= len {
+                        if bytes[close_idx] == b'<'
+                            && bytes[close_idx + 1] == b'/'
+                            && bytes[close_idx + 2..close_idx + 8].eq_ignore_ascii_case(b"script")
+                        {
+                            let mut close_gt = close_idx + 8;
+                            while close_gt < len
+                                && matches!(bytes[close_gt], b' ' | b'\t' | b'\r' | b'\n')
+                            {
+                                close_gt += 1;
+                            }
+                            if close_gt < len && bytes[close_gt] == b'>' {
+                                found_close = Some((close_idx, close_gt + 1));
+                                break;
+                            }
+                        }
+                        close_idx += 1;
+                    }
+
+                    if let Some((body_end, next_scan)) = found_close {
+                        ranges.push((body_start, body_end));
+                        i = next_scan;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    ranges
+}
+
+fn derive_sfc_component_name(rel_path: &str) -> String {
+    let file_name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(file_name);
+    let mut sanitized = String::with_capacity(stem.len() + 5);
+    for ch in stem.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        return "Component".to_string();
+    }
+    if trimmed.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+        format!("Page_{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn extract_sfc_component_and_template(ctx: &mut ExtractContext<'_>, source: &str) {
+    let comp_name = derive_sfc_component_name(&ctx.scanned.rel_path);
+    let has_props_type = ctx.types.iter().any(|t| t.name == "Props");
+    let is_page = ctx.scanned.arch_layer == ArchLayer::App
+        || ctx.scanned.rel_path.starts_with("pages/")
+        || ctx.scanned.rel_path.contains("/pages/");
+
+    if !ctx.symbols.iter().any(|s| s.name == comp_name) {
+        let kind = if is_page {
+            SymbolKind::Entrypoint
+        } else {
+            SymbolKind::Function
+        };
+        let signature = if has_props_type {
+            format!("component {comp_name}(props: Props)")
+        } else {
+            format!("component {comp_name}()")
+        };
+        let symbol_id = format!("{}::{}", ctx.scanned.rel_path, comp_name);
+        ctx.symbols.insert(
+            0,
+            ExtractedSymbol {
+                symbol_id,
+                name: comp_name.clone(),
+                qualified_name: comp_name.clone(),
+                kind,
+                visibility: Visibility::Public,
+                file: ctx.scanned.rel_path.clone(),
+                start_line: 1,
+                end_line: ctx.scanned.line_count.max(1),
+                signature,
+                doc_summary: String::new(),
+                enclosing_type: None,
+                scope: ctx.scanned.scope,
+                arch_layer: ctx.scanned.arch_layer,
+                section_id: ctx.section_id.to_string(),
+            },
+        );
+    }
+
+    // Attribute module-init calls inside frontmatter / top-level script to the SFC component
+    for call in &mut ctx.raw_calls {
+        if call.caller_name == "<module_init>" {
+            call.caller_name = comp_name.clone();
+            call.caller_start_line = 1;
+        }
+    }
+    for xref in &mut ctx.raw_xrefs {
+        if xref.enclosing_symbol.as_deref() == Some("<module_init>") {
+            xref.enclosing_symbol = Some(comp_name.clone());
+        }
+    }
+
+    let code_ranges = collect_sfc_code_ranges(source, &ctx.scanned.rel_path);
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let is_in_code = |pos: usize| code_ranges.iter().any(|&(s, e)| pos >= s && pos < e);
+
+    let mut i = 0usize;
+    let mut line_num = 1usize;
+    while i < len {
+        if is_in_code(i) {
+            if bytes[i] == b'\n' {
+                line_num += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Skip HTML comments `<!-- ... -->`
+        if i + 4 <= len && &bytes[i..i + 4] == b"<!--" {
+            i += 4;
+            while i < len {
+                if bytes[i] == b'\n' {
+                    line_num += 1;
+                }
+                if i + 3 <= len && &bytes[i..i + 3] == b"-->" {
+                    i += 3;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Skip `<style ...> ... </style>` blocks
+        if i + 6 <= len
+            && bytes[i] == b'<'
+            && bytes[i + 1..i + 6].eq_ignore_ascii_case(b"style")
+            && matches!(
+                bytes.get(i + 6).copied().unwrap_or(b'>'),
+                b'>' | b' ' | b'\t' | b'\r' | b'\n'
+            )
+        {
+            i += 6;
+            while i < len {
+                if bytes[i] == b'\n' {
+                    line_num += 1;
+                }
+                if i + 8 <= len
+                    && bytes[i] == b'<'
+                    && bytes[i + 1] == b'/'
+                    && bytes[i + 2..i + 7].eq_ignore_ascii_case(b"style")
+                {
+                    i += 7;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Detect PascalCase component tag `<ComponentName`
+        if bytes[i] == b'<' && i + 1 < len && bytes[i + 1].is_ascii_uppercase() {
+            let start = i + 1;
+            let mut end = start + 1;
+            while end < len
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'.')
+            {
+                end += 1;
+            }
+            let raw_tag = &source[start..end];
+            if let Some((callee_name, receiver_or_qualifier)) = parse_callee_expression(raw_tag) {
+                let context_line = ctx
+                    .lines
+                    .get(line_num.saturating_sub(1))
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default();
+                ctx.raw_calls.push(RawCallSite {
+                    caller_file: ctx.scanned.rel_path.clone(),
+                    caller_name: comp_name.clone(),
+                    caller_start_line: 1,
+                    callee_name: callee_name.clone(),
+                    receiver_or_qualifier,
+                    call_line: line_num,
+                });
+                ctx.raw_xrefs.push(RawXrefSite {
+                    file: ctx.scanned.rel_path.clone(),
+                    line: line_num,
+                    enclosing_symbol: Some(comp_name.clone()),
+                    target_name: callee_name,
+                    category: "call".to_string(),
+                    context: truncate_str(&context_line, 120),
+                });
+            }
+            i = end;
+            continue;
+        }
+
+        // Detect template helper calls `helperFn(` referencing local or imported symbols
+        if (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+        {
+            let start = i;
+            let mut end = start + 1;
+            while end < len && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if end < len && bytes[end] == b'(' {
+                let ident = &source[start..end];
+                let is_known_target = ctx
+                    .symbols
+                    .iter()
+                    .any(|s| s.name == ident && s.name != comp_name)
+                    || ctx
+                        .imports
+                        .iter()
+                        .any(|imp| imp.imported_names.iter().any(|n| n == ident));
+                if is_known_target {
+                    let context_line = ctx
+                        .lines
+                        .get(line_num.saturating_sub(1))
+                        .map(|l| l.trim().to_string())
+                        .unwrap_or_default();
+                    ctx.raw_calls.push(RawCallSite {
+                        caller_file: ctx.scanned.rel_path.clone(),
+                        caller_name: comp_name.clone(),
+                        caller_start_line: 1,
+                        callee_name: ident.to_string(),
+                        receiver_or_qualifier: None,
+                        call_line: line_num,
+                    });
+                    ctx.raw_xrefs.push(RawXrefSite {
+                        file: ctx.scanned.rel_path.clone(),
+                        line: line_num,
+                        enclosing_symbol: Some(comp_name.clone()),
+                        target_name: ident.to_string(),
+                        category: "call".to_string(),
+                        context: truncate_str(&context_line, 120),
+                    });
+                }
+            }
+            i = end;
+            continue;
+        }
+
+        if bytes[i] == b'\n' {
+            line_num += 1;
+        }
+        i += 1;
+    }
 }
 
 #[cfg(test)]
@@ -2646,14 +3310,100 @@ export const formatPacket = (pkt: Packet): string => {
     }
 
     #[test]
-    fn test_c_qualifier_macro_normalization_lengths() {
-        for (from, to) in C_QUALIFIER_NORMALIZATIONS {
+    fn test_c_qualifier_macro_normalization_lengths_and_safety() {
+        for tok in [
+            "STATIC",
+            "INLINE",
+            "__INLINE",
+            "__STATIC_INLINE",
+            "__STATIC_FORCEINLINE",
+            "STATIC_INLINE",
+            "FORCE_INLINE",
+            "ALWAYS_INLINE",
+            "WEAK",
+            "__WEAK",
+            "SYSCONFIG_WEAK",
+            "TI_WEAK",
+            "HAL_WEAK",
+            "CONST",
+            "RAMFUNC",
+            "__RAMFUNC",
+        ] {
+            let rep = classify_c_qualifier_macro_replacement(tok.as_bytes())
+                .unwrap_or_else(|| panic!("expected replacement for {tok}"));
+            assert!(
+                rep.len() <= tok.len(),
+                "replacement prefix for `{tok}` must fit within original token byte length"
+            );
+            let snippet = format!("{tok} void f(void) {{}}");
+            let norm = normalize_c_qualifier_macros(&snippet)
+                .unwrap_or_else(|| panic!("expected normalization for `{tok}`"));
             assert_eq!(
-                from.len(),
-                to.len(),
-                "normalization for `{from}` must preserve byte length"
+                norm.len(),
+                snippet.len(),
+                "normalized buffer for `{tok}` must preserve exact byte length"
             );
         }
+
+        // Verify that `enum { STATIC = 0, CONST = 1 };` inside braces is NEVER corrupted.
+        let src = r#"
+enum Mode {
+    STATIC = 0,
+    CONST = 1,
+    INLINE = 2,
+};
+
+TI_WEAK void board_hook(void) {}
+"#;
+        let scanned = dummy_scanned("fw/drvs/enum_safe.c", LanguageKind::C);
+        let unit = parse_source_str(&scanned, src).expect("parse C file");
+        assert_eq!(unit.parse_errors, 0);
+        assert!(unit.types.iter().any(|t| t.name == "Mode"));
+        assert!(unit.symbols.iter().any(|s| s.name == "board_hook"));
+    }
+
+    #[test]
+    fn test_parse_astro_sfc_frontmatter_script_and_template() {
+        let astro_src = r#"---
+import Button from '../ui/Button.astro';
+import { anchorHref } from './site';
+
+export interface Props {
+  title: string;
+}
+
+const { title } = Astro.props;
+---
+<header>
+  <h1>{title}</h1>
+  <a href={anchorHref('#kontakt', '/')}>Kontakt</a>
+  <Button label="Start" />
+</header>
+<script>
+  function initHeader(): void {
+    console.log('ready');
+  }
+  initHeader();
+</script>
+"#;
+        let scanned = dummy_scanned("src/plugins/shell/Header.astro", LanguageKind::Tsx);
+        let unit = parse_source_str(&scanned, astro_src).expect("parse .astro file");
+        assert_eq!(unit.parse_errors, 0);
+        assert!(unit.types.iter().any(|t| t.name == "Props"));
+        assert!(unit.symbols.iter().any(|s| s.name == "Header"));
+        assert!(unit.symbols.iter().any(|s| s.name == "initHeader"));
+        assert!(unit
+            .raw_calls
+            .iter()
+            .any(|c| c.caller_name == "Header" && c.callee_name == "Button"));
+        assert!(unit
+            .raw_calls
+            .iter()
+            .any(|c| c.caller_name == "Header" && c.callee_name == "anchorHref"));
+        assert!(unit
+            .raw_calls
+            .iter()
+            .any(|c| c.caller_name == "Header" && c.callee_name == "initHeader"));
     }
 
     #[test]

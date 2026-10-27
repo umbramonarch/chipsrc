@@ -37,10 +37,21 @@ impl LanguageKind {
             "rs" => Some(Self::Rust),
             "py" | "pyi" => Some(Self::Python),
             "ts" | "mts" | "cts" => Some(Self::TypeScript),
-            "tsx" => Some(Self::Tsx),
+            "tsx" | "astro" | "vue" | "svelte" => Some(Self::Tsx),
             "js" | "mjs" | "cjs" => Some(Self::JavaScript),
             "jsx" => Some(Self::Jsx),
             _ => None,
+        }
+    }
+
+    /// Returns the language family group ID so callers and imports only bind across
+    /// compatible language ecosystems (`C/C++` = 0, `Rust` = 1, `Python` = 2, `TS/JS/SFC` = 3).
+    pub fn language_family(self) -> u8 {
+        match self {
+            Self::C | Self::Cpp => 0,
+            Self::Rust => 1,
+            Self::Python => 2,
+            Self::TypeScript | Self::Tsx | Self::JavaScript | Self::Jsx => 3,
         }
     }
 }

@@ -108,20 +108,23 @@ pub fn resolve_and_link(
                         .copied()
                 });
 
-            let (caller_id, caller_section_id) = match caller_idx {
+            let (caller_id, caller_section_id, caller_enclosing_type) = match caller_idx {
                 Some(idx) => (
                     symbols[idx].symbol_id.clone(),
                     symbols[idx].section_id.clone(),
+                    symbols[idx].enclosing_type.as_deref(),
                 ),
                 None => (
                     format!("{}::{}", raw.caller_file, raw.caller_name),
                     unit_sec_id.clone(),
+                    None,
                 ),
             };
 
             let short_callee = raw
                 .callee_name
                 .rsplit_once("::")
+                .or_else(|| raw.callee_name.rsplit_once("?."))
                 .or_else(|| raw.callee_name.rsplit_once('.'))
                 .or_else(|| raw.callee_name.rsplit_once("->"))
                 .map(|(_, s)| s)
@@ -154,6 +157,7 @@ pub fn resolve_and_link(
                     file: raw.caller_file.as_str(),
                     section_id: &caller_section_id,
                     language: Some(unit_language),
+                    enclosing_type: caller_enclosing_type,
                 },
                 short_callee,
                 raw.receiver_or_qualifier.as_deref(),
@@ -300,6 +304,7 @@ struct CallerSite<'a> {
     file: &'a str,
     section_id: &'a str,
     language: Option<LanguageKind>,
+    enclosing_type: Option<&'a str>,
 }
 
 fn resolve_callee_candidates(
@@ -313,6 +318,10 @@ fn resolve_callee_candidates(
     let caller_file = caller.file;
     let caller_section_id = caller.section_id;
     let caller_language = caller.language;
+    let effective_qualifier = match receiver_or_qualifier {
+        Some(q) if is_self_or_class_receiver(q) => caller.enclosing_type.or(Some(q)),
+        other => other,
+    };
 
     let unresolved = || {
         (
@@ -332,7 +341,7 @@ fn resolve_callee_candidates(
         .filter(|&idx| symbols[idx].file == caller_file)
         .collect();
     if !same_file.is_empty() {
-        if let Some(qual) = receiver_or_qualifier {
+        if let Some(qual) = effective_qualifier {
             if let Some(&idx) = same_file.iter().find(|&&idx| {
                 symbols[idx]
                     .enclosing_type
@@ -348,11 +357,16 @@ fn resolve_callee_candidates(
         );
     }
 
+    let explicitly_imported = imports
+        .iter()
+        .any(|imp| imp.imported_names.iter().any(|n| n == callee_name));
+
     // Built-in / qualified-call safeguards before any name-based guessing.
     match receiver_or_qualifier {
-        // Unqualified call to a standard language built-in that is not defined in this file.
+        // Unqualified call to a standard language built-in that is not defined in this file
+        // and not explicitly imported by name.
         None => {
-            if is_language_builtin(callee_name, caller_language) {
+            if !explicitly_imported && is_language_builtin(callee_name, caller_language) {
                 return unresolved();
             }
         }
@@ -360,7 +374,13 @@ fn resolve_callee_candidates(
         // repository (e.g. `import subprocess; subprocess.run(...)`, `time.sleep(...)`).
         Some(qual) => {
             if !is_self_or_class_receiver(qual)
-                && is_external_module_qualifier(qual, imports, candidate_indices, symbols)
+                && is_external_module_qualifier(
+                    caller_file,
+                    qual,
+                    imports,
+                    candidate_indices,
+                    symbols,
+                )
             {
                 return unresolved();
             }
@@ -369,9 +389,23 @@ fn resolve_callee_candidates(
 
     // Tier 2: Caller file's imports reference the defining file's stem/module or explicitly import callee_name
     let mut import_matches: Vec<(usize, usize)> = Vec::new();
+    let non_self_qualifier = receiver_or_qualifier.filter(|q| !is_self_or_class_receiver(q));
+    let ubiquitous_member = is_ubiquitous_member_name(callee_name);
     for &idx in candidate_indices {
         let def = &symbols[idx];
-        if let Some(score) = match_import_for_candidate(callee_name, &def.file, imports) {
+        if let Some(qual) = non_self_qualifier {
+            let qual_is_imported_ns = imports.iter().any(|imp| {
+                imp.imported_names
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(qual))
+            });
+            if !qual_is_imported_ns && !qualified_candidate_allowed(qual, ubiquitous_member, def) {
+                continue;
+            }
+        }
+        if let Some(score) =
+            match_import_for_candidate(caller_file, callee_name, &def.file, imports)
+        {
             import_matches.push((score, idx));
         }
     }
@@ -394,11 +428,30 @@ fn resolve_callee_candidates(
     // to symbols living in a module named by the qualifier. Ubiquitous container/IO/lifecycle
     // member names are never guessed blindly.
     let mut eligible: Vec<usize> = candidate_indices.to_vec();
-    if let Some(qual) = receiver_or_qualifier.filter(|q| !is_self_or_class_receiver(q)) {
-        let ubiquitous_member = is_ubiquitous_member_name(callee_name);
-        eligible.retain(|&idx| qualified_candidate_allowed(qual, ubiquitous_member, &symbols[idx]));
-        if eligible.is_empty() {
-            return unresolved();
+    if let Some(qual) = receiver_or_qualifier {
+        if is_self_or_class_receiver(qual) {
+            if let Some(caller_ty) = caller.enclosing_type {
+                let matching_type: Vec<usize> = eligible
+                    .iter()
+                    .copied()
+                    .filter(|&idx| {
+                        symbols[idx]
+                            .enclosing_type
+                            .as_deref()
+                            .is_some_and(|et| et.eq_ignore_ascii_case(caller_ty))
+                    })
+                    .collect();
+                if !matching_type.is_empty() {
+                    eligible = matching_type;
+                }
+            }
+        } else {
+            let ubiquitous_member = is_ubiquitous_member_name(callee_name);
+            eligible
+                .retain(|&idx| qualified_candidate_allowed(qual, ubiquitous_member, &symbols[idx]));
+            if eligible.is_empty() {
+                return unresolved();
+            }
         }
     }
 
@@ -416,12 +469,12 @@ fn resolve_callee_candidates(
         let a = &symbols[idx_a];
         let b = &symbols[idx_b];
 
-        let qual_a = receiver_or_qualifier.is_some_and(|q| {
+        let qual_a = effective_qualifier.is_some_and(|q| {
             a.enclosing_type
                 .as_deref()
                 .is_some_and(|et| et.eq_ignore_ascii_case(q))
         });
-        let qual_b = receiver_or_qualifier.is_some_and(|q| {
+        let qual_b = effective_qualifier.is_some_and(|q| {
             b.enclosing_type
                 .as_deref()
                 .is_some_and(|et| et.eq_ignore_ascii_case(q))
@@ -634,7 +687,7 @@ fn merge_c_family_header_prototypes(symbols: &mut Vec<ExtractedSymbol>) {
         return;
     }
 
-    // Index implementation symbols by (leaf name, enclosing type).
+    // Index implementation symbols by exact (leaf name, enclosing type).
     let mut implementations: FxHashMap<(String, Option<String>), Vec<usize>> = FxHashMap::default();
     for (idx, sym) in symbols.iter().enumerate() {
         if !is_c_family_implementation(&sym.file) || sym.visibility == Visibility::Static {
@@ -669,13 +722,35 @@ fn merge_c_family_header_prototypes(symbols: &mut Vec<ExtractedSymbol>) {
             continue;
         };
 
-        // Prefer the implementation in the same shard, then first-party over vendor/test code,
-        // then the lexicographically first symbol id for determinism.
-        let best = candidates.iter().copied().min_by(|&a, &b| {
+        let proto_arity = signature_param_arity(&proto.signature);
+        let proto_stem = file_stem_lower(&proto.file);
+
+        // Filter candidates with compatible parameter arity (so C++ overloads are never collapsed).
+        let compatible_candidates: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(
+                |&idx| match (proto_arity, signature_param_arity(&symbols[idx].signature)) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                },
+            )
+            .collect();
+
+        if compatible_candidates.is_empty() {
+            continue;
+        }
+
+        // Prefer matching file stem (`drvAdc.h` <-> `drvAdc.c`), then same shard, then
+        // first-party over vendor/test code, then lexicographically first symbol id.
+        let best = compatible_candidates.iter().copied().min_by(|&a, &b| {
+            let stem_a = file_stem_lower(&symbols[a].file) != proto_stem;
+            let stem_b = file_stem_lower(&symbols[b].file) != proto_stem;
             let sec_a = symbols[a].section_id != proto.section_id;
             let sec_b = symbols[b].section_id != proto.section_id;
-            sec_a
-                .cmp(&sec_b)
+            stem_a
+                .cmp(&stem_b)
+                .then_with(|| sec_a.cmp(&sec_b))
                 .then_with(|| scope_rank(symbols[a].scope).cmp(&scope_rank(symbols[b].scope)))
                 .then_with(|| symbols[a].symbol_id.cmp(&symbols[b].symbol_id))
         });
@@ -708,27 +783,45 @@ fn merge_c_family_header_prototypes(symbols: &mut Vec<ExtractedSymbol>) {
 }
 
 fn symbol_key(sym: &ExtractedSymbol) -> (String, Option<String>) {
-    (
-        sym.name.to_ascii_lowercase(),
-        sym.enclosing_type.as_ref().map(|t| t.to_ascii_lowercase()),
-    )
+    (sym.name.clone(), sym.enclosing_type.clone())
 }
 
-fn language_family(lang: LanguageKind) -> u8 {
-    match lang {
-        LanguageKind::C | LanguageKind::Cpp => 0,
-        LanguageKind::Rust => 1,
-        LanguageKind::Python => 2,
-        LanguageKind::TypeScript
-        | LanguageKind::Tsx
-        | LanguageKind::JavaScript
-        | LanguageKind::Jsx => 3,
+fn file_stem_lower(path: &str) -> String {
+    let norm = path.replace('\\', "/");
+    let fname = norm.rsplit('/').next().unwrap_or(norm.as_str());
+    fname
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(fname)
+        .to_ascii_lowercase()
+}
+
+fn signature_param_arity(sig: &str) -> Option<usize> {
+    let open = sig.find('(')?;
+    let close = sig.rfind(')')?;
+    if close <= open {
+        return None;
     }
+    let inner = sig[open + 1..close].trim();
+    if inner.is_empty() || inner == "void" {
+        return Some(0);
+    }
+    let mut count = 1usize;
+    let mut depth = 0usize;
+    for ch in inner.chars() {
+        match ch {
+            '(' | '<' | '[' | '{' => depth += 1,
+            ')' | '>' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    Some(count)
 }
 
 fn languages_compatible(caller: Option<LanguageKind>, callee: Option<LanguageKind>) -> bool {
     match (caller, callee) {
-        (Some(a), Some(b)) => language_family(a) == language_family(b),
+        (Some(a), Some(b)) => a.language_family() == b.language_family(),
         // Unknown languages are never filtered out.
         _ => true,
     }
@@ -841,11 +934,54 @@ fn normalize_import_path(raw_path: &str) -> String {
         .replace('\\', "/")
 }
 
+fn resolve_relative_import_path(caller_file: &str, raw_import: &str) -> Option<String> {
+    let norm_imp = raw_import
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '<' | '>'))
+        .replace('\\', "/");
+    if !norm_imp.starts_with("./") && !norm_imp.starts_with("../") {
+        return None;
+    }
+
+    let caller_norm = caller_file.replace('\\', "/");
+    let mut stack: Vec<&str> = caller_norm.split('/').collect();
+    if !stack.is_empty() {
+        stack.pop(); // Remove caller filename
+    }
+
+    for seg in norm_imp.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+
+    let joined = stack.join("/");
+    Some(strip_source_extension(&joined))
+}
+
 /// True when the import path names the given repository source file.
-fn import_references_file(import_path: &str, def_file: &str) -> bool {
-    let raw = strip_source_extension(normalize_import_path(import_path).trim_start_matches("./"));
+fn import_references_file(caller_file: &str, import_path: &str, def_file: &str) -> bool {
     let def = strip_source_extension(&def_file.replace('\\', "/"));
-    if raw.is_empty() || def.is_empty() {
+    if def.is_empty() {
+        return false;
+    }
+    if let Some(resolved_rel) = resolve_relative_import_path(caller_file, import_path) {
+        if !resolved_rel.is_empty()
+            && (def == resolved_rel || def == format!("{resolved_rel}/index"))
+        {
+            return true;
+        }
+    }
+    let raw = strip_source_extension(
+        normalize_import_path(import_path)
+            .trim_start_matches("../")
+            .trim_start_matches("./"),
+    );
+    if raw.is_empty() {
         return false;
     }
     def == raw || def.ends_with(&format!("/{raw}"))
@@ -882,6 +1018,7 @@ fn import_mentions_name(imp: &ExtractedImport, qualifier: &str, leaf: &str) -> b
 /// True when `qualifier` is an imported module/symbol that does not resolve to any repository
 /// candidate file (e.g. `import subprocess` or `import time` in a Python module).
 fn is_external_module_qualifier(
+    caller_file: &str,
     qualifier: &str,
     imports: &[ExtractedImport],
     candidate_indices: &[usize],
@@ -898,7 +1035,7 @@ fn is_external_module_qualifier(
         }
         let references_repo_file = candidate_indices
             .iter()
-            .any(|&idx| import_references_file(&imp.raw_path, &symbols[idx].file));
+            .any(|&idx| import_references_file(caller_file, &imp.raw_path, &symbols[idx].file));
         if !references_repo_file {
             return true;
         }
@@ -908,6 +1045,7 @@ fn is_external_module_qualifier(
 }
 
 fn match_import_for_candidate(
+    caller_file: &str,
     callee_name: &str,
     def_file: &str,
     imports: &[ExtractedImport],
@@ -927,19 +1065,30 @@ fn match_import_for_candidate(
             .iter()
             .any(|n| n == callee_name || n == "*");
 
+        let rel_resolved = resolve_relative_import_path(caller_file, &imp.raw_path);
+        let exact_rel_match = rel_resolved.as_ref().is_some_and(|rel| {
+            !rel.is_empty()
+                && (def_without_ext == *rel || def_without_ext == format!("{rel}/index"))
+        });
+
         let raw_norm = imp
             .raw_path
             .trim()
             .trim_matches(|c| matches!(c, '"' | '\'' | '<' | '>'))
             .replace("::", "/")
             .replace('\\', "/");
-        let imp_without_ext = strip_source_extension(&raw_norm);
+        let imp_without_ext =
+            strip_source_extension(raw_norm.trim_start_matches("../").trim_start_matches("./"));
         let imp_stem = Path::new(&imp_without_ext)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
 
-        let path_matches = if !imp_without_ext.is_empty() && !def_without_ext.is_empty() {
+        // When the import is a relative path (`./...` or `../...`), only match the resolved
+        // relative target path rather than unrelated files that happen to share the same stem.
+        let path_matches = if rel_resolved.is_some() {
+            exact_rel_match
+        } else if !imp_without_ext.is_empty() && !def_without_ext.is_empty() {
             def_without_ext.ends_with(&imp_without_ext)
                 || imp_without_ext.ends_with(&def_without_ext)
                 || (!imp_stem.is_empty()
@@ -949,10 +1098,25 @@ fn match_import_for_candidate(
             false
         };
 
-        let score = match (explicit_name, path_matches) {
-            (true, true) => Some(3),
-            (false, true) => Some(2),
-            (true, false) if raw_norm.is_empty() || !imp_stem.eq_ignore_ascii_case("std") => {
+        // If an import statement explicitly lists imported symbols (e.g. `import { LIMITS } from './kontakt'`)
+        // and does not import the module stem itself as a namespace, only symbols in `imported_names`
+        // are imported by that statement.
+        let names_module_stem = !imp_stem.is_empty()
+            && imp
+                .imported_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(imp_stem));
+        let implicit_header_or_module_import = imp.imported_names.is_empty() || names_module_stem;
+
+        let score = match (explicit_name, exact_rel_match, path_matches) {
+            (true, true, _) => Some(5),
+            (false, true, _) if implicit_header_or_module_import => Some(4),
+            (true, false, true) => Some(3),
+            (false, false, true) if implicit_header_or_module_import => Some(2),
+            (true, false, false)
+                if rel_resolved.is_none()
+                    && (raw_norm.is_empty() || !imp_stem.eq_ignore_ascii_case("std")) =>
+            {
                 Some(1)
             }
             _ => None,
@@ -990,6 +1154,9 @@ fn strip_source_extension(path: &str) -> String {
                 | "jsx"
                 | "mjs"
                 | "cjs"
+                | "astro"
+                | "vue"
+                | "svelte"
         ) {
             return prefix.to_string();
         }

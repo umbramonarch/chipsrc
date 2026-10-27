@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 /// Excluded build/artifact/cache and generated documentation/static-asset directories
-/// skipped unconditionally during walking (`_static`, `doxygen`, `html`, ... contain bundled
+/// skipped unconditionally during walking (`_static`, `_build`, `doxygen`, ... contain bundled
 /// JS/CSS/HTML documentation assets rather than project source code).
 const IGNORED_DIRS: &[&str] = &[
     ".git",
@@ -26,88 +26,116 @@ const IGNORED_DIRS: &[&str] = &[
     "venv",
     "dist",
     "build",
+    "_build",
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
     "_static",
     "doxygen",
-    "html",
-    "site",
     "coverage",
     "htmlcov",
     ".tox",
     ".nox",
     "wheelhouse",
+    ".astro",
+    ".vercel",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
 ];
 
-/// Path components indicating third-party / vendor SDK ownership (exact segment match).
+/// Directory components indicating third-party / vendor SDK ownership (exact segment match).
 const VENDOR_COMPONENTS: &[&str] = &[
     "vendor",
+    "vendors",
     "third_party",
     "3rdparty",
+    "third-party",
     "external",
+    "externals",
     "sdk",
+    "sdks",
     "cmsis",
     "hal",
     "driverlib",
-    "stm32",
-    "freertos",
     "middlewares",
+    "middleware",
     "submodules",
-    "references",
-    "reference",
     "deps",
     "bundled",
     "svd",
 ];
 
-/// Substring tokens that identify a vendor SDK directory even when the directory name embeds the
-/// token in a composite name (e.g. `My_DriverLib`, `STM32Cube`, `hal_driver`).
-const VENDOR_DIR_TOKENS: &[&str] = &[
+/// Root-level directory names holding external reference material or third-party drops.
+const ROOT_VENDOR_DIRS: &[&str] = &["references", "reference"];
+
+/// Structural sub-tokens inside composite directory names (e.g. `My_DriverLib`, `CMSIS_CORE`,
+/// `hal_driver`, `mcu_sdk`, `STM32Cube`) that indicate vendor/SDK ownership without hardcoding
+/// specific chip part numbers.
+const VENDOR_COMPOSITE_SUBTOKENS: &[&str] = &[
     "driverlib",
     "cmsis",
-    "stm32",
-    "freertos",
-    "third_party",
+    "thirdparty",
     "3rdparty",
     "vendor",
-    "hal_driver",
+    "svd",
+    "sdk",
+    "bundled",
+    "submodules",
+    "middlewares",
 ];
 
 /// Path components indicating test / benchmark / evaluation code.
 const TEST_COMPONENTS: &[&str] = &["tests", "test", "evals", "benches"];
 
-/// Filename prefixes of bundled/minified third-party JavaScript assets emitted by documentation
-/// generators (Sphinx, Doxygen, MkDocs, JSDoc) rather than authored project source.
-const BUNDLED_ASSET_PREFIXES: &[&str] = &[
+/// Exact filenames (without `.js`) of generated documentation scripts emitted by Doxygen/Sphinx/JSDoc.
+const BUNDLED_DOC_JS_STEMS: &[&str] = &[
     "jquery",
     "modernizr",
     "underscore",
-    "bootstrap",
-    "mermaid",
     "prettify",
     "searchdata",
     "navtree",
+    "navtreedata",
     "dynsections",
+];
+
+/// Versioned/variant prefixes of bundled third-party JavaScript libraries (`jquery-3.6.0.js`,
+/// `modernizr-2.8.3.min.js`, `navtreeindex0.js`).
+const BUNDLED_VERSIONED_JS_PREFIXES: &[&str] = &[
+    "jquery-",
+    "modernizr-",
+    "underscore-",
+    "bootstrap-",
+    "bootstrap.",
+    "mermaid-",
+    "mermaid.",
+    "prettify-",
+    "navtreeindex",
 ];
 
 /// Returns `true` for minified or documentation-generator bundled third-party JavaScript assets,
 /// which carry no first-party source structure worth indexing.
 fn is_bundled_js_asset(lower_filename: &str) -> bool {
-    if !(lower_filename.ends_with(".js")
-        || lower_filename.ends_with(".mjs")
-        || lower_filename.ends_with(".cjs"))
-    {
+    let Some(stem) = lower_filename
+        .strip_suffix(".js")
+        .or_else(|| lower_filename.strip_suffix(".mjs"))
+        .or_else(|| lower_filename.strip_suffix(".cjs"))
+    else {
         return false;
-    }
-    lower_filename.ends_with(".min.js")
-        || BUNDLED_ASSET_PREFIXES
+    };
+
+    stem.ends_with(".min")
+        || stem.ends_with(".bundle")
+        || BUNDLED_DOC_JS_STEMS.contains(&stem)
+        || BUNDLED_VERSIONED_JS_PREFIXES
             .iter()
-            .any(|prefix| lower_filename.starts_with(prefix))
+            .any(|prefix| stem.starts_with(prefix))
 }
 
-/// Walks `repo_path` respecting `.gitignore`, `.claudeignore`, and `.graphifyignore`, skips
-/// generated documentation assets and minified/bundled third-party JavaScript, classifies each
+/// Walks `repo_path` respecting `.gitignore` and `.claudeignore`, skips generated
+/// documentation assets and minified/bundled third-party JavaScript, classifies each
 /// supported source file by language, ownership scope, and architectural layer, and returns the
 /// sorted file list along with a 16-character BLAKE3 repository fingerprint.
 pub fn scan_repository(
@@ -348,15 +376,67 @@ fn normalize_rel_path(path: &Path) -> String {
 ///
 /// `size_bytes = 0` disables the large-generated-header heuristic, so no file content is needed.
 pub(crate) fn path_is_vendor_owned(rel_path: &str) -> bool {
+    let parts: Vec<&str> = rel_path
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return false;
+    }
     if classify_file_scope(rel_path, 0, b"") == FileScope::VendorSdk {
         return true;
     }
-    // Module paths carry no trailing filename, so token-match every segment as well.
-    rel_path
-        .split(['/', '\\'])
+    // Module paths carry no trailing filename, so inspect all segments as directory segments.
+    dir_segments_are_vendor(&parts)
+}
+
+fn is_vendor_composite_segment(lower_seg: &str) -> bool {
+    if lower_seg.ends_with("driverlib")
+        || lower_seg.ends_with("cube")
+        || lower_seg.ends_with("_sdk")
+        || lower_seg.ends_with("-sdk")
+        || lower_seg.ends_with("_hal")
+        || lower_seg.ends_with("-hal")
+    {
+        return true;
+    }
+
+    let subtokens: Vec<&str> = lower_seg
+        .split(['_', '-', '.'])
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_ascii_lowercase())
-        .any(|seg| VENDOR_DIR_TOKENS.iter().any(|token| seg.contains(token)))
+        .collect();
+
+    if subtokens
+        .iter()
+        .any(|tok| VENDOR_COMPOSITE_SUBTOKENS.contains(tok))
+    {
+        return true;
+    }
+
+    if subtokens.windows(2).any(|w| {
+        (w[0] == "third" && w[1] == "party")
+            || (w[0] == "hal" && matches!(w[1], "driver" | "drivers" | "sdk" | "lib"))
+    }) {
+        return true;
+    }
+
+    false
+}
+
+fn dir_segments_are_vendor(dir_segments: &[&str]) -> bool {
+    if let Some(first) = dir_segments.first() {
+        let lower_first = first.to_ascii_lowercase();
+        if ROOT_VENDOR_DIRS.contains(&lower_first.as_str()) {
+            return true;
+        }
+    }
+    for seg in dir_segments {
+        let lower = seg.to_ascii_lowercase();
+        if VENDOR_COMPONENTS.contains(&lower.as_str()) || is_vendor_composite_segment(&lower) {
+            return true;
+        }
+    }
+    false
 }
 
 fn classify_file_scope(rel_path: &str, size_bytes: u64, bytes: &[u8]) -> FileScope {
@@ -365,19 +445,10 @@ fn classify_file_scope(rel_path: &str, size_bytes: u64, bytes: &[u8]) -> FileSco
     let lower_filename = filename.to_ascii_lowercase();
     let dir_segments = &parts[..parts.len().saturating_sub(1)];
 
-    // 1. Vendor SDK ownership: exact path-component match (`vendor/`, `cmsis/`, ...) or a
-    // composite directory name embedding a vendor token (`My_DriverLib`, `STM32Cube`, ...).
-    for part in &parts {
-        let lower = part.to_ascii_lowercase();
-        if VENDOR_COMPONENTS.contains(&lower.as_str()) {
-            return FileScope::VendorSdk;
-        }
-    }
-    for seg in dir_segments {
-        let lower = seg.to_ascii_lowercase();
-        if VENDOR_DIR_TOKENS.iter().any(|token| lower.contains(token)) {
-            return FileScope::VendorSdk;
-        }
+    // 1. Vendor SDK ownership: checked strictly against directory segments (`dir_segments`)
+    // so a first-party file whose filename happens to match a token is never misclassified.
+    if dir_segments_are_vendor(dir_segments) {
+        return FileScope::VendorSdk;
     }
 
     // Check if > 200 KiB .h/.hpp file containing device register definitions
@@ -392,15 +463,13 @@ fn classify_file_scope(rel_path: &str, size_bytes: u64, bytes: &[u8]) -> FileSco
 
     // 2. Test / benchmark / evaluation code, including composite directory names such as
     // `test_utils/` or `motor_tests/`.
-    for part in &parts {
-        let lower = part.to_ascii_lowercase();
-        if TEST_COMPONENTS.contains(&lower.as_str()) {
-            return FileScope::Test;
-        }
-    }
     for seg in dir_segments {
         let lower = seg.to_ascii_lowercase();
-        if lower.starts_with("test_") || lower.ends_with("_test") || lower.ends_with("_tests") {
+        if TEST_COMPONENTS.contains(&lower.as_str())
+            || lower.starts_with("test_")
+            || lower.ends_with("_test")
+            || lower.ends_with("_tests")
+        {
             return FileScope::Test;
         }
     }
@@ -430,14 +499,22 @@ fn classify_arch_layer(rel_path: &str, scope: FileScope) -> ArchLayer {
         FileScope::FirstParty => {}
     }
 
-    let parts: Vec<&str> = rel_path.split('/').collect();
-    // Inspect directory segments first, then fall back to file stem if needed
+    let parts: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
     let dir_segments = &parts[..parts.len().saturating_sub(1)];
+    let mut resolved_layer: Option<ArchLayer> = None;
     for seg in dir_segments {
         let lower = seg.to_ascii_lowercase();
         if let Some(layer) = match_segment_to_layer(&lower) {
-            return layer;
+            if resolved_layer.is_none() {
+                resolved_layer = Some(layer);
+            } else if resolved_layer == Some(ArchLayer::App) && layer == ArchLayer::Api {
+                // Route subdirectories such as `src/pages/api/*` refine `App` to `Api`.
+                resolved_layer = Some(ArchLayer::Api);
+            }
         }
+    }
+    if let Some(layer) = resolved_layer {
+        return layer;
     }
 
     if let Some(filename) = parts.last() {
@@ -456,16 +533,20 @@ fn classify_arch_layer(rel_path: &str, scope: FileScope) -> ArchLayer {
 
 fn match_segment_to_layer(lower: &str) -> Option<ArchLayer> {
     match lower {
-        "app" | "application" | "apps" => Some(ArchLayer::App),
-        "bsp" | "board" | "boards" => Some(ArchLayer::Bsp),
+        "app" | "application" | "apps" | "pages" | "views" | "screens" => Some(ArchLayer::App),
+        "bsp" | "board" | "boards" | "platform" => Some(ArchLayer::Bsp),
         "drvs" | "drv" | "drivers" | "driver" | "nfc" | "peripherals" => Some(ArchLayer::Drivers),
         "config" | "configs" | "cfg" => Some(ArchLayer::Config),
-        "libs" | "lib" | "utils" | "common" | "security" => Some(ArchLayer::Libs),
-        "domain" | "models" | "entities" => Some(ArchLayer::Domain),
-        "services" | "service" | "sync" | "database" | "db" | "auth" => Some(ArchLayer::Services),
-        "api" | "frontend" | "routes" | "ui" | "web" => Some(ArchLayer::Api),
-        "cli" | "bin" => Some(ArchLayer::Cli),
-        "core" => Some(ArchLayer::Core),
+        "libs" | "lib" | "utils" | "common" | "security" | "helpers" | "ui" | "components"
+        | "widgets" | "shell" | "layouts" => Some(ArchLayer::Libs),
+        "domain" | "models" | "entities" | "schema" | "schemas" => Some(ArchLayer::Domain),
+        "services" | "service" | "sync" | "database" | "db" | "auth" | "plugins" | "features"
+        | "store" => Some(ArchLayer::Services),
+        "api" | "frontend" | "routes" | "endpoints" | "controllers" | "handlers" | "web" => {
+            Some(ArchLayer::Api)
+        }
+        "cli" | "bin" | "scripts" | "tools" => Some(ArchLayer::Cli),
+        "core" | "engine" | "kernel" => Some(ArchLayer::Core),
         s if s.ends_with("-cli") => Some(ArchLayer::Cli),
         s if s.ends_with("-core") => Some(ArchLayer::Core),
         _ => None,
@@ -654,6 +735,8 @@ mod tests {
         assert!(is_bundled_js_asset("runtime.min.js"));
 
         assert!(!is_bundled_js_asset("app.js"));
+        assert!(!is_bundled_js_asset("bootstrap.js"));
+        assert!(!is_bundled_js_asset("mermaid_renderer.js"));
         assert!(!is_bundled_js_asset("motor_control.js"));
         assert!(!is_bundled_js_asset("main.ts"));
         assert!(!is_bundled_js_asset("minified.h"));
@@ -663,9 +746,8 @@ mod tests {
     fn test_ignored_dirs_include_docs_and_static_assets() {
         for dir in [
             "_static",
+            "_build",
             "doxygen",
-            "html",
-            "site",
             "coverage",
             "htmlcov",
             ".tox",
@@ -679,10 +761,13 @@ mod tests {
                 "Expected IGNORED_DIRS to contain '{dir}'"
             );
         }
+        // Generic first-party package names must never be globally ignored.
+        assert!(!IGNORED_DIRS.contains(&"site"));
+        assert!(!IGNORED_DIRS.contains(&"html"));
     }
 
     #[test]
-    fn test_scan_repository_skips_docs_and_honors_graphifyignore() {
+    fn test_scan_repository_skips_docs_and_honors_claudeignore() {
         let root = std::env::temp_dir().join(format!(
             "chipsrc_scanner_ignore_test_{}",
             std::process::id()

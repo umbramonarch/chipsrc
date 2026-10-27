@@ -257,6 +257,10 @@ pub fn query_symbols(
         ));
     }
 
+    if hits.iter().any(|h| h.score >= 4) {
+        hits.retain(|h| h.score >= 3);
+    }
+
     hits.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
@@ -387,6 +391,10 @@ pub fn query_callers(
         return Ok(format!("No callers found for '{symbol}'.\n"));
     }
 
+    if hits.iter().any(|h| h.score >= 3) {
+        hits.retain(|h| h.score >= 3);
+    }
+
     hits.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
@@ -512,6 +520,10 @@ pub fn query_callees(
 
     if hits.is_empty() {
         return Ok(format!("No callees found for '{symbol}'.\n"));
+    }
+
+    if hits.iter().any(|h| h.score >= 3) {
+        hits.retain(|h| h.score >= 3);
     }
 
     hits.sort_by(|a, b| {
@@ -654,6 +666,10 @@ pub fn query_types(
         return Ok(format!(
             "No types matched '{query}'. Try `chipsrc search \"{query}\"`.\n"
         ));
+    }
+
+    if hits.iter().any(|h| h.score >= 4) {
+        hits.retain(|h| h.score >= 3);
     }
 
     hits.sort_by(|a, b| {

@@ -136,12 +136,14 @@ pub fn build_section_shards(
     // 3. Assign numbered section IDs (01-<slug>, 02-<slug>, ...) and build slug -> numbered map
     let mut slug_to_numbered: FxHashMap<String, String> = FxHashMap::default();
     let mut file_to_numbered: FxHashMap<String, String> = FxHashMap::default();
+    let mut section_to_layer: FxHashMap<String, ArchLayer> = FxHashMap::default();
 
     for (idx, group) in groups.iter().enumerate() {
         let clean_slug = strip_numeric_prefix(&group.raw_slug);
         let numbered_id = format!("{:02}-{clean_slug}", idx + 1);
         slug_to_numbered.insert(group.raw_slug.clone(), numbered_id.clone());
         slug_to_numbered.insert(clean_slug.to_string(), numbered_id.clone());
+        section_to_layer.insert(numbered_id.clone(), group.arch_layer);
         for u in &group.units {
             file_to_numbered.insert(u.scanned.rel_path.clone(), numbered_id.clone());
         }
@@ -170,15 +172,31 @@ pub fn build_section_shards(
         fallback_sec_id.clone()
     };
 
-    // Update section_id on all ranked_symbols, types, macros, calls, and xrefs
+    // Update section_id (and synchronize fallback ArchLayer::Other with the shard's dominant layer)
+    // on all ranked_symbols, types, macros, calls, and xrefs.
     for rs in ranked_symbols.iter_mut() {
         rs.symbol.section_id = resolve_numbered(&rs.symbol.section_id, &rs.symbol.file);
+        if rs.symbol.arch_layer == ArchLayer::Other {
+            if let Some(&layer) = section_to_layer.get(&rs.symbol.section_id) {
+                rs.symbol.arch_layer = layer;
+            }
+        }
     }
     for t in types.iter_mut() {
         t.section_id = resolve_numbered(&t.section_id, &t.file);
+        if t.arch_layer == ArchLayer::Other {
+            if let Some(&layer) = section_to_layer.get(&t.section_id) {
+                t.arch_layer = layer;
+            }
+        }
     }
     for m in macros.iter_mut() {
         m.section_id = resolve_numbered(&m.section_id, &m.file);
+        if m.arch_layer == ArchLayer::Other {
+            if let Some(&layer) = section_to_layer.get(&m.section_id) {
+                m.arch_layer = layer;
+            }
+        }
     }
     for c in calls.iter_mut() {
         c.section_id = resolve_numbered(&c.section_id, &c.file);
@@ -301,10 +319,15 @@ pub fn build_section_shards(
                 .then_with(|| a.name.cmp(&b.name))
         });
 
-        // In `VendorMode::Active`, keep only vendor definitions that first-party code actually
-        // references; when nothing in a category is active, the full list is retained and the
-        // renderer caps it instead.
+        // In `VendorMode::Active`, keep only vendor definitions from retained files that
+        // first-party code actually references; when nothing in a category is active, the
+        // retained-files list is kept and the renderer caps it instead.
         if compact_vendor {
+            let retained_files: FxHashSet<&str> = files.iter().map(|s| s.as_str()).collect();
+            shard_symbols.retain(|rs| retained_files.contains(rs.symbol.file.as_str()));
+            shard_types.retain(|t| retained_files.contains(t.file.as_str()));
+            shard_macros.retain(|m| retained_files.contains(m.file.as_str()));
+
             shard_symbols = filter_active_vendor_items(shard_symbols, |rs: &RankedSymbol| {
                 active_vendor_set.contains(rs.symbol.name.as_str()) || rs.in_degree > 0
             });
