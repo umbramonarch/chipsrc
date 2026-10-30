@@ -24,21 +24,34 @@ All notable changes to this project are listed here. Versions follow
 - **Single-File Component (`.astro`, `.vue`, `.svelte`) & JSX/TSX Extraction (`model.rs`, `parser.rs`)**:
   - Added byte-aligned SFC preprocessing (`preprocess_sfc_to_tsx`) that preserves exact 1:1 byte and line coordinates across frontmatter (`---`), `<script>` blocks, and component templates.
   - Added component symbol synthesis, JSX/template PascalCase component usage call/xref edges (`<Component />`), nested helper arrow-function extraction, HTTP route handler entrypoint classification (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `ALL`), and exported constant indexing.
+- **Core Domain Types Table, Oversized Module Sub-Sharding & Fast `meta.json` Freshness Stamps (`model.rs`, `scanner.rs`, `sharder.rs`, `emitter.rs`, `query.rs`, `lib.rs`)**:
+  - Added a **Core Domain Types & Data Structures** table in `INDEX.md` ranking top first-party types by cross-codebase reference count.
+  - Added automatic sub-sharding in `sharder.rs` for oversized first-party modules (`> 8` files or `> 3,000` lines), partitioning by architectural layer (`domain` vs `core`) and dedicated large-file / balanced chunks.
+  - Added per-file `file_stamps` in `meta.json` (`RepoMetadata`) so `auto_refresh_bundles` and `workspace_status` verify bundle freshness in `<2ms` without deserializing multi-megabyte `cache.json` files.
+  - Added `-n` short alias for `--limit` across all query subcommands and `-S` / `--source` full-text source search in `chipsrc search`.
 
 ### Fixed
 
+- **AST & MMIO Extraction Precision (`mmio.rs`, `scanner.rs`, `parser.rs`, `emitter.rs`)**:
+  - Restricted C-style `PERIPH->REG` and `*(volatile ...)` extraction to C/C++, masked standard and multi-line Rust raw string literals (`r#"..."#`), and stopped MMIO regex scanning at `#[cfg(test)]`.
+  - Extended `PERIPH_REG_RE` and `is_register_write_in_line` to capture chained nested struct members and array subscripts (`IOMUX->SECCFG.PINCM[idx] |= ...`, `TIMG2->CPU_INT.ICLR = ...`).
+  - Excluded 32-bit ASCII FourCC magic constants (`0x50574D00UL` / `"PWM\0"`) and `*MAGIC*`/`*VERSION*` identifiers from `MmioAddress` classification, stripped trailing comments from `#define` values, and supported datasheet hex queries starting with `A..F` (`FFh` -> `0xFF`).
+  - Tagged Rust `#[cfg(test)] mod` items and `#[test]` functions as `FileScope::Test` (`ArchLayer::Tests`), skipped test-local constants and multi-line raw string literals (`<multiline string>`) in `macros.tsv`, and hardened `sanitize_tsv` against control characters.
+  - Passed only function declaration headers (before `{`) to `classify_symbol_kind` and ignored comment lines in `has_preceding_interrupt_attr` so string literals/comments never trigger false `SymbolKind::Isr` tags.
+  - Excluded C++ member function prototypes from `fields_summary`, raised `MAX_TYPE_SUMMARY_ITEMS` from 6 to 16 (`... (+N more)`), handled outer `#[...]` attributes on Rust `pub` items, matched Python `async def`, defaulted TS/JS class methods to `pub`, and extracted calls nested inside Rust macros (`format!`).
+  - Scoped `.claudeignore` updates strictly to when `output_dir` resides inside `repo_path`.
 - **Vendor-Neutral SDK & Asset Classification (`scanner.rs`, `sharder.rs`)**:
-  - Replaced hardcoded chip/vendor tokens with structural composite directory sub-token classification (`driverlib`, `cmsis`, `thirdparty`, `3rdparty`, `vendor`, `svd`, `sdk`, `bundled`, `submodules`, `middlewares`) and root-scoped reference directories (`references/`, `reference/`).
+  - Replaced hardcoded chip/vendor tokens with structural composite directory sub-token classification (`driverlib`, `cmsis`, `thirdparty`, `3rdparty`, `vendor`, `svd`, `sdk`, `bundled`, `submodules`, `middlewares`) and root-scoped reference directories (`references/`, `reference/`), and skipped vendor `examples/`/`samples/`/`demos/`/`templates/` subdirectories.
   - Removed overly broad directory exclusions (`html`, `site`) and refined bundled JavaScript asset detection (`*.min.js`, `*.bundle.js`, versioned doc-generator scripts) so first-party modules (`bootstrap.js`, `site/`, `html/`) are never dropped.
-  - Changed shard group scope resolution to dominant/majority ownership, synchronized fallback `ArchLayer::Other` symbol/type/macro layers with their module shard, and filtered `VendorMode::Active` shards strictly to retained active files.
+  - Changed shard group scope resolution to dominant/majority ownership, synchronized fallback `ArchLayer::Other` symbol/type/macro layers with their module shard, and pruned unreferenced vendor entries from both `sections/*.md` and `index/*.tsv` under `VendorMode::Active`.
 - **Context-Aware C/C++ Qualifier Normalization & Signature Extraction (`parser.rs`, `sanity.rs`)**:
   - Replaced hardcoded vendor macro tables with structural top-level (`brace_depth == 0 && paren_depth == 0`) declaration-context normalization for `STATIC`, `CONST`, `INLINE`, `*_STATIC_INLINE`, `*_FORCEINLINE`, `*_WEAK`, `*_IRQ`, `*_INTERRUPT`, `*_RAMFUNC`, and `*_PACKED`, preserving `enum { STATIC = 0, CONST = 1 };` and exact byte lengths.
   - Fixed `extract_clean_signature` to use AST block body boundaries and parenthesis-aware brace splitting so destructured parameters (`({ request }) =>`) and object literals are never truncated.
-  - Filtered C control-flow keywords from misparsed conditional blocks and skipped decorative ASCII divider banners (`---- label ----`, `====`) when extracting doc summaries.
-- **Cross-Language Call Isolation, Relative Import Resolution & Query Precision (`resolver.rs`, `graph.rs`, `query.rs`)**:
-  - Merged C/C++ forward header prototype declarations into matching `.c`/`.cpp` implementations with exact case and parameter-arity checking.
-  - Added caller `enclosing_type` binding for `self`/`this`/`cls` receivers, import-aware builtin guards, relative import path normalization (`./`, `../`), and receiver filtering in Tier 2 (`ImportResolved`).
-  - Improved 1-turn CLI queries (`sym`, `type`, `callers`, `callees`) to suppress low-confidence substring matches when exact symbol/type matches exist.
+  - Filtered C control-flow keywords from misparsed conditional blocks, skipped decorative ASCII divider banners (`---- label ----`, `====`) when extracting doc summaries, and listed offending file paths in `sanity.rs` parse-error warnings.
+- **Call-Graph Resolution, Iterative Tarjan SCC & Query Precision (`resolver.rs`, `graph.rs`, `query.rs`)**:
+  - Prevented explicit type-qualified calls (`String::new()`, `Vec::new()`, `Parser::new()`) and ubiquitous stdlib methods (`.as_str()`, `.clone()`, `.unwrap()`) from binding to unrelated project methods (`ConvertConfig::new`, `ArchLayer::as_str`), isolated `FirstParty` vs `Test` and `VendorSdk` scopes across all resolution tiers, and filtered noisy Rust stdlib `ExternalOrMacro` calls.
+  - Restricted PageRank, `in_degree`/`out_degree`, Tarjan SCC cycle detection, and `sanity.rs` `call_resolution_ratio` to high-confidence resolution tiers (`SameFile`, `ImportResolved`, `UniqueGlobal`), converted `compute_tarjan_sccs` to an iterative algorithm, and prioritized bidirectional transit hubs in `god_nodes`.
+  - Improved `resolve_bundles` to scope default `.` queries to the current workspace's `source_root` when multiple bundles exist in `output/`, return `BundleNotFound` on invalid multi-segment paths, require exact hex equality on hex queries (`0xFF` / `FFh`), fall back to literal regex escaping on unclosed metacharacters in `search`, and cache source files in `SourceSnippetCache`.
 
 ## [1.0.0] - 2026-10-27
 

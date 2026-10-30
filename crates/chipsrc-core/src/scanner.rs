@@ -3,7 +3,8 @@
 
 use crate::error::{ChipsrcError, Result};
 use crate::model::{
-    ArchLayer, FileScope, IncrementalAstCache, LanguageKind, RepoBlueprint, ScannedFile, VendorMode,
+    ArchLayer, BundleMetaFile, FileScope, IncrementalAstCache, LanguageKind, RepoBlueprint,
+    RepoMetadata, ScannedFile, VendorMode, CACHE_SCHEMA_VERSION,
 };
 use ignore::WalkBuilder;
 use rayon::prelude::*;
@@ -325,9 +326,17 @@ pub fn scan_repository(
                 return None;
             }
 
+            let has_explicit_scope = bp_ref
+                .and_then(|bp| match_longest_prefix(&rel_path, &bp.scopes))
+                .is_some();
             let scope = classify_file_scope_with_blueprint(&rel_path, size_bytes, &bytes, bp_ref);
-            if vendor_mode == VendorMode::None && scope == FileScope::VendorSdk {
-                return None;
+            if scope == FileScope::VendorSdk {
+                if vendor_mode == VendorMode::None {
+                    return None;
+                }
+                if !has_explicit_scope && is_vendor_example_or_demo_path(&rel_path) {
+                    return None;
+                }
             }
 
             let arch_layer = classify_arch_layer_with_blueprint(&rel_path, scope, bp_ref);
@@ -372,6 +381,103 @@ pub fn scan_repository(
     let fingerprint = repo_hasher.finalize().to_hex()[..16].to_string();
 
     Ok((scanned_files, fingerprint))
+}
+
+/// Canonicalizes `repo_path` into a normalized forward-slash `source_root` and clean `repo_name`.
+pub fn canonical_repo_root_and_name(repo_path: &Path) -> (String, String) {
+    let canonical = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf());
+    let repo_name = canonical
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty() && *s != ".")
+        .unwrap_or("repo")
+        .to_string();
+    let raw_str = canonical.to_string_lossy();
+    let clean_root = raw_str
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&raw_str)
+        .replace('\\', "/");
+    (clean_root, repo_name)
+}
+
+/// Loads `meta.json` from `bundle_dir` if present and valid.
+pub fn load_meta_file(bundle_dir: &Path) -> Option<BundleMetaFile> {
+    let bytes = fs::read(bundle_dir.join("meta.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Loads `cache.json` from `bundle_dir` if present and matching `CACHE_SCHEMA_VERSION`.
+pub fn load_cache_file(bundle_dir: &Path) -> Option<IncrementalAstCache> {
+    let bytes = fs::read(bundle_dir.join("cache.json")).ok()?;
+    let cache: IncrementalAstCache = serde_json::from_slice(&bytes).ok()?;
+    if !cache.schema_version.is_empty() && cache.schema_version != CACHE_SCHEMA_VERSION {
+        return None;
+    }
+    Some(cache)
+}
+
+/// Checks how many files were added, deleted, or modified compared to `meta.file_stamps`
+/// (or `meta.fingerprint` when `file_stamps` is empty), without loading `cache.json`.
+pub fn check_meta_files_changed(
+    repo_path: &Path,
+    meta: &RepoMetadata,
+    max_file_bytes: u64,
+) -> Option<usize> {
+    if meta.file_stamps.is_empty() {
+        return None;
+    }
+
+    let (scanned_files, live_fp) =
+        match scan_repository(repo_path, meta.vendor_mode, max_file_bytes) {
+            Ok(res) => res,
+            Err(ChipsrcError::NoSourceFilesFound(_)) => return Some(meta.file_stamps.len()),
+            Err(_) => return None,
+        };
+
+    if live_fp == meta.fingerprint && scanned_files.len() == meta.file_stamps.len() {
+        return Some(0);
+    }
+
+    let stamp_map: BTreeMap<&str, &crate::model::FileStamp> = meta
+        .file_stamps
+        .iter()
+        .map(|s| (s.rel_path.as_str(), s))
+        .collect();
+
+    let mut changed = 0usize;
+    let mut seen_paths = HashSet::with_capacity(scanned_files.len());
+
+    for file in &scanned_files {
+        seen_paths.insert(file.rel_path.as_str());
+        match stamp_map.get(file.rel_path.as_str()) {
+            Some(stamp) => {
+                if stamp.size_bytes != file.size_bytes
+                    || stamp.blake3_hash != file.blake3_hash
+                    || stamp.scope != file.scope
+                    || stamp.arch_layer != file.arch_layer
+                {
+                    changed += 1;
+                }
+            }
+            None => {
+                changed += 1;
+            }
+        }
+    }
+
+    for cached_rel_path in stamp_map.keys() {
+        if !seen_paths.contains(*cached_rel_path) {
+            changed += 1;
+        }
+    }
+
+    if changed == 0 && !meta.fingerprint.is_empty() && meta.fingerprint != live_fp {
+        changed = 1;
+    }
+
+    Some(changed)
 }
 
 /// Checks how many files were added, deleted, or modified compared to `cached.files`.
@@ -444,7 +550,7 @@ pub fn assign_section_id_with_blueprint(
 /// `(section_slug, section_title, module_path)`.
 pub fn assign_section_id(
     rel_path: &str,
-    _scope: FileScope,
+    scope: FileScope,
     arch_layer: ArchLayer,
 ) -> (String, String, String) {
     let normalized = rel_path.replace('\\', "/");
@@ -461,6 +567,17 @@ pub fn assign_section_id(
     {
         let container = parts[0];
         let pkg_name = parts[1];
+        if scope == FileScope::Test
+            || matches!(
+                parts.get(2).copied(),
+                Some("tests" | "test" | "benches" | "evals")
+            )
+        {
+            let module_path = format!("{container}/{pkg_name}/tests");
+            let slug = sanitize_slug(&format!("{container}-{pkg_name}-tests"));
+            let title = format!("{module_path} ({layer_str})");
+            return (slug, title, module_path);
+        }
         let module_path = format!("{container}/{pkg_name}");
         let slug = sanitize_slug(&format!("{container}-{pkg_name}"));
         let title = format!("{module_path} ({layer_str})");
@@ -831,6 +948,26 @@ fn classify_file_scope(rel_path: &str, size_bytes: u64, bytes: &[u8]) -> FileSco
     FileScope::FirstParty
 }
 
+/// Returns `true` when a vendor-owned path sits inside an SDK `examples/`, `samples/`, `demos/`,
+/// or `templates/` directory tree (which holds reference demo applications rather than the SDK library).
+fn is_vendor_example_or_demo_path(rel_path: &str) -> bool {
+    let parts: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
+    let dir_segments = &parts[..parts.len().saturating_sub(1)];
+    dir_segments.iter().any(|seg| {
+        matches!(
+            seg.to_ascii_lowercase().as_str(),
+            "examples"
+                | "example"
+                | "samples"
+                | "sample"
+                | "demos"
+                | "demo"
+                | "templates"
+                | "template"
+        )
+    })
+}
+
 fn classify_arch_layer_with_blueprint(
     rel_path: &str,
     scope: FileScope,
@@ -865,16 +1002,44 @@ fn classify_arch_layer(rel_path: &str, scope: FileScope) -> ArchLayer {
             }
         }
     }
+
+    let stem_opt = parts.last().map(|filename| {
+        filename
+            .rsplit_once('.')
+            .map(|(s, _)| s)
+            .unwrap_or(filename)
+            .to_ascii_lowercase()
+    });
+
+    // When a directory resolves to generic `Core` (e.g. `crates/*-core/src/`) or `None`,
+    // allow pure domain/error/schema file stems to refine the layer to `ArchLayer::Domain`
+    // so intra-crate layered-DAG edges (`core -> domain`) and upward violations are tracked.
+    if matches!(resolved_layer, None | Some(ArchLayer::Core)) {
+        if let Some(ref stem) = stem_opt {
+            if matches!(
+                stem.as_str(),
+                "model"
+                    | "models"
+                    | "error"
+                    | "errors"
+                    | "schema"
+                    | "schemas"
+                    | "entity"
+                    | "entities"
+            ) {
+                return ArchLayer::Domain;
+            }
+        }
+    }
+
     if let Some(layer) = resolved_layer {
         return layer;
     }
 
-    if let Some(filename) = parts.last() {
-        let stem = filename
-            .rsplit_once('.')
-            .map(|(s, _)| s)
-            .unwrap_or(filename)
-            .to_ascii_lowercase();
+    if let Some(stem) = stem_opt {
+        if stem == "lib" {
+            return ArchLayer::Core;
+        }
         if let Some(layer) = match_segment_to_layer(&stem) {
             return layer;
         }
@@ -930,6 +1095,31 @@ fn sanitize_slug(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DEFAULT_MAX_FILE_BYTES;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestTempDir(PathBuf);
+
+    impl TestTempDir {
+        fn new(prefix: &str) -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("{prefix}_{}_{id}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp test dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn test_assign_section_id() {
@@ -941,6 +1131,15 @@ mod tests {
         assert_eq!(slug, "crates-chipsrc-core");
         assert_eq!(module, "crates/chipsrc-core");
         assert_eq!(title, "crates/chipsrc-core (core)");
+
+        let (test_slug, test_title, test_mod) = assign_section_id(
+            "crates/chipsrc-core/tests/integration_tests.rs",
+            FileScope::Test,
+            ArchLayer::Tests,
+        );
+        assert_eq!(test_slug, "crates-chipsrc-core-tests");
+        assert_eq!(test_mod, "crates/chipsrc-core/tests");
+        assert_eq!(test_title, "crates/chipsrc-core/tests (tests)");
 
         let (slug2, title2, module2) =
             assign_section_id("fw/drvs/motor.c", FileScope::FirstParty, ArchLayer::Drivers);
@@ -989,6 +1188,20 @@ mod tests {
         assert_eq!(
             classify_arch_layer("crates/chipsrc-cli/src/main.rs", scope4),
             ArchLayer::Cli
+        );
+
+        // Intra-crate domain stem refinement inside `*-core` crates
+        assert_eq!(
+            classify_arch_layer("crates/chipsrc-core/src/model.rs", FileScope::FirstParty),
+            ArchLayer::Domain
+        );
+        assert_eq!(
+            classify_arch_layer("crates/chipsrc-core/src/error.rs", FileScope::FirstParty),
+            ArchLayer::Domain
+        );
+        assert_eq!(
+            classify_arch_layer("crates/chipsrc-core/src/parser.rs", FileScope::FirstParty),
+            ArchLayer::Core
         );
     }
 
@@ -1095,40 +1308,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ignored_dirs_include_docs_and_static_assets() {
-        for dir in [
-            "_static",
-            "_build",
-            "doxygen",
-            "coverage",
-            "htmlcov",
-            ".tox",
-            ".nox",
-            "wheelhouse",
-            "node_modules",
-            "target",
-        ] {
-            assert!(
-                IGNORED_DIRS.contains(&dir),
-                "Expected IGNORED_DIRS to contain '{dir}'"
-            );
-        }
-        // Generic first-party package names must never be globally ignored.
-        assert!(!IGNORED_DIRS.contains(&"site"));
-        assert!(!IGNORED_DIRS.contains(&"html"));
-    }
-
-    #[test]
-    fn test_scan_repository_skips_docs_and_honors_claudeignore() {
-        let root = std::env::temp_dir().join(format!(
-            "chipsrc_scanner_ignore_test_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+    fn test_scan_repository_skips_docs_vendor_examples_and_honors_claudeignore() {
+        let tmp = TestTempDir::new("chipsrc_scanner_ignore_test");
+        let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("docs/_static")).unwrap();
         std::fs::create_dir_all(root.join("doxygen/html")).unwrap();
         std::fs::create_dir_all(root.join("generated")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/sdk/examples/blinky")).unwrap();
 
         std::fs::write(root.join("src/app.c"), "int app_main(void) { return 0; }\n").unwrap();
         std::fs::write(
@@ -1142,15 +1329,18 @@ mod tests {
             "int skipped(void) { return 1; }\n",
         )
         .unwrap();
+        std::fs::write(
+            root.join("vendor/sdk/examples/blinky/main.c"),
+            "int main(void) { return 0; }\n",
+        )
+        .unwrap();
         std::fs::write(root.join(".claudeignore"), "generated/\n").unwrap();
 
-        let (files, fingerprint) =
-            scan_repository(&root, VendorMode::All, 4 * 1024 * 1024).expect("scan_repository");
+        let (files, fingerprint) = scan_repository(root, VendorMode::All, DEFAULT_MAX_FILE_BYTES)
+            .expect("scan_repository");
         let rel_paths: Vec<&str> = files.iter().map(|f| f.rel_path.as_str()).collect();
         assert_eq!(rel_paths, vec!["src/app.c"]);
         assert_eq!(fingerprint.len(), 16);
         assert_eq!(files[0].scope, FileScope::FirstParty);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

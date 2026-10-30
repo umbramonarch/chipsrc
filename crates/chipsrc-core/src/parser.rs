@@ -7,7 +7,7 @@
 use crate::error::{ChipsrcError, Result};
 use crate::mmio::{classify_macro_value_with_blueprint, extract_mmio_and_linker_constructs};
 use crate::model::{
-    ArchLayer, ExtractedImport, ExtractedMacro, ExtractedSymbol, ExtractedType,
+    ArchLayer, ExtractedImport, ExtractedMacro, ExtractedSymbol, ExtractedType, FileScope,
     IncrementalAstCache, LanguageKind, MacroKind, ParsedFileUnit, RawCallSite, RawXrefSite,
     RepoBlueprint, ScannedFile, SymbolKind, TypeKind, Visibility,
 };
@@ -24,16 +24,9 @@ thread_local! {
         RefCell::new(FxHashMap::default());
 }
 
-/// Parses all `scanned_files`, reusing unchanged entries from `existing_cache` when
-/// `size_bytes` and `blake3_hash` match, and parsing new or modified files in parallel via Rayon.
-///
-/// Returns `(all_units_sorted_by_rel_path, reused_count, reparsed_count)`.
-pub fn parse_files_incremental(
-    scanned_files: &[ScannedFile],
-    existing_cache: Option<&IncrementalAstCache>,
-) -> Result<(Vec<ParsedFileUnit>, usize, usize)> {
-    parse_files_incremental_with_blueprint(scanned_files, existing_cache.cloned(), None)
-}
+/// Maximum number of struct fields or enum variants included in `fields_summary` before
+/// appending `, ... (+N more)`.
+const MAX_TYPE_SUMMARY_ITEMS: usize = 16;
 
 /// Parses all `scanned_files` with an optional `.chipsrc.json` [`RepoBlueprint`] and takes
 /// `existing_cache` by value so unchanged entries are moved out via `.remove()` without deep cloning.
@@ -80,12 +73,6 @@ pub fn parse_files_incremental_with_blueprint(
     Ok((all_units, reused_count, reparsed_count))
 }
 
-/// Parses a single `ScannedFile` from disk using Tree-sitter and extracts all symbols,
-/// types, macros, MMIO register accesses, imports, and call sites.
-pub fn parse_single_file(scanned: &ScannedFile) -> Result<ParsedFileUnit> {
-    parse_single_file_with_blueprint(scanned, None)
-}
-
 /// Parses a single `ScannedFile` from disk with an optional `.chipsrc.json` [`RepoBlueprint`].
 pub fn parse_single_file_with_blueprint(
     scanned: &ScannedFile,
@@ -98,6 +85,7 @@ pub fn parse_single_file_with_blueprint(
 }
 
 /// Parses an in-memory `source` string for a given `ScannedFile` descriptor.
+#[cfg(test)]
 pub fn parse_source_str(scanned: &ScannedFile, source: &str) -> Result<ParsedFileUnit> {
     parse_source_str_with_blueprint(scanned, source, None)
 }
@@ -163,6 +151,7 @@ pub fn parse_source_str_with_blueprint(
         section_id: &section_id,
         blueprint,
         is_header: is_c_or_cpp_header(&scanned.rel_path),
+        in_test_scope: scanned.scope == FileScope::Test,
         symbols: Vec::new(),
         header_prototypes: Vec::new(),
         types: Vec::new(),
@@ -546,6 +535,7 @@ struct ExtractContext<'a> {
     section_id: &'a str,
     blueprint: Option<&'a RepoBlueprint>,
     is_header: bool,
+    in_test_scope: bool,
     symbols: Vec<ExtractedSymbol>,
     header_prototypes: Vec<ExtractedSymbol>,
     types: Vec<ExtractedType>,
@@ -561,6 +551,55 @@ struct ExtractContext<'a> {
     parse_errors: usize,
 }
 
+impl ExtractContext<'_> {
+    fn current_scope(&self) -> FileScope {
+        if self.in_test_scope {
+            FileScope::Test
+        } else {
+            self.scanned.scope
+        }
+    }
+
+    fn current_layer(&self) -> ArchLayer {
+        if self.in_test_scope {
+            ArchLayer::Tests
+        } else {
+            self.scanned.arch_layer
+        }
+    }
+}
+
+fn format_type_summary_items(items: Vec<String>) -> String {
+    let total = items.len();
+    if total <= MAX_TYPE_SUMMARY_ITEMS {
+        items.join(", ")
+    } else {
+        let mut head: String = items[..MAX_TYPE_SUMMARY_ITEMS].join(", ");
+        head.push_str(&format!(", ... (+{} more)", total - MAX_TYPE_SUMMARY_ITEMS));
+        head
+    }
+}
+
+fn has_preceding_rust_test_attr(node: Node<'_>, bytes: &[u8]) -> bool {
+    let mut prev = node.prev_sibling();
+    while let Some(sib) = prev {
+        if sib.kind() == "attribute_item" {
+            let txt = node_text(sib, bytes);
+            if txt.contains("cfg(test)")
+                || txt.contains("#[test]")
+                || txt.contains("::test")
+                || txt.contains("test_case")
+            {
+                return true;
+            }
+        } else if !sib.is_extra() {
+            break;
+        }
+        prev = sib.prev_sibling();
+    }
+    false
+}
+
 fn walk_ast(
     ctx: &mut ExtractContext<'_>,
     node: Node<'_>,
@@ -572,6 +611,14 @@ fn walk_ast(
     }
 
     let kind = node.kind();
+    let prev_test_scope = ctx.in_test_scope;
+    if ctx.scanned.language == LanguageKind::Rust
+        && matches!(kind, "mod_item" | "function_item")
+        && has_preceding_rust_test_attr(node, ctx.bytes)
+    {
+        ctx.in_test_scope = true;
+    }
+
     let mut next_enclosing_type: Option<String> = enclosing_type.map(ToOwned::to_owned);
     let mut next_enclosing_fn: Option<(String, usize)> =
         enclosing_fn.map(|(n, l)| (n.to_string(), l));
@@ -654,11 +701,29 @@ fn walk_ast(
         ctx.local_var_types = prev_types;
         ctx.local_vars = prev_vars;
     }
+    ctx.in_test_scope = prev_test_scope;
 }
 
 // ============================================================================
 // C / C++ AST Extraction
 // ============================================================================
+
+/// Returns `true` when a C/C++ `field_declaration` is a member function prototype
+/// (`bool start(uint16_t rpm);`) rather than a data field or function-pointer field
+/// (`void (*on_frame)(uint8_t);`).
+fn is_cpp_method_field_declaration(node: Node<'_>) -> bool {
+    let Some(fn_decl) = find_first_descendant_of_kind(node, "function_declarator") else {
+        return false;
+    };
+    if let Some(inner_decl) = fn_decl.child_by_field_name("declarator") {
+        if inner_decl.kind() == "parenthesized_declarator"
+            && has_descendant_kind(inner_decl, "pointer_declarator")
+        {
+            return false;
+        }
+    }
+    true
+}
 
 fn handle_c_cpp_node(
     ctx: &mut ExtractContext<'_>,
@@ -678,7 +743,7 @@ fn handle_c_cpp_node(
         }
         "declaration" => {
             // Check if this declaration is a function prototype in a header file
-            if ctx.is_header && has_descendant_kind(node, "function_declarator") {
+            if ctx.is_header && is_cpp_method_field_declaration(node) {
                 let text = node_text(node, ctx.bytes);
                 if !text.trim_start().starts_with("typedef") {
                     if let Some(sym) = extract_c_cpp_function(ctx, node, enclosing_type, true) {
@@ -691,16 +756,10 @@ fn handle_c_cpp_node(
             }
         }
         "field_declaration" => {
-            // C++ method declaration inside class/struct or top-level function pointer field
-            if has_descendant_kind(node, "function_declarator")
-                && (ctx.is_header || enclosing_type.is_none())
-            {
+            // C++ method declaration inside class/struct in a header file
+            if ctx.is_header && is_cpp_method_field_declaration(node) {
                 if let Some(sym) = extract_c_cpp_function(ctx, node, enclosing_type, true) {
-                    if ctx.is_header {
-                        ctx.header_prototypes.push(sym);
-                    } else {
-                        ctx.symbols.push(sym);
-                    }
+                    ctx.header_prototypes.push(sym);
                 }
             }
         }
@@ -732,6 +791,20 @@ fn handle_c_cpp_node(
         }
         _ => {}
     }
+}
+
+fn extract_decl_header<'a>(node: Node<'_>, bytes: &'a [u8]) -> &'a str {
+    let full_text = node_text(node, bytes);
+    let header_end = node
+        .child_by_field_name("body")
+        .map(|b| b.start_byte())
+        .unwrap_or_else(|| node.end_byte());
+    let slice = if header_end > node.start_byte() && header_end <= bytes.len() {
+        std::str::from_utf8(&bytes[node.start_byte()..header_end]).unwrap_or(full_text)
+    } else {
+        full_text
+    };
+    split_at_top_level_brace(slice)
 }
 
 fn extract_c_cpp_function(
@@ -793,18 +866,9 @@ fn extract_c_cpp_function(
         forced_isr = true;
     }
 
-    let full_text = node_text(node, ctx.bytes);
-    // Only the declaration header (everything before the body brace) decides linkage, so a
-    // `static` local declared inside the body cannot mark the function itself as static.
-    let header_end = node
-        .child_by_field_name("body")
-        .map(|b| b.start_byte())
-        .unwrap_or_else(|| node.end_byte());
-    let decl_header = if header_end > node.start_byte() && header_end <= ctx.bytes.len() {
-        std::str::from_utf8(&ctx.bytes[node.start_byte()..header_end]).unwrap_or(full_text)
-    } else {
-        full_text
-    };
+    // Only the declaration header (everything before the body brace) decides linkage and ISR kind,
+    // so literals or `static` locals inside the body cannot misclassify the function.
+    let decl_header = extract_decl_header(node, ctx.bytes);
     let visibility = if c_decl_header_is_static(decl_header) {
         Visibility::Static
     } else {
@@ -815,8 +879,8 @@ fn extract_c_cpp_function(
         &name,
         effective_enclosing.as_deref(),
         forced_isr,
-        ctx.scanned.arch_layer,
-        full_text,
+        ctx.current_layer(),
+        decl_header,
         ctx.blueprint,
     );
 
@@ -839,8 +903,8 @@ fn extract_c_cpp_function(
         signature,
         doc_summary,
         enclosing_type: effective_enclosing,
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
     })
 }
@@ -908,8 +972,8 @@ fn extract_c_typedef(ctx: &mut ExtractContext<'_>, node: Node<'_>) {
         end_line,
         fields_summary,
         doc_summary,
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
     });
 }
@@ -952,8 +1016,8 @@ fn extract_c_specifier_type(
         end_line,
         fields_summary,
         doc_summary,
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
     });
 
@@ -967,11 +1031,12 @@ fn summarize_c_type_fields(type_node: Node<'_>, bytes: &[u8]) -> String {
     let mut items = Vec::new();
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
-        if items.len() >= 6 {
-            break;
-        }
         match child.kind() {
             "field_declaration" => {
+                // Skip C++ member function prototypes inside class/struct bodies
+                if is_cpp_method_field_declaration(child) {
+                    continue;
+                }
                 let ty_txt = child
                     .child_by_field_name("type")
                     .map(|n| normalize_whitespace(node_text(n, bytes)))
@@ -1000,7 +1065,72 @@ fn summarize_c_type_fields(type_node: Node<'_>, bytes: &[u8]) -> String {
             _ => {}
         }
     }
-    items.join(", ")
+    format_type_summary_items(items)
+}
+
+/// Splits a preprocessor `#define` value into `(clean_value, optional_inline_comment)`,
+/// stripping trailing `//...` and `/*...*/` comments while preserving string literals.
+fn split_macro_value_and_inline_comment(raw: &str) -> (String, Option<String>) {
+    let bytes = raw.as_bytes();
+    let mut i = 0usize;
+    let mut in_quote: u8 = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_quote != 0 {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == in_quote {
+                in_quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_quote = b;
+            i += 1;
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            let val = normalize_whitespace(&raw[..i]);
+            let comment = clean_inline_macro_comment(&raw[i + 2..]);
+            return (val, (!comment.is_empty()).then_some(comment));
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let before = &raw[..i];
+            let after_start = i + 2;
+            if let Some(end_rel) = raw[after_start..].find("*/") {
+                let comment_raw = &raw[after_start..after_start + end_rel];
+                let trailing = &raw[after_start + end_rel + 2..];
+                let combined_val = format!("{before} {trailing}");
+                let val = normalize_whitespace(&combined_val);
+                let comment = clean_inline_macro_comment(comment_raw);
+                return (val, (!comment.is_empty()).then_some(comment));
+            } else {
+                let val = normalize_whitespace(before);
+                let comment = clean_inline_macro_comment(&raw[after_start..]);
+                return (val, (!comment.is_empty()).then_some(comment));
+            }
+        }
+        i += 1;
+    }
+
+    (normalize_whitespace(raw), None)
+}
+
+fn clean_inline_macro_comment(raw_comment: &str) -> String {
+    let s = raw_comment
+        .trim()
+        .trim_start_matches('/')
+        .trim_start_matches('*')
+        .trim_start_matches('!')
+        .trim_start_matches('<')
+        .trim_end_matches("*/")
+        .trim_end_matches('*')
+        .trim();
+    normalize_whitespace(s)
 }
 
 fn extract_c_preproc_def(ctx: &mut ExtractContext<'_>, node: Node<'_>, is_fn_like: bool) {
@@ -1020,10 +1150,10 @@ fn extract_c_preproc_def(ctx: &mut ExtractContext<'_>, node: Node<'_>, is_fn_lik
         String::new()
     };
 
-    let raw_val = node
+    let (raw_val, inline_comment) = node
         .child_by_field_name("value")
-        .map(|v| normalize_whitespace(node_text(v, ctx.bytes)))
-        .unwrap_or_default();
+        .map(|v| split_macro_value_and_inline_comment(node_text(v, ctx.bytes)))
+        .unwrap_or_else(|| (String::new(), None));
 
     // Skip empty header guards like `#define MOTOR_CTRL_H`
     if !is_fn_like
@@ -1046,8 +1176,13 @@ fn extract_c_preproc_def(ctx: &mut ExtractContext<'_>, node: Node<'_>, is_fn_lik
         raw_val.clone()
     };
 
-    let (kind, hex_addr, description) =
+    let (kind, hex_addr, mut description) =
         classify_macro_value_with_blueprint(&name, &raw_val, is_fn_like, ctx.blueprint);
+    if let Some(comment) = inline_comment {
+        if !description.contains('(') {
+            description = truncate_str(&comment, 160);
+        }
+    }
     let line = node.start_position().row + 1;
 
     if matches!(kind, MacroKind::MmioAddress | MacroKind::Bitmask) {
@@ -1068,8 +1203,8 @@ fn extract_c_preproc_def(ctx: &mut ExtractContext<'_>, node: Node<'_>, is_fn_lik
         hex_addr,
         file: ctx.scanned.rel_path.clone(),
         line,
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
         description,
     });
@@ -1092,7 +1227,7 @@ fn extract_c_cpp_const_declaration(ctx: &mut ExtractContext<'_>, node: Node<'_>)
     let Some(val_node) = init_decl.child_by_field_name("value") else {
         return;
     };
-    let raw_val = normalize_whitespace(node_text(val_node, ctx.bytes));
+    let raw_val = summarize_const_value_node(val_node, ctx.bytes);
     let (mut kind, hex_addr, mut description) =
         classify_macro_value_with_blueprint(&name, &raw_val, false, ctx.blueprint);
     if kind == MacroKind::ObjectMacro {
@@ -1108,11 +1243,24 @@ fn extract_c_cpp_const_declaration(ctx: &mut ExtractContext<'_>, node: Node<'_>)
         hex_addr,
         file: ctx.scanned.rel_path.clone(),
         line,
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
         description,
     });
+}
+
+fn summarize_const_value_node(val_node: Node<'_>, bytes: &[u8]) -> String {
+    let raw = node_text(val_node, bytes).trim();
+    if (raw.starts_with('"')
+        || raw.starts_with('\'')
+        || raw.starts_with("r\"")
+        || raw.starts_with("r#"))
+        && (raw.contains('\n') || raw.contains("\\t") || raw.contains("\\n"))
+    {
+        return "\"<multiline string>\"".to_string();
+    }
+    normalize_whitespace(raw)
 }
 
 fn extract_c_include(
@@ -1201,7 +1349,9 @@ fn handle_rust_node(
             }
         }
         "const_item" | "static_item" => {
-            extract_rust_const_or_static(ctx, node);
+            if !ctx.in_test_scope && enclosing_fn.is_none() {
+                extract_rust_const_or_static(ctx, node);
+            }
         }
         "macro_definition" => {
             extract_rust_macro_def(ctx, node);
@@ -1212,8 +1362,11 @@ fn handle_rust_node(
         "mod_item" => {
             extract_rust_mod(ctx, node);
         }
-        "call_expression" | "macro_invocation" => {
+        "call_expression" => {
             extract_call_site(ctx, node, enclosing_fn);
+        }
+        "macro_invocation" => {
+            extract_rust_macro_invocation_calls(ctx, node, enclosing_fn);
         }
         _ => {}
     }
@@ -1234,15 +1387,15 @@ fn extract_rust_function(
     let end_line = node.end_position().row + 1;
     let doc_summary = extract_preceding_doc(ctx.lines, start_line);
     let has_isr_attr = has_preceding_interrupt_attr(ctx.lines, start_line);
-    let full_text = node_text(node, ctx.bytes);
+    let decl_header = extract_decl_header(node, ctx.bytes);
 
-    let visibility = parse_rust_visibility(full_text);
+    let visibility = extract_rust_node_visibility(node, ctx.bytes);
     let kind = classify_symbol_kind(
         &name,
         enclosing_type,
         has_isr_attr,
-        ctx.scanned.arch_layer,
-        full_text,
+        ctx.current_layer(),
+        decl_header,
         ctx.blueprint,
     );
 
@@ -1265,8 +1418,8 @@ fn extract_rust_function(
         signature,
         doc_summary,
         enclosing_type: enclosing_type.map(ToOwned::to_owned),
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
     })
 }
@@ -1293,7 +1446,7 @@ fn extract_rust_type(
     let start_line = node.start_position().row + 1;
     let end_line = node.end_position().row + 1;
     let doc_summary = extract_preceding_doc(ctx.lines, start_line);
-    let visibility = parse_rust_visibility(node_text(node, ctx.bytes));
+    let visibility = extract_rust_node_visibility(node, ctx.bytes);
     let fields_summary = summarize_rust_type_fields(node, ctx.bytes);
     let type_id = format!("{}::{}", ctx.scanned.rel_path, name);
 
@@ -1307,8 +1460,8 @@ fn extract_rust_type(
         end_line,
         fields_summary,
         doc_summary,
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
     });
 
@@ -1327,9 +1480,6 @@ fn summarize_rust_type_fields(node: Node<'_>, bytes: &[u8]) -> String {
     let mut items = Vec::new();
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
-        if items.len() >= 6 {
-            break;
-        }
         match child.kind() {
             "field_declaration" => {
                 let fname = child
@@ -1359,7 +1509,7 @@ fn summarize_rust_type_fields(node: Node<'_>, bytes: &[u8]) -> String {
             _ => {}
         }
     }
-    items.join(", ")
+    format_type_summary_items(items)
 }
 
 fn extract_rust_const_or_static(ctx: &mut ExtractContext<'_>, node: Node<'_>) {
@@ -1372,7 +1522,7 @@ fn extract_rust_const_or_static(ctx: &mut ExtractContext<'_>, node: Node<'_>) {
     }
     let raw_val = node
         .child_by_field_name("value")
-        .map(|v| normalize_whitespace(node_text(v, ctx.bytes)))
+        .map(|v| summarize_const_value_node(v, ctx.bytes))
         .unwrap_or_default();
 
     let (mut kind, hex_addr, mut description) =
@@ -1390,8 +1540,8 @@ fn extract_rust_const_or_static(ctx: &mut ExtractContext<'_>, node: Node<'_>) {
         hex_addr,
         file: ctx.scanned.rel_path.clone(),
         line,
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
         description,
     });
@@ -1420,8 +1570,8 @@ fn extract_rust_macro_def(ctx: &mut ExtractContext<'_>, node: Node<'_>) {
         hex_addr: None,
         file: ctx.scanned.rel_path.clone(),
         line,
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
         description,
     });
@@ -1433,21 +1583,35 @@ fn extract_rust_use(
     enclosing_fn: Option<(&str, usize)>,
 ) {
     let full = normalize_whitespace(node_text(node, ctx.bytes));
-    let raw_path = full
+    let raw_use = full
         .trim_start_matches("pub(crate) ")
+        .trim_start_matches("pub(super) ")
         .trim_start_matches("pub ")
         .trim_start_matches("use ")
         .trim_end_matches(';')
         .trim()
         .to_string();
-    if raw_path.is_empty() {
+    if raw_use.is_empty() {
         return;
     }
 
-    let is_system = raw_path.starts_with("std::")
-        || raw_path.starts_with("core::")
-        || raw_path.starts_with("alloc::");
-    let imported_names = parse_rust_use_leaves(&raw_path);
+    let is_system = raw_use.starts_with("std::")
+        || raw_use.starts_with("core::")
+        || raw_use.starts_with("alloc::");
+    let imported_names = parse_rust_use_leaves(&raw_use);
+
+    // Strip any grouped `{ ... }`, `*`, or ` as ...` suffix so `raw_path` names the module prefix cleanly
+    let raw_path = if let Some((prefix, _)) = raw_use.split_once('{') {
+        prefix.trim().trim_end_matches("::").to_string()
+    } else if let Some(prefix) = raw_use.strip_suffix("::*") {
+        prefix.trim().to_string()
+    } else {
+        raw_use
+            .split_once(" as ")
+            .map(|(p, _)| p.trim().to_string())
+            .unwrap_or(raw_use)
+    };
+
     let line = node.start_position().row + 1;
 
     for target in &imported_names {
@@ -1523,11 +1687,29 @@ fn extract_rust_mod(ctx: &mut ExtractContext<'_>, node: Node<'_>) {
     });
 }
 
+fn extract_rust_node_visibility(node: Node<'_>, bytes: &[u8]) -> Visibility {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "visibility_modifier" {
+            return parse_rust_visibility(node_text(child, bytes));
+        }
+    }
+    parse_rust_visibility(node_text(node, bytes))
+}
+
 fn parse_rust_visibility(text: &str) -> Visibility {
-    let trimmed = text.trim_start();
+    let mut trimmed = text.trim_start();
+    // Strip any leading outer attributes `#[...]` included in raw node slices
+    while trimmed.starts_with("#[") {
+        if let Some(end_bracket) = trimmed.find(']') {
+            trimmed = trimmed[end_bracket + 1..].trim_start();
+        } else {
+            break;
+        }
+    }
     if trimmed.starts_with("pub(crate)") || trimmed.starts_with("pub(super)") {
         Visibility::Internal
-    } else if trimmed.starts_with("pub ") || trimmed.starts_with("pub(") {
+    } else if trimmed == "pub" || trimmed.starts_with("pub ") || trimmed.starts_with("pub(") {
         Visibility::Public
     } else {
         Visibility::Private
@@ -1553,7 +1735,7 @@ fn handle_python_node(
                 *next_enclosing_type = Some(cls_name);
             }
         }
-        "function_definition" => {
+        "function_definition" | "async_function_definition" => {
             if let Some(sym) = extract_python_function(ctx, node, enclosing_type) {
                 *next_enclosing_fn = Some((sym.name.clone(), sym.start_line));
                 ctx.symbols.push(sym);
@@ -1598,13 +1780,13 @@ fn extract_python_function(
         Visibility::Public
     };
 
-    let full_text = node_text(node, ctx.bytes);
+    let decl_header = extract_decl_header(node, ctx.bytes);
     let kind = classify_symbol_kind(
         &name,
         enclosing_type,
         false,
-        ctx.scanned.arch_layer,
-        full_text,
+        ctx.current_layer(),
+        decl_header,
         ctx.blueprint,
     );
 
@@ -1627,8 +1809,8 @@ fn extract_python_function(
         signature,
         doc_summary,
         enclosing_type: enclosing_type.map(ToOwned::to_owned),
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
     })
 }
@@ -1665,8 +1847,8 @@ fn extract_python_class(ctx: &mut ExtractContext<'_>, node: Node<'_>) -> Option<
         end_line,
         fields_summary,
         doc_summary,
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
     });
 
@@ -1680,9 +1862,6 @@ fn summarize_python_class_fields(node: Node<'_>, bytes: &[u8]) -> String {
     let mut items = Vec::new();
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
-        if items.len() >= 6 {
-            break;
-        }
         match child.kind() {
             "expression_statement" => {
                 if let Some(assign) = child.child(0) {
@@ -1701,15 +1880,27 @@ fn summarize_python_class_fields(node: Node<'_>, bytes: &[u8]) -> String {
                     }
                 }
             }
-            "function_definition" => {
+            "function_definition" | "async_function_definition" => {
                 if let Some(mname) = child.child_by_field_name("name") {
                     items.push(format!("def {}", node_text(mname, bytes).trim()));
+                }
+            }
+            "decorated_definition" => {
+                if let Some(def) = child.child_by_field_name("definition") {
+                    if matches!(
+                        def.kind(),
+                        "function_definition" | "async_function_definition"
+                    ) {
+                        if let Some(mname) = def.child_by_field_name("name") {
+                            items.push(format!("def {}", node_text(mname, bytes).trim()));
+                        }
+                    }
                 }
             }
             _ => {}
         }
     }
-    items.join(", ")
+    format_type_summary_items(items)
 }
 
 fn extract_python_docstring(node: Node<'_>, bytes: &[u8]) -> String {
@@ -1757,7 +1948,7 @@ fn extract_python_top_level_const(ctx: &mut ExtractContext<'_>, node: Node<'_>) 
     }
     let raw_val = node
         .child_by_field_name("right")
-        .map(|r| normalize_whitespace(node_text(r, ctx.bytes)))
+        .map(|r| summarize_const_value_node(r, ctx.bytes))
         .unwrap_or_default();
 
     let (mut kind, hex_addr, mut description) =
@@ -1775,8 +1966,8 @@ fn extract_python_top_level_const(ctx: &mut ExtractContext<'_>, node: Node<'_>) 
         hex_addr,
         file: ctx.scanned.rel_path.clone(),
         line,
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
         description,
     });
@@ -1928,29 +2119,52 @@ fn extract_jsx_component_use(
         None => ("<module_init>".to_string(), 1),
     };
     let call_line = node.start_position().row + 1;
-    let context_line = ctx
-        .lines
-        .get(call_line.saturating_sub(1))
-        .map(|l| l.trim().to_string())
-        .unwrap_or_else(|| truncate_str(&normalize_whitespace(node_text(node, ctx.bytes)), 120));
 
     ctx.raw_calls.push(RawCallSite {
         caller_file: ctx.scanned.rel_path.clone(),
-        caller_name: caller_name.clone(),
+        caller_name,
         caller_start_line,
-        callee_name: callee_name.clone(),
+        callee_name,
         receiver_or_qualifier,
         call_line,
     });
+}
 
-    ctx.raw_xrefs.push(RawXrefSite {
-        file: ctx.scanned.rel_path.clone(),
-        line: call_line,
-        enclosing_symbol: Some(caller_name),
-        target_name: callee_name,
-        category: "call".to_string(),
-        context: truncate_str(&context_line, 120),
-    });
+fn extract_ts_js_method_visibility(
+    node: Node<'_>,
+    name: &str,
+    is_exported: bool,
+    enclosing_type: Option<&str>,
+    bytes: &[u8],
+) -> Visibility {
+    if name.starts_with('#') {
+        return Visibility::Private;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "accessibility_modifier" {
+            match node_text(child, bytes).trim() {
+                "private" => return Visibility::Private,
+                "protected" => return Visibility::Protected,
+                "public" => return Visibility::Public,
+                _ => {}
+            }
+        }
+    }
+    let decl_header = extract_decl_header(node, bytes).trim_start();
+    if decl_header.starts_with("private ") {
+        Visibility::Private
+    } else if decl_header.starts_with("protected ") {
+        Visibility::Protected
+    } else if is_exported
+        || decl_header.starts_with("public ")
+        || matches!(node.kind(), "method_definition" | "method_signature")
+        || enclosing_type.is_some()
+    {
+        Visibility::Public
+    } else {
+        Visibility::Internal
+    }
 }
 
 fn extract_ts_js_function(
@@ -1971,24 +2185,16 @@ fn extract_ts_js_function(
     let is_exported = node
         .parent()
         .is_some_and(|p| p.kind() == "export_statement");
-    let full_text = node_text(node, ctx.bytes);
     let visibility =
-        if is_exported || full_text.starts_with("public ") || node.kind() == "method_signature" {
-            Visibility::Public
-        } else if full_text.starts_with("private ") || name.starts_with('#') {
-            Visibility::Private
-        } else if full_text.starts_with("protected ") {
-            Visibility::Protected
-        } else {
-            Visibility::Internal
-        };
+        extract_ts_js_method_visibility(node, &name, is_exported, enclosing_type, ctx.bytes);
+    let decl_header = extract_decl_header(node, ctx.bytes);
 
     let kind = classify_symbol_kind(
         &name,
         enclosing_type,
         false,
-        ctx.scanned.arch_layer,
-        full_text,
+        ctx.current_layer(),
+        decl_header,
         ctx.blueprint,
     );
 
@@ -2011,8 +2217,8 @@ fn extract_ts_js_function(
         signature,
         doc_summary,
         enclosing_type: enclosing_type.map(ToOwned::to_owned),
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
     })
 }
@@ -2047,13 +2253,13 @@ fn extract_ts_js_arrow_or_const(
         } else {
             Visibility::Internal
         };
-        let full_text = node_text(outer_decl, ctx.bytes);
+        let decl_header = extract_decl_header(outer_decl, ctx.bytes);
         let kind = classify_symbol_kind(
             &name,
             enclosing_type,
             false,
-            ctx.scanned.arch_layer,
-            full_text,
+            ctx.current_layer(),
+            decl_header,
             ctx.blueprint,
         );
         let qualified_name = match enclosing_type {
@@ -2075,8 +2281,8 @@ fn extract_ts_js_arrow_or_const(
             signature,
             doc_summary,
             enclosing_type: enclosing_type.map(ToOwned::to_owned),
-            scope: ctx.scanned.scope,
-            arch_layer: ctx.scanned.arch_layer,
+            scope: ctx.current_scope(),
+            arch_layer: ctx.current_layer(),
             section_id: ctx.section_id.to_string(),
         });
     }
@@ -2093,13 +2299,13 @@ fn extract_ts_js_arrow_or_const(
             let start_line = outer_decl.start_position().row + 1;
             let end_line = node.end_position().row + 1;
             let doc_summary = extract_preceding_doc(ctx.lines, start_line);
-            let full_text = node_text(outer_decl, ctx.bytes);
+            let decl_header = extract_decl_header(outer_decl, ctx.bytes);
             let kind = classify_symbol_kind(
                 &name,
                 enclosing_type,
                 false,
-                ctx.scanned.arch_layer,
-                full_text,
+                ctx.current_layer(),
+                decl_header,
                 ctx.blueprint,
             );
             let qualified_name = match enclosing_type {
@@ -2118,14 +2324,6 @@ fn extract_ts_js_arrow_or_const(
                     receiver_or_qualifier: None,
                     call_line: start_line,
                 });
-                ctx.raw_xrefs.push(RawXrefSite {
-                    file: ctx.scanned.rel_path.clone(),
-                    line: start_line,
-                    enclosing_symbol: Some(name.clone()),
-                    target_name: target_ident.to_string(),
-                    category: "call".to_string(),
-                    context: truncate_str(&normalize_whitespace(full_text), 120),
-                });
             }
 
             return Some(ExtractedSymbol {
@@ -2140,8 +2338,8 @@ fn extract_ts_js_arrow_or_const(
                 signature,
                 doc_summary,
                 enclosing_type: enclosing_type.map(ToOwned::to_owned),
-                scope: ctx.scanned.scope,
-                arch_layer: ctx.scanned.arch_layer,
+                scope: ctx.current_scope(),
+                arch_layer: ctx.current_layer(),
                 section_id: ctx.section_id.to_string(),
             });
         }
@@ -2152,7 +2350,7 @@ fn extract_ts_js_arrow_or_const(
         .trim_start()
         .starts_with("const ");
     if is_screaming_snake_case(&name) || (is_exported && is_const_decl) {
-        let raw_val = normalize_whitespace(node_text(val_node, ctx.bytes));
+        let raw_val = summarize_const_value_node(val_node, ctx.bytes);
         let (mut kind, hex_addr, mut description) =
             classify_macro_value_with_blueprint(&name, &raw_val, false, ctx.blueprint);
         if kind == MacroKind::ObjectMacro {
@@ -2171,8 +2369,8 @@ fn extract_ts_js_arrow_or_const(
             hex_addr,
             file: ctx.scanned.rel_path.clone(),
             line,
-            scope: ctx.scanned.scope,
-            arch_layer: ctx.scanned.arch_layer,
+            scope: ctx.current_scope(),
+            arch_layer: ctx.current_layer(),
             section_id: ctx.section_id.to_string(),
             description,
         });
@@ -2230,8 +2428,8 @@ fn extract_ts_js_type(
         end_line,
         fields_summary,
         doc_summary,
-        scope: ctx.scanned.scope,
-        arch_layer: ctx.scanned.arch_layer,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
         section_id: ctx.section_id.to_string(),
     });
 
@@ -2250,9 +2448,6 @@ fn summarize_ts_js_type_fields(node: Node<'_>, bytes: &[u8]) -> String {
     let mut items = Vec::new();
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
-        if items.len() >= 6 {
-            break;
-        }
         match child.kind() {
             "property_signature" | "public_field_definition" | "field_definition" => {
                 let prop = normalize_whitespace(node_text(child, bytes))
@@ -2277,7 +2472,7 @@ fn summarize_ts_js_type_fields(node: Node<'_>, bytes: &[u8]) -> String {
             _ => {}
         }
     }
-    items.join(", ")
+    format_type_summary_items(items)
 }
 
 fn extract_ts_js_import(
@@ -2357,6 +2552,151 @@ fn collect_ts_import_identifiers(node: Node<'_>, bytes: &[u8], out: &mut Vec<Str
 // Shared Call-Site & Symbol Classification Helpers
 // ============================================================================
 
+const RUST_STD_MACROS: &[&str] = &[
+    "format",
+    "println",
+    "eprintln",
+    "print",
+    "eprint",
+    "write",
+    "writeln",
+    "vec",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "panic",
+    "todo",
+    "unimplemented",
+    "unreachable",
+    "matches",
+    "cfg",
+    "env",
+    "option_env",
+    "include_str",
+    "include_bytes",
+    "concat",
+    "stringify",
+    "thread_local",
+    "bail",
+    "anyhow",
+];
+
+fn extract_rust_macro_invocation_calls(
+    ctx: &mut ExtractContext<'_>,
+    node: Node<'_>,
+    enclosing_fn: Option<(&str, usize)>,
+) {
+    if let Some(macro_node) = node
+        .child_by_field_name("macro")
+        .or_else(|| node.named_child(0))
+    {
+        let raw_callee = normalize_whitespace(node_text(macro_node, ctx.bytes));
+        if let Some((callee_name, mut receiver_or_qualifier)) = parse_callee_expression(&raw_callee)
+        {
+            if !RUST_STD_MACROS.contains(&callee_name.as_str()) {
+                if let Some(ref qual) = receiver_or_qualifier {
+                    if let Some(resolved_ty) =
+                        resolve_local_receiver_type(qual, &ctx.local_var_types)
+                    {
+                        receiver_or_qualifier = Some(resolved_ty);
+                    }
+                }
+                let (caller_name, caller_start_line) = match enclosing_fn {
+                    Some((name, start)) => (name.to_string(), start),
+                    None => ("<module_init>".to_string(), 1),
+                };
+                let call_line = node.start_position().row + 1;
+                ctx.raw_calls.push(RawCallSite {
+                    caller_file: ctx.scanned.rel_path.clone(),
+                    caller_name,
+                    caller_start_line,
+                    callee_name,
+                    receiver_or_qualifier,
+                    call_line,
+                });
+            }
+        }
+    }
+
+    // Scan the macro's `token_tree` arguments for nested function calls (e.g. `format!("{}", escape_table(x))`)
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "token_tree" {
+            extract_calls_from_rust_token_tree(ctx, child, enclosing_fn);
+        }
+    }
+}
+
+fn extract_calls_from_rust_token_tree(
+    ctx: &mut ExtractContext<'_>,
+    tt_node: Node<'_>,
+    enclosing_fn: Option<(&str, usize)>,
+) {
+    let mut cursor = tt_node.walk();
+    let children: Vec<Node<'_>> = tt_node.children(&mut cursor).collect();
+
+    for i in 0..children.len() {
+        let cur = children[i];
+        if cur.kind() == "token_tree" {
+            let cur_txt = node_text(cur, ctx.bytes).trim();
+            if cur_txt.starts_with('(') && i > 0 {
+                let prev = children[i - 1];
+                if prev.kind() == "identifier" {
+                    let callee_leaf = node_text(prev, ctx.bytes).trim();
+                    if is_valid_identifier(callee_leaf)
+                        && !matches!(
+                            callee_leaf,
+                            "if" | "else"
+                                | "match"
+                                | "while"
+                                | "for"
+                                | "loop"
+                                | "return"
+                                | "Some"
+                                | "Ok"
+                                | "Err"
+                        )
+                    {
+                        // Reconstruct optional `Type::` or `recv.` qualifier preceding `prev`
+                        let mut qualifier: Option<String> = None;
+                        if i >= 3 {
+                            let sep = node_text(children[i - 2], ctx.bytes).trim();
+                            let before_sep = node_text(children[i - 3], ctx.bytes).trim();
+                            if (sep == "::" || sep == ".") && is_valid_identifier(before_sep) {
+                                qualifier = Some(before_sep.to_string());
+                            }
+                        }
+                        if let Some(ref qual) = qualifier {
+                            if let Some(resolved_ty) =
+                                resolve_local_receiver_type(qual, &ctx.local_var_types)
+                            {
+                                qualifier = Some(resolved_ty);
+                            }
+                        }
+                        let (caller_name, caller_start_line) = match enclosing_fn {
+                            Some((name, start)) => (name.to_string(), start),
+                            None => ("<module_init>".to_string(), 1),
+                        };
+                        let call_line = prev.start_position().row + 1;
+                        ctx.raw_calls.push(RawCallSite {
+                            caller_file: ctx.scanned.rel_path.clone(),
+                            caller_name,
+                            caller_start_line,
+                            callee_name: callee_leaf.to_string(),
+                            receiver_or_qualifier: qualifier,
+                            call_line,
+                        });
+                    }
+                }
+            }
+            extract_calls_from_rust_token_tree(ctx, cur, enclosing_fn);
+        }
+    }
+}
+
 fn extract_call_site(
     ctx: &mut ExtractContext<'_>,
     node: Node<'_>,
@@ -2394,28 +2734,14 @@ fn extract_call_site(
     };
 
     let call_line = node.start_position().row + 1;
-    let context_line = ctx
-        .lines
-        .get(call_line.saturating_sub(1))
-        .map(|l| l.trim().to_string())
-        .unwrap_or_else(|| truncate_str(&normalize_whitespace(node_text(node, ctx.bytes)), 120));
 
     ctx.raw_calls.push(RawCallSite {
         caller_file: ctx.scanned.rel_path.clone(),
-        caller_name: caller_name.clone(),
+        caller_name,
         caller_start_line,
-        callee_name: callee_name.clone(),
+        callee_name,
         receiver_or_qualifier,
         call_line,
-    });
-
-    ctx.raw_xrefs.push(RawXrefSite {
-        file: ctx.scanned.rel_path.clone(),
-        line: call_line,
-        enclosing_symbol: Some(caller_name),
-        target_name: callee_name,
-        category: "call".to_string(),
-        context: truncate_str(&context_line, 120),
     });
 }
 
@@ -2459,7 +2785,7 @@ fn classify_symbol_kind(
     enclosing_type: Option<&str>,
     has_isr_attr: bool,
     arch_layer: ArchLayer,
-    full_text: &str,
+    decl_header: &str,
     blueprint: Option<&RepoBlueprint>,
 ) -> SymbolKind {
     // 0. Blueprint overrides for entrypoints and ISR patterns
@@ -2472,7 +2798,7 @@ fn classify_symbol_kind(
                 && (name == pat
                     || name.ends_with(pat.as_str())
                     || name.starts_with(pat.as_str())
-                    || full_text.contains(pat.as_str()))
+                    || decl_header.contains(pat.as_str()))
         }) {
             return SymbolKind::Isr;
         }
@@ -2486,15 +2812,15 @@ fn classify_symbol_kind(
         return SymbolKind::Entrypoint;
     }
 
-    // 2. ISR handlers
+    // 2. ISR handlers (checked strictly against `decl_header` and `has_isr_attr`, never the function body)
     if has_isr_attr
         || name.ends_with("_IRQHandler")
         || name.ends_with("_Handler")
         || name.starts_with("ISR(")
         || name.starts_with("SIGNAL(")
         || name.starts_with("__vector_")
-        || full_text.contains("__irq")
-        || full_text.contains("interrupt") && full_text.contains("#[")
+        || decl_header.contains("__irq")
+        || (decl_header.contains("interrupt") && decl_header.contains("#["))
     {
         return SymbolKind::Isr;
     }
@@ -2518,8 +2844,8 @@ fn classify_symbol_kind(
         && (name.starts_with("cmd_")
             || name.starts_with("handle_")
             || is_http_method_handler(name)
-            || full_text.contains("@app.")
-            || full_text.contains("@router."))
+            || decl_header.contains("@app.")
+            || decl_header.contains("@router."))
     {
         return SymbolKind::Entrypoint;
     }
@@ -3516,10 +3842,12 @@ fn has_preceding_interrupt_attr(lines: &[&str], start_line: usize) -> bool {
     for idx in start_idx..end_idx {
         if let Some(line) = lines.get(idx) {
             let t = line.trim();
-            if t.contains("#[interrupt")
-                || t.contains("#[exception")
+            if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+                continue;
+            }
+            if (t.starts_with("#[") && (t.contains("interrupt") || t.contains("exception")))
                 || t.contains("__interrupt")
-                || t.contains("interrupt") && t.contains("__attribute__")
+                || (t.contains("interrupt") && t.contains("__attribute__"))
             {
                 return true;
             }
@@ -3900,26 +4228,13 @@ fn extract_sfc_component_and_template(ctx: &mut ExtractContext<'_>, source: &str
             }
             let raw_tag = &source[start..end];
             if let Some((callee_name, receiver_or_qualifier)) = parse_callee_expression(raw_tag) {
-                let context_line = ctx
-                    .lines
-                    .get(line_num.saturating_sub(1))
-                    .map(|l| l.trim().to_string())
-                    .unwrap_or_default();
                 ctx.raw_calls.push(RawCallSite {
                     caller_file: ctx.scanned.rel_path.clone(),
                     caller_name: comp_name.clone(),
                     caller_start_line: 1,
-                    callee_name: callee_name.clone(),
+                    callee_name,
                     receiver_or_qualifier,
                     call_line: line_num,
-                });
-                ctx.raw_xrefs.push(RawXrefSite {
-                    file: ctx.scanned.rel_path.clone(),
-                    line: line_num,
-                    enclosing_symbol: Some(comp_name.clone()),
-                    target_name: callee_name,
-                    category: "call".to_string(),
-                    context: truncate_str(&context_line, 120),
                 });
             }
             i = end;
@@ -3946,11 +4261,6 @@ fn extract_sfc_component_and_template(ctx: &mut ExtractContext<'_>, source: &str
                         .iter()
                         .any(|imp| imp.imported_names.iter().any(|n| n == ident));
                 if is_known_target {
-                    let context_line = ctx
-                        .lines
-                        .get(line_num.saturating_sub(1))
-                        .map(|l| l.trim().to_string())
-                        .unwrap_or_default();
                     ctx.raw_calls.push(RawCallSite {
                         caller_file: ctx.scanned.rel_path.clone(),
                         caller_name: comp_name.clone(),
@@ -3958,14 +4268,6 @@ fn extract_sfc_component_and_template(ctx: &mut ExtractContext<'_>, source: &str
                         callee_name: ident.to_string(),
                         receiver_or_qualifier: None,
                         call_line: line_num,
-                    });
-                    ctx.raw_xrefs.push(RawXrefSite {
-                        file: ctx.scanned.rel_path.clone(),
-                        line: line_num,
-                        enclosing_symbol: Some(comp_name.clone()),
-                        target_name: ident.to_string(),
-                        category: "call".to_string(),
-                        context: truncate_str(&context_line, 120),
                     });
                 }
             }
@@ -4233,8 +4535,14 @@ export const formatPacket = (pkt: Packet): string => {
             );
         }
 
-        // Verify that `enum { STATIC = 0, CONST = 1 };` inside braces is NEVER corrupted.
+        // Verify that `enum { STATIC = 0, CONST = 1 };` inside braces is NEVER corrupted,
+        // and that storage/qualifier macros normalize cleanly without CST errors.
         let src = r#"
+#include <stdint.h>
+
+#define STATIC static
+#define VENDOR_FAST __STATIC_INLINE
+
 enum Mode {
     STATIC = 0,
     CONST = 1,
@@ -4242,12 +4550,53 @@ enum Mode {
 };
 
 TI_WEAK void board_hook(void) {}
+
+STATIC void helper_reset(void) {
+    uint32_t tmp = 0;
+    STATIC_guard(&tmp);
+}
+
+__STATIC_INLINE void fast_op(void) {
+    do_fast();
+}
+
+__STATIC_FORCEINLINE void forced_op(void) {
+    do_forced();
+}
+
+const void *CONST_PTR;
+
+static void plain_static(void) {}
+
+void public_entry(void) {
+    static uint32_t call_count = 0;
+    (void)call_count;
+}
 "#;
-        let scanned = dummy_scanned("fw/drvs/enum_safe.c", LanguageKind::C);
+        let scanned = dummy_scanned("fw/drvs/qualifier_macros.c", LanguageKind::C);
         let unit = parse_source_str(&scanned, src).expect("parse C file");
-        assert_eq!(unit.parse_errors, 0);
+        assert_eq!(
+            unit.parse_errors, 0,
+            "qualifier macros must not produce Tree-sitter errors"
+        );
         assert!(unit.types.iter().any(|t| t.name == "Mode"));
         assert!(unit.symbols.iter().any(|s| s.name == "board_hook"));
+
+        let vis = |name: &str| {
+            unit.symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing symbol {name}"))
+                .visibility
+        };
+        assert_eq!(vis("helper_reset"), Visibility::Static);
+        assert_eq!(vis("fast_op"), Visibility::Static);
+        assert_eq!(vis("forced_op"), Visibility::Static);
+        assert_eq!(vis("plain_static"), Visibility::Static);
+        assert_eq!(vis("public_entry"), Visibility::Public);
+
+        assert!(unit.macros.iter().any(|m| m.name == "STATIC"));
+        assert!(unit.macros.iter().any(|m| m.name == "VENDOR_FAST"));
     }
 
     #[test]
@@ -4295,66 +4644,130 @@ const { title } = Astro.props;
     }
 
     #[test]
-    fn test_c_qualifier_macros_normalized_for_parsing_and_visibility() {
-        let src = r#"
-#include <stdint.h>
+    fn test_cpp_class_methods_excluded_from_fields_and_rust_test_scope() {
+        let cpp_src = r#"
+class MotorController {
+public:
+    MotorController();
+    void setSpeed(int rpm);
+    int getSpeed() const;
+private:
+    int current_rpm_;
+    bool enabled_;
+};
+"#;
+        let cpp_scanned = dummy_scanned("src/drvs/motor.hpp", LanguageKind::Cpp);
+        let cpp_unit = parse_source_str(&cpp_scanned, cpp_src).expect("parse C++ header");
+        let cls = cpp_unit
+            .types
+            .iter()
+            .find(|t| t.name == "MotorController")
+            .expect("MotorController class");
+        assert!(cls.fields_summary.contains("current_rpm_: int"));
+        assert!(cls.fields_summary.contains("enabled_: bool"));
+        assert!(!cls.fields_summary.contains("setSpeed"));
+        assert!(!cls.fields_summary.contains("getSpeed"));
 
-#define STATIC static
-#define VENDOR_FAST __STATIC_INLINE
+        let rs_src = r##"
+use crate::model::{SymbolKind, Visibility};
 
-STATIC void helper_reset(void) {
-    uint32_t tmp = 0;
-    STATIC_guard(&tmp);
+#[allow(clippy::too_many_arguments)]
+pub fn check_isr_header(sig: &str) -> String {
+    let _ = "__attribute__((interrupt)) #[interrupt]";
+    format!("sig={}", helper_escape(sig))
 }
 
-__STATIC_INLINE void fast_op(void) {
-    do_fast();
+fn helper_escape(s: &str) -> &str {
+    s
 }
 
-__STATIC_FORCEINLINE void forced_op(void) {
-    do_forced();
+#[cfg(test)]
+mod tests {
+    const SAMPLE_RAW: &str = r#"
+         TIM1->CCR1 = 0x40010000;
+    "#;
+
+    #[test]
+    fn test_sample() {
+        let _ = SAMPLE_RAW;
+    }
 }
+"##;
+        let rs_scanned = dummy_scanned("crates/chipsrc-core/src/parser.rs", LanguageKind::Rust);
+        let rs_unit = parse_source_str(&rs_scanned, rs_src).expect("parse Rust");
+        let check_fn = rs_unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "check_isr_header")
+            .expect("check_isr_header");
+        assert_eq!(check_fn.visibility, Visibility::Public);
+        assert_eq!(
+            check_fn.kind,
+            SymbolKind::Function,
+            "string literals inside body must not trigger SymbolKind::Isr"
+        );
+        assert!(
+            rs_unit
+                .raw_calls
+                .iter()
+                .any(|c| c.caller_name == "check_isr_header" && c.callee_name == "helper_escape"),
+            "calls nested inside format! macro must be extracted"
+        );
+        let test_fn = rs_unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "test_sample")
+            .expect("test_sample");
+        assert_eq!(test_fn.scope, FileScope::Test);
+        assert!(
+            !rs_unit.macros.iter().any(|m| m.name == "SAMPLE_RAW"),
+            "const items inside #[cfg(test)] must not pollute macros"
+        );
+        let imp = &rs_unit.imports[0];
+        assert_eq!(imp.raw_path, "crate::model");
+    }
 
-const void *CONST_PTR;
+    #[test]
+    fn test_python_async_def_and_ts_method_visibility() {
+        let py_src = r#"
+class AsyncService:
+    async def fetch_items(self) -> list:
+        return []
 
-static void plain_static(void) {}
+async def run_pipeline() -> None:
+    pass
+"#;
+        let py_scanned = dummy_scanned("services/pipeline.py", LanguageKind::Python);
+        let py_unit = parse_source_str(&py_scanned, py_src).expect("parse Python");
+        assert!(py_unit
+            .symbols
+            .iter()
+            .any(|s| s.name == "fetch_items" && s.kind == SymbolKind::Method));
+        assert!(py_unit
+            .symbols
+            .iter()
+            .any(|s| s.name == "run_pipeline" && s.kind == SymbolKind::Function));
 
-void public_entry(void) {
-    static uint32_t call_count = 0;
-    (void)call_count;
+        let ts_src = r#"
+export class ApiClient {
+    fetchData(): void {}
+    private secretHelper(): void {}
 }
 "#;
-        let scanned = dummy_scanned("fw/drvs/qualifier_macros.c", LanguageKind::C);
-        let unit = parse_source_str(&scanned, src).expect("parse C file");
-
-        // Uppercase storage/qualifier macros must no longer produce CST error nodes.
-        assert_eq!(
-            unit.parse_errors, 0,
-            "qualifier macros must not produce Tree-sitter errors"
-        );
-
-        let vis = |name: &str| {
-            unit.symbols
-                .iter()
-                .find(|s| s.name == name)
-                .unwrap_or_else(|| panic!("missing symbol {name}"))
-                .visibility
-        };
-        assert_eq!(vis("helper_reset"), Visibility::Static);
-        assert_eq!(vis("fast_op"), Visibility::Static);
-        assert_eq!(vis("forced_op"), Visibility::Static);
-        assert_eq!(vis("plain_static"), Visibility::Static);
-        // A `static` local inside the body must not leak into the function's linkage.
-        assert_eq!(vis("public_entry"), Visibility::Public);
-
-        // The `#define STATIC static` directive itself must still be extracted as a macro and
-        // must not be rewritten by the pre-normalization pass.
-        assert!(
-            unit.macros.iter().any(|m| m.name == "STATIC"),
-            "`#define STATIC static` must still be extracted: {:?}",
-            unit.macros.iter().map(|m| &m.name).collect::<Vec<_>>()
-        );
-        assert!(unit.macros.iter().any(|m| m.name == "VENDOR_FAST"));
+        let ts_scanned = dummy_scanned("src/api/client.ts", LanguageKind::TypeScript);
+        let ts_unit = parse_source_str(&ts_scanned, ts_src).expect("parse TS");
+        let fetch_m = ts_unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "fetchData")
+            .unwrap();
+        assert_eq!(fetch_m.visibility, Visibility::Public);
+        let secret_m = ts_unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "secretHelper")
+            .unwrap();
+        assert_eq!(secret_m.visibility, Visibility::Private);
     }
 
     #[test]

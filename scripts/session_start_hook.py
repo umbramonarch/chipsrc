@@ -12,66 +12,11 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 
-IGNORED_DIRS = {
-    ".git",
-    "target",
-    "node_modules",
-    "bin",
-    "output",
-    "dist",
-    "build",
-    ".claude",
-    ".factory",
-    ".venv",
-    "venv",
-}
-
-SOURCE_EXTENSIONS = {
-    ".c",
-    ".h",
-    ".cc",
-    ".cpp",
-    ".cxx",
-    ".hpp",
-    ".hh",
-    ".hxx",
-    ".inl",
-    ".rs",
-    ".py",
-    ".pyi",
-    ".ts",
-    ".mts",
-    ".cts",
-    ".tsx",
-    ".js",
-    ".mjs",
-    ".cjs",
-    ".jsx",
-}
-
-
-def find_chipsrc_binary(project_dir: Path) -> str | None:
-    env_bin = os.environ.get("CHIPSRC_BIN")
-    if env_bin and Path(env_bin).is_file():
-        return env_bin
-
-    which_bin = shutil.which("chipsrc")
-    if which_bin:
-        return which_bin
-
-    plugin_root = Path(os.environ.get("CLAUDE_PLUGIN_ROOT", project_dir)).resolve()
-    exe_names = ["chipsrc.exe", "chipsrc"] if os.name == "nt" else ["chipsrc"]
-    for base in (project_dir, plugin_root):
-        for profile in ("release", "debug"):
-            for exe in exe_names:
-                candidate = base / "target" / profile / exe
-                if candidate.is_file():
-                    return str(candidate)
-    return None
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _hook_common import IGNORED_DIRS, SOURCE_EXTENSIONS, find_chipsrc_binary  # noqa: E402
 
 
 def find_bundles(root: Path) -> list[dict]:
@@ -148,31 +93,17 @@ def refresh_existing_bundles(project_dir: Path, bundles: list[dict]) -> None:
     binary = find_chipsrc_binary(project_dir)
     if not binary or not bundles:
         return
-    output_root = project_dir / "output"
-    for b in bundles:
-        source_root = b.get("source_root") or str(project_dir)
-        vendor_mode = b.get("vendor_mode") or "active"
-        if not Path(source_root).is_dir():
-            continue
-        try:
-            subprocess.run(
-                [
-                    binary,
-                    "ensure",
-                    str(source_root),
-                    "-o",
-                    str(output_root),
-                    "--vendor-mode",
-                    str(vendor_mode),
-                ],
-                cwd=str(project_dir),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-                check=False,
-            )
-        except Exception:
-            continue
+    try:
+        subprocess.run(
+            [binary, "status", str(project_dir), "--sync"],
+            cwd=str(project_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return
 
 
 def main() -> int:

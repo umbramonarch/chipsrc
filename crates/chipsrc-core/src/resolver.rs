@@ -161,14 +161,27 @@ pub fn resolve_and_link(
                     file: raw.caller_file.as_str(),
                     section_id: &caller_section_id,
                     language: Some(unit_language),
+                    scope: unit.scanned.scope,
                     enclosing_type: caller_enclosing_type,
                 },
+                raw.callee_name.as_str(),
                 short_callee,
                 raw.receiver_or_qualifier.as_deref(),
                 &unit.imports,
                 &candidate_indices,
                 &symbols,
             );
+
+            if tier == ResolutionTier::ExternalOrMacro
+                && unit_language == LanguageKind::Rust
+                && is_noisy_rust_external_call(
+                    raw.callee_name.as_str(),
+                    short_callee,
+                    raw.receiver_or_qualifier.as_deref(),
+                )
+            {
+                continue;
+            }
 
             calls.push(ResolvedCallEdge {
                 caller_id,
@@ -236,8 +249,10 @@ pub fn resolve_and_link(
                     file: rx.file.as_str(),
                     section_id: &caller_section_id,
                     language: Some(unit_language),
+                    scope: unit.scanned.scope,
                     enclosing_type: caller_enclosing_type,
                 },
+                target_name,
                 target_name,
                 None,
                 &unit.imports,
@@ -245,7 +260,7 @@ pub fn resolve_and_link(
                 &symbols,
             );
 
-            if !tier.is_resolved() {
+            if !tier.is_high_confidence() {
                 continue;
             }
 
@@ -409,11 +424,13 @@ struct CallerSite<'a> {
     file: &'a str,
     section_id: &'a str,
     language: Option<LanguageKind>,
+    scope: FileScope,
     enclosing_type: Option<&'a str>,
 }
 
 fn resolve_callee_candidates(
     caller: CallerSite<'_>,
+    raw_callee_name: &str,
     callee_name: &str,
     receiver_or_qualifier: Option<&str>,
     imports: &[ExtractedImport],
@@ -423,6 +440,7 @@ fn resolve_callee_candidates(
     let caller_file = caller.file;
     let caller_section_id = caller.section_id;
     let caller_language = caller.language;
+    let is_static_path_call = raw_callee_name.contains("::");
     let effective_qualifier = match receiver_or_qualifier {
         Some(q) if is_self_or_class_receiver(q) => caller.enclosing_type.or(Some(q)),
         other => other,
@@ -439,21 +457,61 @@ fn resolve_callee_candidates(
         return unresolved();
     }
 
-    // Tier 1: Defined in the same file
+    // Scope compatibility helper:
+    // - Non-test code (`FirstParty` or `VendorSdk`) never resolves to `FileScope::Test` symbols
+    //   (even if defined inside a `#[cfg(test)]` block in the same source file).
+    // - `VendorSdk` code never resolves to `FirstParty` symbols via heuristics.
+    let scope_compatible = |def: &ExtractedSymbol| -> bool {
+        if caller.scope != FileScope::Test && def.scope == FileScope::Test {
+            return false;
+        }
+        if caller.scope == FileScope::VendorSdk && def.scope != FileScope::VendorSdk {
+            return false;
+        }
+        true
+    };
+
+    let ubiquitous_member = is_ubiquitous_member_name(callee_name);
+
+    // Tier 1: Defined in the same file (and scope-compatible)
     let same_file: Vec<usize> = candidate_indices
         .iter()
         .copied()
-        .filter(|&idx| symbols[idx].file == caller_file)
+        .filter(|&idx| symbols[idx].file == caller_file && scope_compatible(&symbols[idx]))
         .collect();
     if !same_file.is_empty() {
         if let Some(qual) = effective_qualifier {
+            let q_leaf = qualifier_leaf(qual);
             if let Some(&idx) = same_file.iter().find(|&&idx| {
                 symbols[idx]
                     .enclosing_type
                     .as_deref()
-                    .is_some_and(|et| et.eq_ignore_ascii_case(qual))
+                    .is_some_and(|et| et.eq_ignore_ascii_case(q_leaf))
             }) {
                 return (symbols[idx].symbol_id.clone(), ResolutionTier::SameFile);
+            }
+            // If the call has a concrete non-self qualifier (e.g. `Vec::new()` or `entry.path()`)
+            // and a same-file candidate is a method on a DIFFERENT enclosing type, filter it out.
+            if !is_self_or_class_receiver(qual) {
+                let allowed_same_file: Vec<usize> = same_file
+                    .iter()
+                    .copied()
+                    .filter(|&idx| {
+                        qualified_candidate_allowed(
+                            qual,
+                            is_static_path_call,
+                            ubiquitous_member,
+                            &symbols[idx],
+                        )
+                    })
+                    .collect();
+                if let Some(&first_idx) = allowed_same_file.first() {
+                    return (
+                        symbols[first_idx].symbol_id.clone(),
+                        ResolutionTier::SameFile,
+                    );
+                }
+                return unresolved();
             }
         }
         return (
@@ -495,18 +553,28 @@ fn resolve_callee_candidates(
     // Tier 2: Caller file's imports reference the defining file's stem/module or explicitly import callee_name
     let mut import_matches: Vec<(usize, usize)> = Vec::new();
     let non_self_qualifier = receiver_or_qualifier.filter(|q| !is_self_or_class_receiver(q));
-    let ubiquitous_member = is_ubiquitous_member_name(callee_name);
     for &idx in candidate_indices {
         let def = &symbols[idx];
+        if !scope_compatible(def) {
+            continue;
+        }
         if let Some(qual) = non_self_qualifier {
             let qual_is_imported_ns = imports.iter().any(|imp| {
                 imp.imported_names
                     .iter()
                     .any(|n| n.eq_ignore_ascii_case(qual))
             });
-            if !qual_is_imported_ns && !qualified_candidate_allowed(qual, ubiquitous_member, def) {
+            if !(qual_is_imported_ns && def.enclosing_type.is_none())
+                && !qualified_candidate_allowed(qual, is_static_path_call, ubiquitous_member, def)
+            {
                 continue;
             }
+        } else if def.enclosing_type.is_some()
+            && caller.enclosing_type != def.enclosing_type.as_deref()
+            && !explicitly_imported
+        {
+            // Unqualified call cannot invoke a method of an unrelated type across files.
+            continue;
         }
         if let Some(score) =
             match_import_for_candidate(caller_file, callee_name, &def.file, imports)
@@ -529,10 +597,15 @@ fn resolve_callee_candidates(
         );
     }
 
-    // `obj.method()` / `value.method()` receivers may only bind to methods of a matching type or
+    // `obj.method()` / `Type::method()` receivers may only bind to methods of a matching type or
     // to symbols living in a module named by the qualifier. Ubiquitous container/IO/lifecycle
-    // member names are never guessed blindly.
-    let mut eligible: Vec<usize> = candidate_indices.to_vec();
+    // member names and mismatched explicit type qualifiers are never guessed blindly.
+    let mut eligible: Vec<usize> = candidate_indices
+        .iter()
+        .copied()
+        .filter(|&idx| scope_compatible(&symbols[idx]))
+        .collect();
+
     if let Some(qual) = receiver_or_qualifier {
         if is_self_or_class_receiver(qual) {
             if let Some(caller_ty) = caller.enclosing_type {
@@ -548,16 +621,38 @@ fn resolve_callee_candidates(
                     .collect();
                 if !matching_type.is_empty() {
                     eligible = matching_type;
+                } else if ubiquitous_member {
+                    return unresolved();
                 }
-            }
-        } else {
-            let ubiquitous_member = is_ubiquitous_member_name(callee_name);
-            eligible
-                .retain(|&idx| qualified_candidate_allowed(qual, ubiquitous_member, &symbols[idx]));
-            if eligible.is_empty() {
+            } else if ubiquitous_member {
                 return unresolved();
             }
+        } else {
+            eligible.retain(|&idx| {
+                qualified_candidate_allowed(
+                    qual,
+                    is_static_path_call,
+                    ubiquitous_member,
+                    &symbols[idx],
+                )
+            });
         }
+    } else {
+        // Unqualified call (`foo()`): exclude methods (`enclosing_type.is_some()`) unless the caller
+        // is in the same `enclosing_type`.
+        eligible.retain(|&idx| {
+            let def = &symbols[idx];
+            match def.enclosing_type.as_deref() {
+                None => true,
+                Some(et) => caller
+                    .enclosing_type
+                    .is_some_and(|ct| ct.eq_ignore_ascii_case(et)),
+            }
+        });
+    }
+
+    if eligible.is_empty() {
+        return unresolved();
     }
 
     // Tier 3: Exactly 1 definition across the entire repository
@@ -678,20 +773,63 @@ const JS_BUILTINS: &[&str] = &[
     "prompt",
 ];
 
-/// Ubiquitous container / IO / lifecycle member names. When such a name is invoked on an arbitrary
-/// variable receiver (`session.commit()`, `data.get()`, `thread.start()`) it is almost always a
-/// standard-library or third-party object method, never a repository function.
+/// Ubiquitous container / IO / lifecycle / conversion member names. When such a name is invoked
+/// on an arbitrary variable receiver (`session.commit()`, `data.get()`, `s.as_str()`, `Vec::new()`)
+/// it is almost always a standard-library or third-party method, never an unrelated repository method.
 const UBIQUITOUS_MEMBER_NAMES: &[&str] = &[
+    "new",
+    "default",
+    "from",
+    "into",
+    "try_from",
+    "try_into",
+    "as_str",
+    "as_bytes",
+    "as_ref",
+    "as_mut",
+    "as_deref",
+    "as_path",
+    "as_slice",
+    "to_str",
+    "to_string",
+    "to_owned",
+    "to_path_buf",
+    "to_vec",
+    "to_lowercase",
+    "to_uppercase",
+    "to_ascii_lowercase",
+    "to_ascii_uppercase",
+    "eq_ignore_ascii_case",
+    "parse",
+    "fmt",
+    "len",
+    "is_empty",
     "get",
+    "get_mut",
     "set",
     "add",
     "pop",
     "remove",
     "clear",
+    "truncate",
+    "retain",
+    "dedup",
+    "dedup_by",
+    "sort",
+    "sort_by",
+    "sort_by_key",
+    "sort_unstable",
+    "reverse",
     "update",
     "append",
     "extend",
     "insert",
+    "entry",
+    "or_insert",
+    "or_insert_with",
+    "or_default",
+    "with_capacity",
+    "reserve",
     "keys",
     "values",
     "items",
@@ -706,17 +844,34 @@ const UBIQUITOUS_MEMBER_NAMES: &[&str] = &[
     "start",
     "stop",
     "run",
+    "init",
+    "reset",
+    "deinit",
+    "build",
     "join",
     "sleep",
     "wait",
     "notify",
     "acquire",
     "release",
+    "lock",
     "split",
+    "rsplit",
+    "split_once",
+    "rsplit_once",
     "strip",
     "lstrip",
     "rstrip",
+    "trim",
+    "trim_start",
+    "trim_end",
+    "trim_matches",
+    "trim_start_matches",
+    "trim_end_matches",
+    "strip_prefix",
+    "strip_suffix",
     "replace",
+    "repeat",
     "format",
     "encode",
     "decode",
@@ -724,22 +879,80 @@ const UBIQUITOUS_MEMBER_NAMES: &[&str] = &[
     "upper",
     "startswith",
     "endswith",
+    "starts_with",
+    "ends_with",
+    "contains",
     "find",
+    "rfind",
+    "position",
+    "rposition",
     "index",
     "count",
     "copy",
     "clone",
+    "copied",
+    "cloned",
     "iter",
     "into_iter",
+    "iter_mut",
+    "chars",
+    "bytes",
+    "lines",
+    "map",
+    "filter",
+    "filter_map",
+    "flat_map",
+    "find_map",
+    "flatten",
+    "fold",
+    "all",
+    "any",
+    "take",
+    "skip",
+    "take_while",
+    "skip_while",
+    "chain",
+    "zip",
+    "enumerate",
     "collect",
     "unwrap",
+    "unwrap_or",
+    "unwrap_or_default",
+    "unwrap_or_else",
     "expect",
     "ok",
     "err",
+    "some",
+    "none",
+    "is_some",
+    "is_none",
+    "is_ok",
+    "is_err",
+    "is_some_and",
+    "is_ok_and",
+    "map_or",
+    "map_or_else",
     "map_err",
     "and_then",
     "or_else",
+    "ok_or",
+    "ok_or_else",
+    "transpose",
+    "first",
+    "last",
+    "min",
+    "max",
+    "clamp",
+    "cmp",
+    "partial_cmp",
+    "total_cmp",
+    "min_by",
+    "max_by",
+    "min_by_key",
+    "max_by_key",
+    "then_with",
     "push",
+    "push_str",
     "slice",
     "splice",
     "forEach",
@@ -965,6 +1178,94 @@ fn is_ubiquitous_member_name(name: &str) -> bool {
     UBIQUITOUS_MEMBER_NAMES.contains(&name)
 }
 
+/// Returns `true` when an unresolved (`ExternalOrMacro`) call in a Rust file is a ubiquitous
+/// standard-library method/constructor/iterator/option operation (`clone`, `to_string`, `as_str`,
+/// `unwrap`, `iter`, `map`, `collect`, `Vec::new`, `String::new`, etc.) that adds noise without
+/// architectural signal.
+fn is_noisy_rust_external_call(
+    raw_callee_name: &str,
+    short_callee: &str,
+    receiver_or_qualifier: Option<&str>,
+) -> bool {
+    if is_ubiquitous_member_name(short_callee) {
+        return true;
+    }
+    if matches!(
+        short_callee,
+        "saturating_sub"
+            | "saturating_add"
+            | "div_ceil"
+            | "is_ascii_alphanumeric"
+            | "is_ascii_alphabetic"
+            | "is_ascii_digit"
+            | "is_ascii_uppercase"
+            | "is_ascii_lowercase"
+            | "is_ascii_hexdigit"
+            | "is_alphanumeric"
+            | "is_whitespace"
+            | "char_indices"
+            | "len_utf8"
+            | "from_utf8"
+            | "from_utf8_lossy"
+            | "lossy"
+            | "to_string_lossy"
+            | "as_os_str"
+            | "file_name"
+            | "file_stem"
+            | "extension"
+            | "parent"
+            | "join"
+            | "exists"
+            | "is_dir"
+            | "is_file"
+            | "components"
+            | "display"
+            | "duration_since"
+            | "as_secs"
+            | "as_millis"
+            | "as_nanos"
+            | "elapsed"
+            | "now"
+    ) {
+        return true;
+    }
+    if let Some(qual) = receiver_or_qualifier {
+        let q_leaf = qualifier_leaf(qual);
+        if matches!(
+            q_leaf,
+            "String"
+                | "Vec"
+                | "Option"
+                | "Result"
+                | "Box"
+                | "Arc"
+                | "Rc"
+                | "Path"
+                | "PathBuf"
+                | "BTreeMap"
+                | "BTreeSet"
+                | "HashMap"
+                | "HashSet"
+                | "FxHashMap"
+                | "FxHashSet"
+                | "OnceLock"
+                | "Mutex"
+                | "RwLock"
+                | "Instant"
+                | "SystemTime"
+                | "mem"
+                | "str"
+                | "fs"
+                | "env"
+                | "io"
+                | "fmt"
+        ) {
+            return true;
+        }
+    }
+    raw_callee_name.starts_with("std::") || raw_callee_name.starts_with("core::")
+}
+
 fn qualifier_leaf(qualifier: &str) -> &str {
     qualifier
         .trim()
@@ -1011,20 +1312,33 @@ fn module_qualifier_matches(qualifier: &str, def_file: &str) -> bool {
 
 fn qualified_candidate_allowed(
     qualifier: &str,
+    is_static_path_call: bool,
     ubiquitous_member: bool,
     sym: &ExtractedSymbol,
 ) -> bool {
+    let q_leaf = qualifier_leaf(qualifier);
     // A method of the type named by the qualifier always answers the call.
     if let Some(enclosing) = sym.enclosing_type.as_deref() {
-        if enclosing.eq_ignore_ascii_case(qualifier) {
+        if enclosing.eq_ignore_ascii_case(qualifier) || enclosing.eq_ignore_ascii_case(q_leaf) {
             return true;
+        }
+        // If the call site uses an explicit `Type::func()` path or a PascalCase type/namespace
+        // qualifier (`String::new()`, `Parser::new()`, `RegexBuilder::new()`), it can NEVER bind
+        // to a method of a different `enclosing_type`.
+        let q_starts_upper = q_leaf
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_uppercase());
+        if is_static_path_call || q_starts_upper || sym.kind == SymbolKind::Constructor {
+            return false;
         }
         // Ubiquitous container/IO/lifecycle methods of unrelated types are never guessed.
         return !ubiquitous_member;
     }
 
     if matches!(sym.kind, SymbolKind::Function | SymbolKind::Entrypoint) {
-        // A standalone function only answers `qualifier.name()` when the qualifier names its module.
+        // A standalone function only answers `qualifier.name()` or `qualifier::name()` when the
+        // qualifier names its module.
         return module_qualifier_matches(qualifier, &sym.file);
     }
 
@@ -1032,11 +1346,32 @@ fn qualified_candidate_allowed(
 }
 
 fn normalize_import_path(raw_path: &str) -> String {
-    raw_path
+    let before_brace = raw_path.split('{').next().unwrap_or(raw_path);
+    let cleaned = before_brace
         .trim()
         .trim_matches(|c| matches!(c, '"' | '\'' | '<' | '>'))
+        .trim_end_matches("::*")
+        .trim_end_matches("/*")
+        .trim_end_matches("::")
         .replace("::", "/")
-        .replace('\\', "/")
+        .replace('\\', "/");
+    strip_rust_path_prefixes(&cleaned).to_string()
+}
+
+fn strip_rust_path_prefixes(path: &str) -> &str {
+    let mut cur = path.trim_start_matches('/');
+    loop {
+        if let Some(rest) = cur.strip_prefix("crate/") {
+            cur = rest;
+        } else if let Some(rest) = cur.strip_prefix("super/") {
+            cur = rest;
+        } else if let Some(rest) = cur.strip_prefix("self/") {
+            cur = rest;
+        } else {
+            break;
+        }
+    }
+    cur
 }
 
 fn resolve_relative_import_path(caller_file: &str, raw_import: &str) -> Option<String> {
@@ -1076,7 +1411,10 @@ fn import_references_file(caller_file: &str, import_path: &str, def_file: &str) 
     }
     if let Some(resolved_rel) = resolve_relative_import_path(caller_file, import_path) {
         if !resolved_rel.is_empty()
-            && (def == resolved_rel || def == format!("{resolved_rel}/index"))
+            && (def == resolved_rel
+                || def == format!("{resolved_rel}/index")
+                || def == format!("{resolved_rel}/mod")
+                || def == format!("{resolved_rel}/__init__"))
         {
             return true;
         }
@@ -1089,7 +1427,11 @@ fn import_references_file(caller_file: &str, import_path: &str, def_file: &str) 
     if raw.is_empty() {
         return false;
     }
-    def == raw || def.ends_with(&format!("/{raw}"))
+    def == raw
+        || def.ends_with(&format!("/{raw}"))
+        || def.ends_with(&format!("/{raw}/mod"))
+        || def.ends_with(&format!("/{raw}/index"))
+        || def.ends_with(&format!("/{raw}/__init__"))
 }
 
 fn import_mentions_name(imp: &ExtractedImport, qualifier: &str, leaf: &str) -> bool {
@@ -1176,12 +1518,7 @@ fn match_import_for_candidate(
                 && (def_without_ext == *rel || def_without_ext == format!("{rel}/index"))
         });
 
-        let raw_norm = imp
-            .raw_path
-            .trim()
-            .trim_matches(|c| matches!(c, '"' | '\'' | '<' | '>'))
-            .replace("::", "/")
-            .replace('\\', "/");
+        let raw_norm = normalize_import_path(&imp.raw_path);
         let imp_without_ext =
             strip_source_extension(raw_norm.trim_start_matches("../").trim_start_matches("./"));
         let imp_stem = Path::new(&imp_without_ext)
@@ -1194,7 +1531,11 @@ fn match_import_for_candidate(
         let path_matches = if rel_resolved.is_some() {
             exact_rel_match
         } else if !imp_without_ext.is_empty() && !def_without_ext.is_empty() {
-            def_without_ext.ends_with(&imp_without_ext)
+            def_without_ext == imp_without_ext
+                || def_without_ext.ends_with(&format!("/{imp_without_ext}"))
+                || def_without_ext.ends_with(&format!("/{imp_without_ext}/mod"))
+                || def_without_ext.ends_with(&format!("/{imp_without_ext}/index"))
+                || def_without_ext.ends_with(&format!("/{imp_without_ext}/__init__"))
                 || imp_without_ext.ends_with(&def_without_ext)
                 || (!imp_stem.is_empty()
                     && !def_stem.is_empty()
@@ -1823,7 +2164,15 @@ mod tests {
         let c_ext = calls.iter().find(|c| c.callee_name == "printf").unwrap();
         assert_eq!(c_ext.tier, ResolutionTier::ExternalOrMacro);
 
-        assert!(!xrefs.is_empty());
+        assert!(xrefs
+            .iter()
+            .any(|x| x.category == "mmio_access" && x.symbol == "GPIOA->MODER"));
+        assert!(xrefs
+            .iter()
+            .any(|x| x.category == "macro_def" && x.symbol == "GPIOA_MODER"));
+        assert!(xrefs
+            .iter()
+            .any(|x| x.category == "call" && x.symbol == "uart_init"));
         assert_eq!(vendor.total_vendor_files, 1);
         assert_eq!(vendor.total_vendor_symbols, 2);
         assert!(vendor
@@ -2127,5 +2476,117 @@ mod tests {
 
         let config = find_call(&calls, "adc_Config");
         assert_eq!(config.callee_id, "src/drvs/drvAdc.h::adc_Config");
+    }
+
+    #[test]
+    fn test_qualified_constructor_and_ubiquitous_method_isolation() {
+        let mut cfg_new = sample_symbol(
+            "crates/chipsrc-core/src/model.rs",
+            "new",
+            10,
+            FileScope::FirstParty,
+            ArchLayer::Domain,
+            "crates-chipsrc-core",
+        );
+        cfg_new.qualified_name = "ConvertConfig::new".to_string();
+        cfg_new.kind = SymbolKind::Constructor;
+        cfg_new.enclosing_type = Some("ConvertConfig".to_string());
+
+        let mut layer_as_str = sample_symbol(
+            "crates/chipsrc-core/src/model.rs",
+            "as_str",
+            30,
+            FileScope::FirstParty,
+            ArchLayer::Domain,
+            "crates-chipsrc-core",
+        );
+        layer_as_str.qualified_name = "ArchLayer::as_str".to_string();
+        layer_as_str.kind = SymbolKind::Method;
+        layer_as_str.enclosing_type = Some("ArchLayer".to_string());
+
+        let unit_model = sample_unit(
+            "crates/chipsrc-core/src/model.rs",
+            FileScope::FirstParty,
+            ArchLayer::Domain,
+            LanguageKind::Rust,
+            vec![cfg_new, layer_as_str],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let unit_caller = sample_unit(
+            "crates/chipsrc-core/src/parser.rs",
+            FileScope::FirstParty,
+            ArchLayer::Core,
+            LanguageKind::Rust,
+            vec![sample_symbol(
+                "crates/chipsrc-core/src/parser.rs",
+                "parse_files",
+                10,
+                FileScope::FirstParty,
+                ArchLayer::Core,
+                "crates-chipsrc-core",
+            )],
+            Vec::new(),
+            vec![
+                // Explicit ConvertConfig::new() MUST resolve
+                sample_call(
+                    "crates/chipsrc-core/src/parser.rs",
+                    "parse_files",
+                    10,
+                    "ConvertConfig::new",
+                    Some("ConvertConfig"),
+                    12,
+                ),
+                // String::new() and Parser::new() must NOT resolve to ConvertConfig::new
+                sample_call(
+                    "crates/chipsrc-core/src/parser.rs",
+                    "parse_files",
+                    10,
+                    "String::new",
+                    Some("String"),
+                    13,
+                ),
+                sample_call(
+                    "crates/chipsrc-core/src/parser.rs",
+                    "parse_files",
+                    10,
+                    "Parser::new",
+                    Some("Parser"),
+                    14,
+                ),
+                // s.as_str() on arbitrary variable must NOT resolve to ArchLayer::as_str
+                sample_call(
+                    "crates/chipsrc-core/src/parser.rs",
+                    "parse_files",
+                    10,
+                    "as_str",
+                    Some("name"),
+                    15,
+                ),
+            ],
+        );
+
+        let (_symbols, _types, _macros, calls, _xrefs, _vendor) =
+            resolve_and_link(&[unit_model, unit_caller]);
+
+        assert!(
+            calls.iter().any(|c| {
+                c.callee_name == "ConvertConfig::new"
+                    && c.callee_id == "crates/chipsrc-core/src/model.rs::new"
+                    && c.tier == ResolutionTier::UniqueGlobal
+            }),
+            "ConvertConfig::new() must resolve to ConvertConfig::new"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.callee_name != "ConvertConfig::new" && c.callee_id.ends_with("::new")),
+            "String::new / Parser::new must never bind to ConvertConfig::new: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.callee_id.ends_with("::as_str")),
+            "name.as_str() must never bind to ArchLayer::as_str: {calls:?}"
+        );
     }
 }

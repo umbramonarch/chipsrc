@@ -1,9 +1,10 @@
 use crate::error::{ChipsrcError, Result};
-use crate::mmio::normalize_hex_literal;
-use crate::model::{
-    BundleMetaFile, BundleStatusEntry, IncrementalAstCache, LanguageKind, SearchHit,
+use crate::mmio::{normalize_hex_literal, normalize_query_hex_literal};
+use crate::model::{BundleStatusEntry, LanguageKind, SearchHit, DEFAULT_MAX_FILE_BYTES};
+use crate::scanner::{
+    canonical_repo_root_and_name, check_files_changed, check_meta_files_changed, load_cache_file,
+    load_meta_file, scan_repository,
 };
-use crate::scanner::{check_files_changed, scan_repository};
 use memchr::memmem;
 use rayon::prelude::*;
 use regex::RegexBuilder;
@@ -14,23 +15,39 @@ use std::path::{Path, PathBuf};
 
 /// Resolves `target` into one or more indexed bundle directories (containing `meta.json` and `INDEX.md`).
 pub fn resolve_bundles(target: &Path) -> Result<Vec<PathBuf>> {
+    resolve_bundles_internal(target, true)
+}
+
+/// Discovers all indexed bundles under `workspace` (and `workspace/output`) without filtering
+/// to a single workspace `source_root`.
+pub fn discover_workspace_bundles(workspace: &Path) -> Result<Vec<PathBuf>> {
+    resolve_bundles_internal(workspace, false)
+}
+
+fn resolve_bundles_internal(
+    target: &Path,
+    prefer_matching_source_root: bool,
+) -> Result<Vec<PathBuf>> {
     if is_valid_bundle_dir(target) {
         return Ok(vec![target.to_path_buf()]);
     }
 
-    let output_candidate = Path::new("output").join(target);
-    if is_valid_bundle_dir(&output_candidate) {
-        return Ok(vec![output_candidate]);
+    let is_bare_single_name =
+        !target.is_absolute() && target.components().count() == 1 && target != Path::new(".");
+
+    if is_bare_single_name {
+        let output_candidate = Path::new("output").join(target);
+        if is_valid_bundle_dir(&output_candidate) {
+            return Ok(vec![output_candidate]);
+        }
     }
 
-    if let Some(stem) = target.file_name().and_then(|s| s.to_str()) {
-        let stem_candidate = Path::new("output").join(stem);
-        if is_valid_bundle_dir(&stem_candidate) {
-            return Ok(vec![stem_candidate]);
-        }
-        let nested_candidate = target.join("output").join(stem);
-        if is_valid_bundle_dir(&nested_candidate) {
-            return Ok(vec![nested_candidate]);
+    if target.is_dir() {
+        if let Some(stem) = target.file_name().and_then(|s| s.to_str()) {
+            let nested_candidate = target.join("output").join(stem);
+            if is_valid_bundle_dir(&nested_candidate) {
+                return Ok(vec![nested_candidate]);
+            }
         }
     }
 
@@ -64,6 +81,28 @@ pub fn resolve_bundles(target: &Path) -> Result<Vec<PathBuf>> {
     if bundles.is_empty() {
         return Err(ChipsrcError::BundleNotFound(target.to_path_buf()));
     }
+
+    // Issue #17: When multiple bundles exist under `output/` and `target` is a repository root
+    // (such as `.`), prefer the bundle(s) whose `metadata.source_root` matches `target` so
+    // unrelated bundles in `output/` do not bleed into default queries.
+    if prefer_matching_source_root && bundles.len() > 1 && target.is_dir() {
+        let (target_canon, _) = canonical_repo_root_and_name(target);
+        let matching: Vec<PathBuf> = bundles
+            .iter()
+            .filter(|b| {
+                load_meta_file(b).is_some_and(|m| {
+                    let (src_canon, _) =
+                        canonical_repo_root_and_name(Path::new(&m.metadata.source_root));
+                    src_canon.eq_ignore_ascii_case(&target_canon)
+                })
+            })
+            .cloned()
+            .collect();
+        if !matching.is_empty() {
+            return Ok(matching);
+        }
+    }
+
     Ok(bundles)
 }
 
@@ -95,7 +134,7 @@ pub fn resolve_target_and_query(
 
 /// Scans `workspace` (and `workspace/output`) for indexed bundles and checks live freshness against source files.
 pub fn workspace_status(workspace: &Path) -> Result<Vec<BundleStatusEntry>> {
-    let bundles = match resolve_bundles(workspace) {
+    let bundles = match discover_workspace_bundles(workspace) {
         Ok(b) => b,
         Err(ChipsrcError::BundleNotFound(_)) => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -119,10 +158,14 @@ pub fn workspace_status(workspace: &Path) -> Result<Vec<BundleStatusEntry>> {
 
         let source_path = Path::new(&meta.source_root);
         let changed_files_count = if source_path.is_dir() {
-            if let Some(cache) = load_cache_file(&bundle_dir) {
-                check_files_changed(source_path, &cache, 4 * 1024 * 1024).unwrap_or(0)
+            if let Some(count) =
+                check_meta_files_changed(source_path, &meta, DEFAULT_MAX_FILE_BYTES)
+            {
+                count
+            } else if let Some(cache) = load_cache_file(&bundle_dir) {
+                check_files_changed(source_path, &cache, DEFAULT_MAX_FILE_BYTES).unwrap_or(0)
             } else if let Ok((_, live_fp)) =
-                scan_repository(source_path, meta.vendor_mode, 4 * 1024 * 1024)
+                scan_repository(source_path, meta.vendor_mode, DEFAULT_MAX_FILE_BYTES)
             {
                 usize::from(live_fp != meta.fingerprint)
             } else {
@@ -177,6 +220,7 @@ pub fn query_symbols(
         arch_layer: String,
         scope: String,
         section_id: String,
+        doc_summary: String,
         score: u8,
     }
 
@@ -197,6 +241,7 @@ pub fn query_symbols(
             let symbol_id = cols[0];
             let name = cols[1];
             let kind = cols[2];
+            let doc_summary = cols.get(14).copied().unwrap_or("");
 
             if let Some(ref kf) = kind_lower {
                 if !kind.eq_ignore_ascii_case(kf) && !kind.to_ascii_lowercase().starts_with(kf) {
@@ -248,6 +293,7 @@ pub fn query_symbols(
                 arch_layer: cols[11].to_string(),
                 scope: cols[12].to_string(),
                 section_id: cols[13].to_string(),
+                doc_summary: doc_summary.to_string(),
                 score,
             });
         }
@@ -273,6 +319,7 @@ pub fn query_symbols(
 
     let total = hits.len();
     let mut out = String::new();
+    let mut snippet_cache = SourceSnippetCache::default();
     for h in hits.into_iter().take(limit) {
         out.push_str(&format!(
             "[{}] {} `{}` ({}) | `{}:{}-{}` | layer={} scope={} shard=`{}` | PR={:.4} in={} out={}\n  sig: `{}`\n  id : `{}`\n",
@@ -292,10 +339,13 @@ pub fn query_symbols(
             h.signature,
             h.symbol_id
         ));
+        if !h.doc_summary.is_empty() {
+            out.push_str(&format!("  doc: {}\n", h.doc_summary));
+        }
 
         if show_source {
             if let Some(snippet) =
-                read_source_snippet(&h.bundle_dir, &h.file, h.start_line, h.end_line)
+                snippet_cache.read_snippet(&h.bundle_dir, &h.file, h.start_line, h.end_line)
             {
                 out.push_str(&snippet);
             }
@@ -338,6 +388,8 @@ pub fn query_callers(
     }
 
     let mut hits = Vec::new();
+    let has_exact_sym = bundles_have_exact_symbol(bundles, q_trim, &q_lower);
+    let suffix = format!("::{q_lower}");
 
     for bundle_dir in bundles {
         let calls_tsv = bundle_dir.join("index").join("calls.tsv");
@@ -358,12 +410,12 @@ pub fn query_callers(
 
             let score = if callee_name == q_trim || callee_id == q_trim {
                 4
-            } else if callee_lower == q_lower
-                || id_lower == q_lower
-                || id_lower.ends_with(&format!("::{q_lower}"))
+            } else if callee_lower == q_lower || id_lower == q_lower || id_lower.ends_with(&suffix)
             {
                 3
-            } else if callee_lower.contains(&q_lower) || id_lower.contains(&q_lower) {
+            } else if !has_exact_sym
+                && (callee_lower.contains(&q_lower) || id_lower.contains(&q_lower))
+            {
                 2
             } else {
                 0
@@ -410,6 +462,7 @@ pub fn query_callers(
         symbol,
         hits.len()
     );
+    let mut snippet_cache = SourceSnippetCache::default();
     for h in hits.into_iter().take(limit) {
         out.push_str(&format!(
             "  [{}] `{}` (`{}`) -> `{}` (`{}`) at `{}:{}` [tier={}, shard=`{}`]\n",
@@ -427,7 +480,7 @@ pub fn query_callers(
         if show_source {
             let start = h.line.saturating_sub(2).max(1);
             let end = h.line + 4;
-            if let Some(snippet) = read_source_snippet(&h.bundle_dir, &h.file, start, end) {
+            if let Some(snippet) = snippet_cache.read_snippet(&h.bundle_dir, &h.file, start, end) {
                 out.push_str(&snippet);
             }
         }
@@ -469,6 +522,8 @@ pub fn query_callees(
     }
 
     let mut hits = Vec::new();
+    let has_exact_sym = bundles_have_exact_symbol(bundles, q_trim, &q_lower);
+    let suffix = format!("::{q_lower}");
 
     for bundle_dir in bundles {
         let calls_tsv = bundle_dir.join("index").join("calls.tsv");
@@ -489,12 +544,12 @@ pub fn query_callees(
 
             let score = if caller_name == q_trim || caller_id == q_trim {
                 4
-            } else if caller_lower == q_lower
-                || id_lower == q_lower
-                || id_lower.ends_with(&format!("::{q_lower}"))
+            } else if caller_lower == q_lower || id_lower == q_lower || id_lower.ends_with(&suffix)
             {
                 3
-            } else if caller_lower.contains(&q_lower) || id_lower.contains(&q_lower) {
+            } else if !has_exact_sym
+                && (caller_lower.contains(&q_lower) || id_lower.contains(&q_lower))
+            {
                 2
             } else {
                 0
@@ -528,9 +583,14 @@ pub fn query_callees(
         hits.retain(|h| h.score >= 3);
     }
 
+    // Issue #42.2: Sort resolved project callees (`tier != "external_or_macro"`) ahead of
+    // unresolved external/macro calls so genuine project dependencies always surface first.
     hits.sort_by(|a, b| {
+        let resolved_a = a.tier != "external_or_macro";
+        let resolved_b = b.tier != "external_or_macro";
         b.score
             .cmp(&a.score)
+            .then_with(|| resolved_b.cmp(&resolved_a))
             .then_with(|| a.file.cmp(&b.file))
             .then_with(|| a.line.cmp(&b.line))
     });
@@ -541,6 +601,7 @@ pub fn query_callees(
         symbol,
         hits.len()
     );
+    let mut snippet_cache = SourceSnippetCache::default();
     for h in hits.into_iter().take(limit) {
         out.push_str(&format!(
             "  [{}] `{}` (`{}`) -> `{}` (`{}`) at `{}:{}` [tier={}, shard=`{}`]\n",
@@ -558,7 +619,7 @@ pub fn query_callees(
         if show_source {
             let start = h.line.saturating_sub(2).max(1);
             let end = h.line + 4;
-            if let Some(snippet) = read_source_snippet(&h.bundle_dir, &h.file, start, end) {
+            if let Some(snippet) = snippet_cache.read_snippet(&h.bundle_dir, &h.file, start, end) {
                 out.push_str(&snippet);
             }
         }
@@ -599,6 +660,7 @@ pub fn query_types(
         arch_layer: String,
         scope: String,
         section_id: String,
+        doc_summary: String,
         score: u8,
     }
 
@@ -619,6 +681,7 @@ pub fn query_types(
             let type_id = cols[0];
             let name = cols[1];
             let fields = cols[7];
+            let doc_summary = cols.get(11).copied().unwrap_or("");
 
             let name_lower = name.to_ascii_lowercase();
             let id_lower = type_id.to_ascii_lowercase();
@@ -659,6 +722,7 @@ pub fn query_types(
                 arch_layer: cols[8].to_string(),
                 scope: cols[9].to_string(),
                 section_id: cols[10].to_string(),
+                doc_summary: doc_summary.to_string(),
                 score,
             });
         }
@@ -683,6 +747,7 @@ pub fn query_types(
 
     let total = hits.len();
     let mut out = String::new();
+    let mut snippet_cache = SourceSnippetCache::default();
     for h in hits.into_iter().take(limit) {
         out.push_str(&format!(
             "[{}] {} {} `{}` | `{}:{}-{}` | layer={} scope={} shard=`{}`\n  fields: {}\n  id    : `{}`\n",
@@ -703,10 +768,13 @@ pub fn query_types(
             },
             h.type_id
         ));
+        if !h.doc_summary.is_empty() {
+            out.push_str(&format!("  doc   : {}\n", h.doc_summary));
+        }
 
         if show_source {
             if let Some(snippet) =
-                read_source_snippet(&h.bundle_dir, &h.file, h.start_line, h.end_line)
+                snippet_cache.read_snippet(&h.bundle_dir, &h.file, h.start_line, h.end_line)
             {
                 out.push_str(&snippet);
             }
@@ -733,7 +801,9 @@ pub fn query_macros(
     limit: usize,
 ) -> Result<String> {
     let q_trim = query.trim();
-    let q_hex = normalize_hex_literal(q_trim);
+    let q_lower = q_trim.to_ascii_lowercase();
+    let q_hex = normalize_query_hex_literal(q_trim);
+    let is_explicit_hex = q_hex.is_some() && (q_lower.starts_with("0x") || q_lower.ends_with('h'));
 
     struct MacroHit {
         bundle_dir: PathBuf,
@@ -772,7 +842,7 @@ pub fn query_macros(
             let desc = cols[9];
 
             let row_hex = if hex_col != "-" && !hex_col.is_empty() {
-                normalize_hex_literal(hex_col)
+                normalize_query_hex_literal(hex_col).or_else(|| normalize_hex_literal(hex_col))
             } else {
                 normalize_hex_literal(val)
             };
@@ -782,22 +852,22 @@ pub fn query_macros(
                 _ => false,
             };
 
-            let id_score = score_hw_identifier_match(name, q_trim);
-            let val_score = if val
-                .to_ascii_lowercase()
-                .contains(&q_trim.to_ascii_lowercase())
-                || desc
-                    .to_ascii_lowercase()
-                    .contains(&q_trim.to_ascii_lowercase())
-            {
-                1
-            } else {
-                0
-            };
-
             let score = if hex_exact {
                 5
+            } else if is_explicit_hex {
+                // Issue #9: When the query is an explicit hex address/mask (`0xFF`, `41C00004h`),
+                // require exact numeric hex equality so `0xFF` never substring-matches `0xFFFFFFFF`.
+                0
             } else {
+                let id_score = score_hw_identifier_match(name, q_trim);
+                let val_score = if !q_lower.is_empty()
+                    && (val.to_ascii_lowercase().contains(&q_lower)
+                        || desc.to_ascii_lowercase().contains(&q_lower))
+                {
+                    1
+                } else {
+                    0
+                };
                 id_score.max(val_score)
             };
 
@@ -829,6 +899,10 @@ pub fn query_macros(
         ));
     }
 
+    if hits.iter().any(|h| h.score >= 3) {
+        hits.retain(|h| h.score >= 2);
+    }
+
     hits.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
@@ -838,6 +912,7 @@ pub fn query_macros(
 
     let total = hits.len();
     let mut out = String::new();
+    let mut snippet_cache = SourceSnippetCache::default();
     for h in hits.into_iter().take(limit) {
         let hex_info = if h.hex_addr != "-" && !h.hex_addr.is_empty() {
             format!(" [hex={}]", h.hex_addr)
@@ -862,7 +937,7 @@ pub fn query_macros(
         if show_source {
             let start = h.line.saturating_sub(2).max(1);
             let end = h.line + 4;
-            if let Some(snippet) = read_source_snippet(&h.bundle_dir, &h.file, start, end) {
+            if let Some(snippet) = snippet_cache.read_snippet(&h.bundle_dir, &h.file, start, end) {
                 out.push_str(&snippet);
             }
         }
@@ -1026,7 +1101,9 @@ pub fn query_sections(
 /// normalizing hex literals (`0x400` <-> `400h`) and peripheral separators (`PERIPH_REG` <-> `PERIPH->REG` <-> `PERIPH.REG`).
 pub fn query_xref(bundles: &[PathBuf], query: &str, limit: usize) -> Result<String> {
     let q_trim = query.trim();
-    let q_hex = normalize_hex_literal(q_trim);
+    let q_lower = q_trim.to_ascii_lowercase();
+    let q_hex = normalize_query_hex_literal(q_trim);
+    let is_explicit_hex = q_hex.is_some() && (q_lower.starts_with("0x") || q_lower.ends_with('h'));
 
     struct XrefHit {
         bundle_name: String,
@@ -1066,8 +1143,11 @@ pub fn query_xref(bundles: &[PathBuf], query: &str, limit: usize) -> Result<Stri
 
             let hex_match = match &q_hex {
                 Some(qh) => {
-                    normalize_hex_literal(sym).is_some_and(|sh| sh.eq_ignore_ascii_case(qh))
-                        || normalize_hex_literal(target)
+                    normalize_query_hex_literal(sym)
+                        .or_else(|| normalize_hex_literal(sym))
+                        .is_some_and(|sh| sh.eq_ignore_ascii_case(qh))
+                        || normalize_query_hex_literal(target)
+                            .or_else(|| normalize_hex_literal(target))
                             .is_some_and(|th| th.eq_ignore_ascii_case(qh))
                         || normalize_hex_literal(context)
                             .is_some_and(|ch| ch.eq_ignore_ascii_case(qh))
@@ -1075,20 +1155,19 @@ pub fn query_xref(bundles: &[PathBuf], query: &str, limit: usize) -> Result<Stri
                 None => false,
             };
 
-            let sym_score = score_hw_identifier_match(sym, q_trim);
-            let target_score = score_hw_identifier_match(target, q_trim);
-            let ctx_score = if context
-                .to_ascii_lowercase()
-                .contains(&q_trim.to_ascii_lowercase())
-            {
-                1
-            } else {
-                0
-            };
-
             let score = if hex_match {
                 5
+            } else if is_explicit_hex {
+                0
             } else {
+                let sym_score = score_hw_identifier_match(sym, q_trim);
+                let target_score = score_hw_identifier_match(target, q_trim);
+                let ctx_score =
+                    if !q_lower.is_empty() && context.to_ascii_lowercase().contains(&q_lower) {
+                        1
+                    } else {
+                        0
+                    };
                 sym_score.max(target_score).max(ctx_score)
             };
 
@@ -1115,6 +1194,10 @@ pub fn query_xref(bundles: &[PathBuf], query: &str, limit: usize) -> Result<Stri
         return Ok(format!(
             "No cross-reference graph connections found for '{query}'.\n"
         ));
+    }
+
+    if hits.iter().any(|h| h.score >= 3) {
+        hits.retain(|h| h.score >= 2);
     }
 
     hits.sort_by(|a, b| {
@@ -1624,6 +1707,8 @@ pub fn query_impact(
 
 /// High-speed parallel search across one or more bundles using SIMD (`memchr::memmem::Finder`)
 /// for literal case-sensitive queries and `RegexBuilder` for pattern/case-insensitive queries.
+/// Supports `kind = "source"` (`--source` / `-S`) and automatic raw source fallback when
+/// `kind = "all"` returns 0 index hits.
 pub fn parallel_bundle_search(
     bundles: &[PathBuf],
     pattern: &str,
@@ -1631,13 +1716,21 @@ pub fn parallel_bundle_search(
     ignore_case: bool,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
-    let re = RegexBuilder::new(pattern)
+    // Issue #28: Fall back to literal escaped regex when `pattern` has unclosed regex metacharacters
+    // such as `"fn("` or `"ARR["`.
+    let re = match RegexBuilder::new(pattern)
         .case_insensitive(ignore_case)
         .build()
-        .map_err(|source| ChipsrcError::InvalidRegex {
-            pattern: pattern.to_string(),
-            source,
-        })?;
+    {
+        Ok(compiled) => compiled,
+        Err(_) => RegexBuilder::new(&regex::escape(pattern))
+            .case_insensitive(ignore_case)
+            .build()
+            .map_err(|source| ChipsrcError::InvalidRegex {
+                pattern: pattern.to_string(),
+                source,
+            })?,
+    };
 
     let is_literal = !ignore_case
         && !pattern.is_empty()
@@ -1658,12 +1751,14 @@ pub fn parallel_bundle_search(
     };
 
     let k = kind.trim().to_ascii_lowercase();
-    let search_syms = k == "all" || k.starts_with("sym");
-    let search_types = k == "all" || k.starts_with("typ");
-    let search_calls = k == "all" || k.starts_with("call");
-    let search_macros = k == "all" || k.starts_with("mac") || k.starts_with("reg");
-    let search_xrefs = k == "all" || k.starts_with("xref");
-    let search_secs = k == "all" || k.starts_with("sec") || k == "md";
+    let search_source_explicit = k.starts_with("src") || k.starts_with("source") || k == "code";
+    let search_syms = !search_source_explicit && (k == "all" || k.starts_with("sym"));
+    let search_types = !search_source_explicit && (k == "all" || k.starts_with("typ"));
+    let search_calls = !search_source_explicit && (k == "all" || k.starts_with("call"));
+    let search_macros =
+        !search_source_explicit && (k == "all" || k.starts_with("mac") || k.starts_with("reg"));
+    let search_xrefs = !search_source_explicit && (k == "all" || k.starts_with("xref"));
+    let search_secs = !search_source_explicit && (k == "all" || k.starts_with("sec") || k == "md");
 
     let mut all_hits: Vec<SearchHit> = Vec::new();
 
@@ -1768,7 +1863,109 @@ pub fn parallel_bundle_search(
         }
     }
 
+    // Issue #19: Full-text raw source search when `kind` is `"source"`/`"src"` OR when `kind == "all"`
+    // produced 0 hits in the bundle index tables / section skeletons.
+    if (search_source_explicit || (k == "all" && all_hits.is_empty())) && all_hits.len() < limit {
+        for bundle_dir in bundles {
+            if all_hits.len() >= limit {
+                break;
+            }
+            let Some(meta) = load_meta_file(bundle_dir) else {
+                continue;
+            };
+            let source_root = Path::new(&meta.metadata.source_root);
+            if !source_root.is_dir() {
+                continue;
+            }
+            let bundle_name = if !meta.metadata.repo_name.is_empty() {
+                meta.metadata.repo_name.clone()
+            } else {
+                bundle_name_from_dir(bundle_dir)
+            };
+
+            let rel_files: Vec<String> = if !meta.metadata.file_stamps.is_empty() {
+                meta.metadata
+                    .file_stamps
+                    .iter()
+                    .map(|s| s.rel_path.clone())
+                    .collect()
+            } else if let Ok((scanned, _)) = scan_repository(
+                source_root,
+                meta.metadata.vendor_mode,
+                DEFAULT_MAX_FILE_BYTES,
+            ) {
+                scanned.into_iter().map(|s| s.rel_path).collect()
+            } else {
+                Vec::new()
+            };
+
+            let src_hits: Vec<SearchHit> = rel_files
+                .par_iter()
+                .flat_map_iter(|rel_file| {
+                    let full_path = source_root.join(rel_file);
+                    let content = match fs::read_to_string(&full_path) {
+                        Ok(c) => c,
+                        Err(_) => return Vec::new(),
+                    };
+                    if let Some(ref finder) = simd_finder {
+                        if finder.find(content.as_bytes()).is_none() {
+                            return Vec::new();
+                        }
+                    }
+                    content
+                        .lines()
+                        .enumerate()
+                        .filter(|(_, line)| matches_line(line))
+                        .map(|(idx, line)| SearchHit {
+                            bundle_name: bundle_name.clone(),
+                            kind: "source".to_string(),
+                            file: rel_file.clone(),
+                            line: idx + 1,
+                            snippet: line.trim().to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+
+            for hit in src_hits {
+                if all_hits.len() >= limit {
+                    break;
+                }
+                all_hits.push(hit);
+            }
+        }
+    }
+
     Ok(all_hits)
+}
+
+fn bundles_have_exact_symbol(bundles: &[PathBuf], q_trim: &str, q_lower: &str) -> bool {
+    if q_trim.is_empty() {
+        return false;
+    }
+    let suffix = format!("::{q_lower}");
+    for bundle_dir in bundles {
+        let sym_tsv = bundle_dir.join("index").join("symbols.tsv");
+        let Ok(content) = fs::read_to_string(&sym_tsv) else {
+            continue;
+        };
+        for line in content.lines().skip(1) {
+            let mut cols = line.split('\t');
+            let Some(symbol_id) = cols.next() else {
+                continue;
+            };
+            let Some(name) = cols.next() else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case(q_trim)
+                || symbol_id.eq_ignore_ascii_case(q_trim)
+                || symbol_id.to_ascii_lowercase().ends_with(&suffix)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Normalizes and scores hardware/code identifier matches across `PERIPH_REG`, `PERIPH->REG`, `PERIPH.REG`, and `PERIPH::REG`.
@@ -1789,15 +1986,17 @@ fn score_hw_identifier_match(candidate: &str, query: &str) -> u8 {
         return 4;
     }
 
-    // Check peripheral prefix + register suffix splitting
-    if let (Some((cp, cr)), Some((qp, qr))) = (split_periph_reg(c_trim), split_periph_reg(q_trim)) {
-        if periph_stems_compatible(cp, qp) && cr.eq_ignore_ascii_case(qr) {
-            return 3;
+    // Check peripheral prefix + register suffix splitting (both first and last `_` splits)
+    for (cp, cr) in split_periph_reg_candidates(c_trim) {
+        for (qp, qr) in split_periph_reg_candidates(q_trim) {
+            if periph_stems_compatible(cp, qp) && cr.eq_ignore_ascii_case(qr) {
+                return 3;
+            }
         }
     }
 
     // Check if query is a peripheral name (e.g. "GPIOA" or "GPIO") matching "GPIOA->MODER" or "GPIOA_MODER"
-    if let Some((cp, cr)) = split_periph_reg(c_trim) {
+    for (cp, cr) in split_periph_reg_candidates(c_trim) {
         if cp.eq_ignore_ascii_case(q_trim) || cr.eq_ignore_ascii_case(q_trim) {
             return 3;
         }
@@ -1817,22 +2016,37 @@ fn score_hw_identifier_match(candidate: &str, query: &str) -> u8 {
 
 fn canonicalize_hw_ident(s: &str) -> String {
     s.trim()
+        .trim_start_matches('_')
         .replace("->", "_")
         .replace("::", "_")
         .replace('.', "_")
         .to_ascii_uppercase()
 }
 
-fn split_periph_reg(s: &str) -> Option<(&str, &str)> {
-    s.split_once("->")
-        .or_else(|| s.split_once('.'))
-        .or_else(|| s.split_once("::"))
-        .or_else(|| s.split_once('_'))
+fn split_periph_reg_candidates(s: &str) -> Vec<(&str, &str)> {
+    let trimmed = s.trim().trim_start_matches('_');
+    if let Some(pair) = trimmed
+        .split_once("->")
+        .or_else(|| trimmed.split_once('.'))
+        .or_else(|| trimmed.split_once("::"))
+    {
+        return vec![pair];
+    }
+    let mut out = Vec::new();
+    if let Some(first) = trimmed.split_once('_') {
+        out.push(first);
+    }
+    if let Some(last) = trimmed.rsplit_once('_') {
+        if !out.contains(&last) {
+            out.push(last);
+        }
+    }
+    out
 }
 
 fn periph_stems_compatible(a: &str, b: &str) -> bool {
-    let au = a.trim().to_ascii_uppercase();
-    let bu = b.trim().to_ascii_uppercase();
+    let au = a.trim().trim_start_matches('_').to_ascii_uppercase();
+    let bu = b.trim().trim_start_matches('_').to_ascii_uppercase();
     if au == bu {
         return true;
     }
@@ -1840,7 +2054,7 @@ fn periph_stems_compatible(a: &str, b: &str) -> bool {
         if tok.len() >= 4 && tok.ends_with('X') {
             return tok[..tok.len() - 1].to_string();
         }
-        if tok.len() == 5 && tok.starts_with("GPIO") && matches!(tok.as_bytes()[4], b'A'..=b'K') {
+        if tok.len() == 5 && tok.starts_with("GPIO") && tok.as_bytes()[4].is_ascii_uppercase() {
             return "GPIO".to_string();
         }
         let trimmed = tok.trim_end_matches(|c: char| c.is_ascii_digit());
@@ -1857,73 +2071,84 @@ fn periph_stems_compatible(a: &str, b: &str) -> bool {
         && (au == sa || bu == sb || a.ends_with(['x', 'X']) || b.ends_with(['x', 'X']))
 }
 
-/// Reads `start_line..=end_line` (capped at 60 lines) from `<source_root>/<rel_file>` and formats as a fenced code block.
-fn read_source_snippet(
-    bundle_dir: &Path,
-    rel_file: &str,
-    start_line: usize,
-    end_line: usize,
-) -> Option<String> {
-    let meta = load_meta_file(bundle_dir)?;
-    let root_path = Path::new(&meta.metadata.source_root);
-    let full_path = if root_path.join(rel_file).is_file() {
-        root_path.join(rel_file)
-    } else if Path::new(rel_file).is_file() {
-        PathBuf::from(rel_file)
-    } else {
-        return None;
-    };
+/// Caches `source_root` per bundle and file line vectors across hits within a single query
+/// so `--show` never re-reads `meta.json` or the same source file multiple times (Issue #43).
+#[derive(Default)]
+struct SourceSnippetCache {
+    roots: FxHashMap<PathBuf, PathBuf>,
+    files: FxHashMap<PathBuf, Vec<String>>,
+}
 
-    let content = fs::read_to_string(&full_path).ok()?;
-    let all_lines: Vec<&str> = content.lines().collect();
-    if all_lines.is_empty() {
-        return None;
+impl SourceSnippetCache {
+    fn read_snippet(
+        &mut self,
+        bundle_dir: &Path,
+        rel_file: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<String> {
+        let root_path = if let Some(r) = self.roots.get(bundle_dir) {
+            r.clone()
+        } else {
+            let meta = load_meta_file(bundle_dir)?;
+            let r = PathBuf::from(meta.metadata.source_root);
+            self.roots.insert(bundle_dir.to_path_buf(), r.clone());
+            r
+        };
+
+        let full_path = if root_path.join(rel_file).is_file() {
+            root_path.join(rel_file)
+        } else if Path::new(rel_file).is_file() {
+            PathBuf::from(rel_file)
+        } else {
+            return None;
+        };
+
+        if !self.files.contains_key(&full_path) {
+            let content = fs::read_to_string(&full_path).ok()?;
+            let lines: Vec<String> = content.lines().map(ToOwned::to_owned).collect();
+            self.files.insert(full_path.clone(), lines);
+        }
+        let all_lines = self.files.get(&full_path)?;
+        if all_lines.is_empty() {
+            return None;
+        }
+
+        let s_line = start_line.max(1);
+        let e_line = end_line.max(s_line).min(all_lines.len());
+        if s_line > all_lines.len() {
+            return None;
+        }
+
+        const MAX_SNIPPET_LINES: usize = 60;
+        let capped_end = e_line.min(s_line + MAX_SNIPPET_LINES - 1);
+
+        let ext = full_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let lang_tag = LanguageKind::from_extension(ext)
+            .map(|l| l.as_str())
+            .unwrap_or("text");
+
+        let mut out = String::new();
+        out.push_str(&format!("```{lang_tag}\n"));
+        for line_no in s_line..=capped_end {
+            out.push_str(&format!("{:>4} | {}\n", line_no, all_lines[line_no - 1]));
+        }
+        if e_line > capped_end {
+            out.push_str(&format!(
+                "     | ... (+{} more lines in `{}:{}-{}`)\n",
+                e_line - capped_end,
+                rel_file,
+                capped_end + 1,
+                e_line
+            ));
+        }
+        out.push_str("```\n");
+        Some(out)
     }
-
-    let s_line = start_line.max(1);
-    let e_line = end_line.max(s_line).min(all_lines.len());
-    if s_line > all_lines.len() {
-        return None;
-    }
-
-    const MAX_SNIPPET_LINES: usize = 60;
-    let capped_end = e_line.min(s_line + MAX_SNIPPET_LINES - 1);
-
-    let ext = full_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let lang_tag = LanguageKind::from_extension(ext)
-        .map(|l| l.as_str())
-        .unwrap_or("text");
-
-    let mut out = String::new();
-    out.push_str(&format!("```{lang_tag}\n"));
-    for line_no in s_line..=capped_end {
-        out.push_str(&format!("{:>4} | {}\n", line_no, all_lines[line_no - 1]));
-    }
-    if e_line > capped_end {
-        out.push_str(&format!(
-            "     | ... (+{} more lines in `{}:{}-{}`)\n",
-            e_line - capped_end,
-            rel_file,
-            capped_end + 1,
-            e_line
-        ));
-    }
-    out.push_str("```\n");
-    Some(out)
 }
 
 fn is_valid_bundle_dir(dir: &Path) -> bool {
     dir.is_dir() && dir.join("meta.json").is_file() && dir.join("INDEX.md").is_file()
-}
-
-fn load_meta_file(bundle_dir: &Path) -> Option<BundleMetaFile> {
-    let raw = fs::read_to_string(bundle_dir.join("meta.json")).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-fn load_cache_file(bundle_dir: &Path) -> Option<IncrementalAstCache> {
-    let raw = fs::read_to_string(bundle_dir.join("cache.json")).ok()?;
-    serde_json::from_str(&raw).ok()
 }
 
 fn bundle_name_from_dir(bundle_dir: &Path) -> String {
@@ -1942,7 +2167,25 @@ fn bundle_name_from_dir(bundle_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{RepoMetadata, SanityReport, VendorMode};
+    use crate::model::{BundleMetaFile, RepoMetadata, SanityReport, VendorMode};
+
+    struct TestTempDir(PathBuf);
+
+    impl TestTempDir {
+        fn new(label: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("chipsrc_query_{label}_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn test_hw_identifier_and_hex_matching() {
@@ -1950,15 +2193,19 @@ mod tests {
         assert_eq!(score_hw_identifier_match("GPIOA_MODER", "GPIOA.MODER"), 4);
         assert_eq!(score_hw_identifier_match("GPIOA->MODER", "GPIOA"), 3);
         assert_eq!(score_hw_identifier_match("GPIOx_MODER", "GPIOA->MODER"), 3);
+        assert_eq!(score_hw_identifier_match("GPIOZ_MODER", "GPIOx->MODER"), 3);
+        assert_eq!(
+            score_hw_identifier_match("__HAL_TIM_GET_COUNTER", "HAL_TIM_GET_COUNTER"),
+            4
+        );
         assert_eq!(score_hw_identifier_match("TIM1->CCR1", "UART0_DR"), 0);
     }
 
     #[test]
     fn test_query_symbols_macros_and_parallel_search_with_show() {
-        let tmp = std::env::temp_dir().join(format!("chipsrc_query_test_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp);
-        let src_dir = tmp.join("src");
-        let bundle_dir = tmp.join("output").join("demo");
+        let tmp = TestTempDir::new("main");
+        let src_dir = tmp.0.join("src");
+        let bundle_dir = tmp.0.join("output").join("demo");
         let index_dir = bundle_dir.join("index");
         let sections_dir = bundle_dir.join("sections");
 
@@ -1976,7 +2223,7 @@ mod tests {
         let meta = BundleMetaFile {
             metadata: RepoMetadata {
                 repo_name: "demo".to_string(),
-                source_root: tmp.display().to_string(),
+                source_root: tmp.0.display().to_string(),
                 fingerprint: "abc12345".to_string(),
                 vendor_mode: VendorMode::Active,
                 total_files: 1,
@@ -1997,24 +2244,33 @@ mod tests {
         .unwrap();
         fs::write(bundle_dir.join("INDEX.md"), "# demo\n").unwrap();
 
-        let syms_tsv = "symbol_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tsignature\tpagerank\tin_deg\tout_deg\tarch_layer\tscope\tsection_id\n\
-src/drv.c::lock_actuator\tlock_actuator\tfn\tpub\tsrc/drv.c\t2\t4\tvoid lock_actuator(int id)\t0.500000\t1\t0\tdrvs\tfirst_party\t01-src\n";
+        let syms_tsv = "symbol_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tsignature\tpagerank\tin_deg\tout_deg\tarch_layer\tscope\tsection_id\tdoc_summary\n\
+src/drv.c::lock_actuator\tlock_actuator\tfn\tpub\tsrc/drv.c\t2\t4\tvoid lock_actuator(int id)\t0.500000\t1\t0\tdrvs\tfirst_party\t01-src\tLocks the actuator.\n";
         fs::write(index_dir.join("symbols.tsv"), syms_tsv).unwrap();
 
         let macros_tsv = "name\tkind\tvalue_or_args\thex_addr\tfile\tline\tarch_layer\tscope\tsection_id\tdescription\n\
 REG_CTRL\tmmio_addr\t0x41C00004UL\t0x41C00004\tsrc/drv.c\t1\tdrvs\tfirst_party\t01-src\tMMIO register\n\
+MASK_ALL\tbitmask\t0xFFFFFFFFUL\t0xFFFFFFFF\tsrc/drv.c\t1\tdrvs\tfirst_party\t01-src\tAll bits\n\
 GPIOA->MODER\treg_access\tGPIOA->MODER = id;\t-\tsrc/drv.c\t3\tdrvs\tfirst_party\t01-src\tRegister access\n";
         fs::write(index_dir.join("macros.tsv"), macros_tsv).unwrap();
 
         let bundles = resolve_bundles(&bundle_dir).unwrap();
         assert_eq!(bundles.len(), 1);
 
+        // Non-existent multi-segment path must return BundleNotFound (Issue #23)
+        assert!(resolve_bundles(Path::new("nonexistent_dir/demo")).is_err());
+
         let sym_out = query_symbols(&bundles, "lock_actuator", None, true, 10).unwrap();
         assert!(sym_out.contains("void lock_actuator(int id)"));
+        assert!(sym_out.contains("doc: Locks the actuator."));
         assert!(sym_out.contains("GPIOA->MODER = id;"));
 
         let mac_hex_out = query_macros(&bundles, "41C00004h", false, 10).unwrap();
         assert!(mac_hex_out.contains("REG_CTRL"));
+
+        // Exact hex query `0xFF` or `FFh` must NOT substring-match `0xFFFFFFFF` (Issue #9)
+        let mac_ff_out = query_macros(&bundles, "FFh", false, 10).unwrap();
+        assert!(!mac_ff_out.contains("MASK_ALL"));
 
         let mac_periph_out = query_macros(&bundles, "GPIOA_MODER", false, 10).unwrap();
         assert!(mac_periph_out.contains("GPIOA->MODER"));
@@ -2022,6 +2278,9 @@ GPIOA->MODER\treg_access\tGPIOA->MODER = id;\t-\tsrc/drv.c\t3\tdrvs\tfirst_party
         let hits = parallel_bundle_search(&bundles, "lock_actuator", "all", false, 10).unwrap();
         assert!(!hits.is_empty());
 
-        let _ = fs::remove_dir_all(&tmp);
+        // Literal search with unclosed regex parenthesis must not fail (Issue #28)
+        let paren_hits =
+            parallel_bundle_search(&bundles, "lock_actuator(", "source", false, 10).unwrap();
+        assert!(!paren_hits.is_empty());
     }
 }

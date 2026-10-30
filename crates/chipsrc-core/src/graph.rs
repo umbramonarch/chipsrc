@@ -1,6 +1,6 @@
 use crate::model::{
     ArchLayer, CyclicCluster, ExtractedSymbol, FileScope, LanguageKind, LayerDependencyEdge,
-    ParsedFileUnit, RankedSymbol, ResolutionTier, ResolvedCallEdge, SymbolKind, Visibility,
+    ParsedFileUnit, RankedSymbol, ResolvedCallEdge, SymbolKind, Visibility,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,7 +39,7 @@ pub fn analyze_graph(
     let mut rev_adj: Vec<Vec<u32>> = vec![Vec::new(); n];
 
     for call in calls {
-        if !call.tier.is_resolved() {
+        if !call.tier.is_high_confidence() {
             continue;
         }
         if let (Some(&u), Some(&v)) = (
@@ -47,6 +47,13 @@ pub fn analyze_graph(
             id_to_idx.get(call.callee_id.as_str()),
         ) {
             if u != v {
+                // Do not let unit-test callers inflate the production in-degree / PageRank of
+                // first-party symbols.
+                if symbols[u as usize].scope == FileScope::Test
+                    && symbols[v as usize].scope == FileScope::FirstParty
+                {
+                    continue;
+                }
                 adj[u as usize].push(v);
                 rev_adj[v as usize].push(u);
             }
@@ -150,30 +157,41 @@ pub fn analyze_graph(
         .collect();
 
     // 6. Identify God Nodes (Top architectural hubs)
-    // Ranked by pagerank * (1.0 + (in_degree + out_degree) as f64).ln_1p()
+    // Prefer true architectural transit hubs (`in_degree > 0 && out_degree > 0`) and orchestration
+    // coordinators (`out_degree >= 2`) over pure leaf utility functions (`out_degree == 0`).
+    let hub_score = |r: &RankedSymbol| -> f64 {
+        let deg = (r.in_degree + r.out_degree) as f64;
+        let base = r.pagerank * (1.0 + deg).ln_1p();
+        if r.in_degree > 0 && r.out_degree > 0 {
+            base * 2.0
+        } else if r.out_degree >= 2 {
+            base * 1.2
+        } else if r.out_degree == 0 {
+            base * 0.15
+        } else {
+            base
+        }
+    };
+
     let mut hub_candidates: Vec<(usize, f64)> = ranked
         .iter()
         .enumerate()
         .filter(|(_, r)| {
-            r.symbol.scope == FileScope::FirstParty && (r.in_degree + r.out_degree) >= 2
+            r.symbol.scope == FileScope::FirstParty
+                && r.out_degree > 0
+                && (r.in_degree + r.out_degree) >= 2
         })
-        .map(|(idx, r)| {
-            let deg = (r.in_degree + r.out_degree) as f64;
-            let score = r.pagerank * (1.0 + deg).ln_1p();
-            (idx, score)
-        })
+        .map(|(idx, r)| (idx, hub_score(r)))
         .collect();
 
-    if hub_candidates.is_empty() {
+    if hub_candidates.len() < 5 {
         hub_candidates = ranked
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.symbol.scope == FileScope::FirstParty)
-            .map(|(idx, r)| {
-                let deg = (r.in_degree + r.out_degree) as f64;
-                let score = r.pagerank * (1.0 + deg).ln_1p();
-                (idx, score)
+            .filter(|(_, r)| {
+                r.symbol.scope == FileScope::FirstParty && (r.in_degree + r.out_degree) >= 2
             })
+            .map(|(idx, r)| (idx, hub_score(r)))
             .collect();
     }
 
@@ -181,11 +199,16 @@ pub fn analyze_graph(
         hub_candidates = ranked
             .iter()
             .enumerate()
-            .map(|(idx, r)| {
-                let deg = (r.in_degree + r.out_degree) as f64;
-                let score = r.pagerank * (1.0 + deg).ln_1p();
-                (idx, score)
-            })
+            .filter(|(_, r)| r.symbol.scope == FileScope::FirstParty)
+            .map(|(idx, r)| (idx, hub_score(r)))
+            .collect();
+    }
+
+    if hub_candidates.is_empty() {
+        hub_candidates = ranked
+            .iter()
+            .enumerate()
+            .map(|(idx, r)| (idx, hub_score(r)))
             .collect();
     }
 
@@ -240,77 +263,79 @@ fn compute_tarjan_sccs(
     adj: &[Vec<u32>],
     symbols: &[ExtractedSymbol],
 ) -> (Vec<CyclicCluster>, Vec<Option<usize>>) {
-    struct TarjanState<'a> {
-        adj: &'a [Vec<u32>],
-        index: u32,
-        indices: Vec<Option<u32>>,
-        lowlink: Vec<u32>,
-        on_stack: Vec<bool>,
-        stack: Vec<u32>,
-        raw_sccs: Vec<Vec<u32>>,
-    }
+    let n = adj.len();
+    let mut index: u32 = 0;
+    let mut indices: Vec<Option<u32>> = vec![None; n];
+    let mut lowlink: Vec<u32> = vec![0; n];
+    let mut on_stack: Vec<bool> = vec![false; n];
+    let mut scc_stack: Vec<u32> = Vec::new();
+    let mut work_stack: Vec<(u32, usize)> = Vec::new();
+    let mut raw_sccs: Vec<Vec<u32>> = Vec::new();
 
-    impl<'a> TarjanState<'a> {
-        fn strongconnect(&mut self, v: u32) {
-            let v_usize = v as usize;
-            self.indices[v_usize] = Some(self.index);
-            self.lowlink[v_usize] = self.index;
-            self.index += 1;
-            self.stack.push(v);
-            self.on_stack[v_usize] = true;
+    for start_v in 0..(n as u32) {
+        if indices[start_v as usize].is_some() {
+            continue;
+        }
 
-            for &w in &self.adj[v_usize] {
+        indices[start_v as usize] = Some(index);
+        lowlink[start_v as usize] = index;
+        index += 1;
+        scc_stack.push(start_v);
+        on_stack[start_v as usize] = true;
+        work_stack.push((start_v, 0));
+
+        while let Some((v, next_edge_idx)) = work_stack.last_mut() {
+            let v_usize = *v as usize;
+            if *next_edge_idx < adj[v_usize].len() {
+                let w = adj[v_usize][*next_edge_idx];
+                *next_edge_idx += 1;
                 let w_usize = w as usize;
-                if self.indices[w_usize].is_none() {
-                    self.strongconnect(w);
-                    self.lowlink[v_usize] = self.lowlink[v_usize].min(self.lowlink[w_usize]);
-                } else if self.on_stack[w_usize] {
-                    let w_idx = self.indices[w_usize].unwrap_or(0);
-                    self.lowlink[v_usize] = self.lowlink[v_usize].min(w_idx);
+                if indices[w_usize].is_none() {
+                    indices[w_usize] = Some(index);
+                    lowlink[w_usize] = index;
+                    index += 1;
+                    scc_stack.push(w);
+                    on_stack[w_usize] = true;
+                    work_stack.push((w, 0));
+                } else if on_stack[w_usize] {
+                    let w_idx = indices[w_usize].unwrap_or(0);
+                    lowlink[v_usize] = lowlink[v_usize].min(w_idx);
                 }
-            }
+            } else {
+                let finished_v = *v;
+                let finished_usize = finished_v as usize;
+                work_stack.pop();
 
-            if Some(self.lowlink[v_usize]) == self.indices[v_usize] {
-                let mut component = Vec::new();
-                while let Some(w) = self.stack.pop() {
-                    self.on_stack[w as usize] = false;
-                    component.push(w);
-                    if w == v {
-                        break;
+                if let Some(&(parent_v, _)) = work_stack.last() {
+                    let p_usize = parent_v as usize;
+                    lowlink[p_usize] = lowlink[p_usize].min(lowlink[finished_usize]);
+                }
+
+                if Some(lowlink[finished_usize]) == indices[finished_usize] {
+                    let mut component = Vec::new();
+                    while let Some(w) = scc_stack.pop() {
+                        on_stack[w as usize] = false;
+                        component.push(w);
+                        if w == finished_v {
+                            break;
+                        }
+                    }
+                    if component.len() >= 2 {
+                        component.sort_unstable();
+                        raw_sccs.push(component);
                     }
                 }
-                if component.len() >= 2 {
-                    component.sort_unstable();
-                    self.raw_sccs.push(component);
-                }
             }
-        }
-    }
-
-    let n = adj.len();
-    let mut state = TarjanState {
-        adj,
-        index: 0,
-        indices: vec![None; n],
-        lowlink: vec![0; n],
-        on_stack: vec![false; n],
-        stack: Vec::new(),
-        raw_sccs: Vec::new(),
-    };
-
-    for v in 0..(n as u32) {
-        if state.indices[v as usize].is_none() {
-            state.strongconnect(v);
         }
     }
 
     // Sort SCCs deterministically by their first node ID
-    state.raw_sccs.sort();
+    raw_sccs.sort();
 
     let mut node_scc_ids: Vec<Option<usize>> = vec![None; n];
-    let mut clusters: Vec<CyclicCluster> = Vec::with_capacity(state.raw_sccs.len());
+    let mut clusters: Vec<CyclicCluster> = Vec::with_capacity(raw_sccs.len());
 
-    for (cluster_idx, comp) in state.raw_sccs.into_iter().enumerate() {
+    for (cluster_idx, comp) in raw_sccs.into_iter().enumerate() {
         let scc_id = cluster_idx + 1;
         let mut syms = Vec::with_capacity(comp.len());
         let mut files = BTreeSet::new();
@@ -393,13 +418,6 @@ fn import_target_compatible(
         || (importer_scope == FileScope::FirstParty && target_scope == FileScope::FirstParty)
 }
 
-fn is_high_confidence_tier(tier: ResolutionTier) -> bool {
-    matches!(
-        tier,
-        ResolutionTier::SameFile | ResolutionTier::ImportResolved | ResolutionTier::UniqueGlobal
-    )
-}
-
 fn compute_layer_edges(
     symbols: &[ExtractedSymbol],
     calls: &[ResolvedCallEdge],
@@ -463,7 +481,7 @@ fn compute_layer_edges(
     for call in calls {
         // Only high-confidence resolutions contribute to layer dependency edges; ambiguous name
         // guesses must never trigger a false architectural violation.
-        if !is_high_confidence_tier(call.tier) {
+        if !call.tier.is_high_confidence() {
             continue;
         }
         // Boot / startup entrypoints or vector table handlers in BSP / VendorHal dispatching into
@@ -710,10 +728,13 @@ mod tests {
             analyze_graph(symbols, &calls, &[]);
 
         assert_eq!(ranked.len(), 4);
-        assert!(!god_nodes.is_empty());
+        assert_eq!(god_nodes.len(), 4);
+        assert!(god_nodes.iter().any(|g| g.symbol.symbol_id == "s::drv_a"));
         assert_eq!(entrypoints.len(), 1);
         assert_eq!(entrypoints[0].symbol.name, "main");
-        assert!(!cycles.is_empty());
+        assert_eq!(cycles.len(), 1);
+        assert!(cycles[0].symbols.contains(&"s::drv_a".to_string()));
+        assert!(cycles[0].symbols.contains(&"s::drv_b".to_string()));
         assert!(layer_edges
             .iter()
             .any(|e| e.from_layer == "drvs" && e.to_layer == "app" && e.is_upward_violation));

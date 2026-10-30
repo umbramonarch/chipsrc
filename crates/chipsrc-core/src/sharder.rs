@@ -15,16 +15,18 @@ struct RawShardGroup<'a> {
 }
 
 /// Groups parsed files into architectural module shards, numbers them deterministically
-/// (`01-<slug>`, `02-<slug>`, ...), updates `section_id` across all index records, computes
+/// (`01-<slug>`, `02-<slug>`, ...), updates `section_id` across all index records, prunes
+/// inactive vendor index entries under `VendorMode::Active` / `VendorMode::None`, computes
 /// cross-shard call dependencies, and renders each shard's Markdown signature skeleton.
 #[allow(clippy::too_many_arguments)]
 pub fn build_section_shards(
+    repo_name_hint: &str,
     units: &[ParsedFileUnit],
-    ranked_symbols: &mut [RankedSymbol],
-    types: &mut [ExtractedType],
-    macros: &mut [ExtractedMacro],
-    calls: &mut [ResolvedCallEdge],
-    xrefs: &mut [XrefEntry],
+    ranked_symbols: &mut Vec<RankedSymbol>,
+    types: &mut Vec<ExtractedType>,
+    macros: &mut Vec<ExtractedMacro>,
+    calls: &mut Vec<ResolvedCallEdge>,
+    xrefs: &mut Vec<XrefEntry>,
     vendor_surface: &VendorSurfaceSummary,
     vendor_mode: VendorMode,
 ) -> (Vec<SectionSummary>, Vec<SectionShard>) {
@@ -32,7 +34,11 @@ pub fn build_section_shards(
         return (Vec::new(), Vec::new());
     }
 
-    let repo_name = infer_repo_name(units);
+    let repo_name = if !repo_name_hint.trim().is_empty() {
+        repo_name_hint.trim().to_string()
+    } else {
+        infer_repo_name(units)
+    };
 
     // 1. Group files by initial section_id slug
     let mut group_map: BTreeMap<String, RawShardGroup<'_>> = BTreeMap::new();
@@ -120,6 +126,7 @@ pub fn build_section_shards(
                 }
             }
         })
+        .flat_map(|g| split_oversized_shard_group(g, &mut file_to_raw_slug))
         .collect();
 
     // 2. Order shards deterministically:
@@ -132,6 +139,81 @@ pub fn build_section_shards(
             .then_with(|| a.module_path.cmp(&b.module_path))
             .then_with(|| a.raw_slug.cmp(&b.raw_slug))
     });
+
+    // Collect active files across surviving groups so we can prune inactive vendor entries
+    // from `index/*.tsv` when `has_non_vendor` is true and `vendor_mode != VendorMode::All`.
+    if has_non_vendor && vendor_mode != VendorMode::All {
+        let mut active_vendor_files: FxHashSet<&str> = FxHashSet::default();
+        if vendor_mode == VendorMode::Active {
+            for g in &groups {
+                if g.scope == FileScope::VendorSdk {
+                    for u in &g.units {
+                        if unit_is_active_vendor_surface(u, &active_vendor_set, &active_header_set)
+                        {
+                            active_vendor_files.insert(u.scanned.rel_path.as_str());
+                        }
+                    }
+                } else {
+                    for u in &g.units {
+                        if u.scanned.scope == FileScope::VendorSdk
+                            && unit_is_active_vendor_surface(
+                                u,
+                                &active_vendor_set,
+                                &active_header_set,
+                            )
+                        {
+                            active_vendor_files.insert(u.scanned.rel_path.as_str());
+                        }
+                    }
+                }
+            }
+        }
+
+        let has_any_active_vendor_sym = ranked_symbols.iter().any(|rs| {
+            rs.symbol.scope == FileScope::VendorSdk
+                && active_vendor_files.contains(rs.symbol.file.as_str())
+                && (active_vendor_set.contains(rs.symbol.name.as_str()) || rs.in_degree > 0)
+        });
+
+        ranked_symbols.retain(|rs| {
+            if rs.symbol.scope != FileScope::VendorSdk {
+                return true;
+            }
+            vendor_mode == VendorMode::Active
+                && active_vendor_files.contains(rs.symbol.file.as_str())
+                && (!has_any_active_vendor_sym
+                    || active_vendor_set.contains(rs.symbol.name.as_str())
+                    || rs.in_degree > 0)
+        });
+        types.retain(|t| {
+            if t.scope != FileScope::VendorSdk {
+                return true;
+            }
+            vendor_mode == VendorMode::Active && active_vendor_files.contains(t.file.as_str())
+        });
+        macros.retain(|m| {
+            if m.scope != FileScope::VendorSdk {
+                return true;
+            }
+            vendor_mode == VendorMode::Active && active_vendor_files.contains(m.file.as_str())
+        });
+
+        let non_vendor_files: FxHashSet<&str> = units
+            .iter()
+            .filter(|u| u.scanned.scope != FileScope::VendorSdk)
+            .map(|u| u.scanned.rel_path.as_str())
+            .collect();
+        calls.retain(|c| {
+            non_vendor_files.contains(c.file.as_str())
+                || (vendor_mode == VendorMode::Active
+                    && active_vendor_files.contains(c.file.as_str()))
+        });
+        xrefs.retain(|x| {
+            non_vendor_files.contains(x.file.as_str())
+                || (vendor_mode == VendorMode::Active
+                    && active_vendor_files.contains(x.file.as_str()))
+        });
+    }
 
     // 3. Assign numbered section IDs (01-<slug>, 02-<slug>, ...) and build slug -> numbered map
     let mut slug_to_numbered: FxHashMap<String, String> = FxHashMap::default();
@@ -216,14 +298,14 @@ pub fn build_section_shards(
     let mut callees_by_caller: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
 
     for call in calls.iter() {
+        if !call.tier.is_resolved() {
+            continue;
+        }
         callees_by_caller
             .entry(call.caller_id.as_str())
             .or_default()
             .push(call.callee_name.as_str());
 
-        if !call.tier.is_resolved() {
-            continue;
-        }
         if let Some(&target_sec) = sym_id_to_section.get(call.callee_id.as_str()) {
             if target_sec != call.section_id {
                 depends_on_map
@@ -241,6 +323,29 @@ pub fn build_section_shards(
     for list in callees_by_caller.values_mut() {
         let mut seen = FxHashSet::default();
         list.retain(|item| seen.insert(*item));
+    }
+
+    // Pre-partition symbols, types, and macros by section_id in O(N + T + M)
+    let mut symbols_by_section: FxHashMap<&str, Vec<&RankedSymbol>> = FxHashMap::default();
+    for rs in ranked_symbols.iter() {
+        symbols_by_section
+            .entry(rs.symbol.section_id.as_str())
+            .or_default()
+            .push(rs);
+    }
+    let mut types_by_section: FxHashMap<&str, Vec<&ExtractedType>> = FxHashMap::default();
+    for t in types.iter() {
+        types_by_section
+            .entry(t.section_id.as_str())
+            .or_default()
+            .push(t);
+    }
+    let mut macros_by_section: FxHashMap<&str, Vec<&ExtractedMacro>> = FxHashMap::default();
+    for m in macros.iter() {
+        macros_by_section
+            .entry(m.section_id.as_str())
+            .or_default()
+            .push(m);
     }
 
     // 5. Render each shard's markdown_body and assemble SectionSummary + SectionShard
@@ -273,10 +378,9 @@ pub fn build_section_shards(
             .map(|u| u.scanned.rel_path.clone())
             .collect();
 
-        let mut shard_symbols: Vec<&RankedSymbol> = ranked_symbols
-            .iter()
-            .filter(|rs| rs.symbol.section_id == section_id)
-            .collect();
+        let mut shard_symbols: Vec<&RankedSymbol> = symbols_by_section
+            .remove(section_id.as_str())
+            .unwrap_or_default();
         shard_symbols.sort_by(|a, b| {
             b.pagerank
                 .total_cmp(&a.pagerank)
@@ -285,10 +389,9 @@ pub fn build_section_shards(
                 .then_with(|| a.symbol.name.cmp(&b.symbol.name))
         });
 
-        let mut shard_types: Vec<&ExtractedType> = types
-            .iter()
-            .filter(|t| t.section_id == section_id)
-            .collect();
+        let mut shard_types: Vec<&ExtractedType> = types_by_section
+            .remove(section_id.as_str())
+            .unwrap_or_default();
         shard_types.sort_by(|a, b| {
             a.file
                 .cmp(&b.file)
@@ -296,10 +399,9 @@ pub fn build_section_shards(
                 .then_with(|| a.name.cmp(&b.name))
         });
 
-        let mut shard_macros: Vec<&ExtractedMacro> = macros
-            .iter()
-            .filter(|m| m.section_id == section_id)
-            .collect();
+        let mut shard_macros: Vec<&ExtractedMacro> = macros_by_section
+            .remove(section_id.as_str())
+            .unwrap_or_default();
         shard_macros.sort_by(|a, b| {
             let active_a = active_vendor_set.contains(a.name.as_str());
             let active_b = active_vendor_set.contains(b.name.as_str());
@@ -723,6 +825,166 @@ fn group_has_active_vendor_refs(
         .any(|u| unit_is_active_vendor_surface(u, active_vendor_set, active_header_set))
 }
 
+/// Sub-shards an oversized first-party shard group (`> 8` files or `> 3,000` total source lines)
+/// into cohesive sub-modules so no single `sections/*.md` file balloons into a 20k+ token monolith.
+fn split_oversized_shard_group<'a>(
+    group: RawShardGroup<'a>,
+    file_to_raw_slug: &mut FxHashMap<String, String>,
+) -> Vec<RawShardGroup<'a>> {
+    const MAX_GROUP_FILES: usize = 8;
+    const MAX_GROUP_LINES: usize = 3000;
+    const LARGE_SINGLE_FILE_LINES: usize = 1400;
+
+    let total_lines: usize = group.units.iter().map(|u| u.scanned.line_count).sum();
+    if group.scope != FileScope::FirstParty
+        || group.units.len() <= 1
+        || (group.units.len() <= MAX_GROUP_FILES && total_lines <= MAX_GROUP_LINES)
+    {
+        return vec![group];
+    }
+
+    // Step 1: Partition by each unit's individual `ArchLayer` if multiple layers exist in this group
+    // (for example `ArchLayer::Domain` for `model.rs`/`error.rs` vs `ArchLayer::Core`).
+    let mut by_layer: BTreeMap<u8, (ArchLayer, Vec<&'a ParsedFileUnit>)> = BTreeMap::new();
+    for u in &group.units {
+        by_layer
+            .entry(layer_sort_order(u.scanned.arch_layer))
+            .or_insert_with(|| (u.scanned.arch_layer, Vec::new()))
+            .1
+            .push(*u);
+    }
+    let has_multiple_layers = by_layer.len() > 1;
+
+    let mut out = Vec::new();
+    for (_order, (layer, mut layer_units)) in by_layer {
+        layer_units.sort_by(|a, b| a.scanned.rel_path.cmp(&b.scanned.rel_path));
+        let layer_lines: usize = layer_units.iter().map(|u| u.scanned.line_count).sum();
+        let layer_str = layer.as_str();
+
+        // If this layer slice is already compact, keep it as a single sub-shard.
+        if layer_units.len() <= MAX_GROUP_FILES && layer_lines <= MAX_GROUP_LINES {
+            let sub_slug = if has_multiple_layers && layer != group.arch_layer {
+                sanitize_slug(&format!("{}-{layer_str}", group.raw_slug))
+            } else {
+                group.raw_slug.clone()
+            };
+            let sub_path = if has_multiple_layers && layer != group.arch_layer {
+                format!("{}/{layer_str}", group.module_path)
+            } else {
+                group.module_path.clone()
+            };
+            for u in &layer_units {
+                file_to_raw_slug.insert(u.scanned.rel_path.clone(), sub_slug.clone());
+            }
+            out.push(RawShardGroup {
+                raw_slug: sub_slug,
+                title: format!("{sub_path} ({layer_str})"),
+                module_path: sub_path,
+                arch_layer: layer,
+                scope: group.scope,
+                units: layer_units,
+            });
+            continue;
+        }
+
+        // Step 2: Separate very large individual files (`>= LARGE_SINGLE_FILE_LINES`) into
+        // dedicated `<base_slug>-<stem>` sub-shards, and pack remaining files into balanced chunks.
+        let mut small_units: Vec<&'a ParsedFileUnit> = Vec::new();
+        for u in layer_units {
+            if u.scanned.line_count >= LARGE_SINGLE_FILE_LINES {
+                let stem = unit_file_stem(u);
+                let sub_slug = sanitize_slug(&format!("{}-{stem}", group.raw_slug));
+                let sub_path = format!("{}/{stem}", group.module_path);
+                file_to_raw_slug.insert(u.scanned.rel_path.clone(), sub_slug.clone());
+                out.push(RawShardGroup {
+                    raw_slug: sub_slug,
+                    title: format!("{sub_path} ({layer_str})"),
+                    module_path: sub_path,
+                    arch_layer: layer,
+                    scope: group.scope,
+                    units: vec![u],
+                });
+            } else {
+                small_units.push(u);
+            }
+        }
+
+        if small_units.is_empty() {
+            continue;
+        }
+
+        // Pack remaining units into chunks of `<= MAX_GROUP_LINES` and `<= MAX_GROUP_FILES`.
+        let mut chunks: Vec<Vec<&'a ParsedFileUnit>> = Vec::new();
+        let mut current_chunk: Vec<&'a ParsedFileUnit> = Vec::new();
+        let mut current_lines = 0usize;
+
+        for u in small_units {
+            if !current_chunk.is_empty()
+                && (current_chunk.len() >= MAX_GROUP_FILES
+                    || current_lines + u.scanned.line_count > MAX_GROUP_LINES)
+            {
+                chunks.push(std::mem::take(&mut current_chunk));
+                current_lines = 0;
+            }
+            current_lines += u.scanned.line_count;
+            current_chunk.push(u);
+        }
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
+
+        let num_chunks = chunks.len();
+        for chunk in chunks {
+            let (sub_slug, sub_path) = if num_chunks == 1 && out.is_empty() {
+                (group.raw_slug.clone(), group.module_path.clone())
+            } else if chunk.len() == 1 {
+                let stem = unit_file_stem(chunk[0]);
+                (
+                    sanitize_slug(&format!("{}-{stem}", group.raw_slug)),
+                    format!("{}/{stem}", group.module_path),
+                )
+            } else if num_chunks == 1 {
+                (group.raw_slug.clone(), group.module_path.clone())
+            } else {
+                let first_stem = unit_file_stem(chunk[0]);
+                let last_stem = unit_file_stem(chunk[chunk.len() - 1]);
+                let suffix = if first_stem == last_stem {
+                    first_stem
+                } else {
+                    format!("{first_stem}-{last_stem}")
+                };
+                (
+                    sanitize_slug(&format!("{}-{suffix}", group.raw_slug)),
+                    format!("{}/{suffix}", group.module_path),
+                )
+            };
+            for u in &chunk {
+                file_to_raw_slug.insert(u.scanned.rel_path.clone(), sub_slug.clone());
+            }
+            out.push(RawShardGroup {
+                raw_slug: sub_slug,
+                title: format!("{sub_path} ({layer_str})"),
+                module_path: sub_path,
+                arch_layer: layer,
+                scope: group.scope,
+                units: chunk,
+            });
+        }
+    }
+
+    out
+}
+
+fn unit_file_stem(unit: &ParsedFileUnit) -> String {
+    let norm = unit.scanned.rel_path.replace('\\', "/");
+    let fname = norm.rsplit('/').next().unwrap_or(norm.as_str());
+    fname
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(fname)
+        .to_ascii_lowercase()
+}
+
 fn derive_unit_shard_meta(unit: &ParsedFileUnit) -> (String, String, String) {
     let existing_slug = unit
         .symbols
@@ -972,6 +1234,7 @@ mod tests {
         let mut xrefs: Vec<XrefEntry> = Vec::new();
 
         build_section_shards(
+            "test-repo",
             units,
             &mut ranked_symbols,
             &mut types,

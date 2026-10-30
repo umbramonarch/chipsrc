@@ -17,21 +17,15 @@ pub use crate::error::{ChipsrcError, Result};
 pub use crate::model::*;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-
-/// Returns the crate version.
-pub fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}
 
 /// Inspects a repository's language breakdown, first-party vs. vendor SDK file counts,
 /// line counts, and detected architectural layers without writing a bundle to disk.
 pub fn inspect_repo(repo_path: &Path, vendor_mode: VendorMode) -> Result<InspectReport> {
     let (scanned_files, fingerprint) =
-        scanner::scan_repository(repo_path, vendor_mode, 4 * 1024 * 1024)?;
-    let (source_root, repo_name) = canonical_repo_root_and_name(repo_path);
+        scanner::scan_repository(repo_path, vendor_mode, DEFAULT_MAX_FILE_BYTES)?;
+    let (source_root, repo_name) = scanner::canonical_repo_root_and_name(repo_path);
     let blueprint_opt = scanner::load_repo_blueprint(repo_path);
     let (has_blueprint, unclassified_dirs, detected_workspaces, candidate_c_macros) =
         scanner::analyze_onboarding_signals(
@@ -98,7 +92,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
     let start = Instant::now();
     let (scanned_files, fingerprint) =
         scanner::scan_repository(&config.repo_path, config.vendor_mode, config.max_file_bytes)?;
-    let (source_root, repo_name) = canonical_repo_root_and_name(&config.repo_path);
+    let (source_root, repo_name) = scanner::canonical_repo_root_and_name(&config.repo_path);
     let blueprint_opt = scanner::load_repo_blueprint(&config.repo_path);
     let blueprint_hash = blueprint_opt
         .as_ref()
@@ -117,12 +111,13 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         && cache_path.is_file()
         && (!config.single_file || single_md_path.is_file())
     {
-        if let Some(mut existing_meta) = load_meta_file(&config.output_dir) {
+        if let Some(mut existing_meta) = scanner::load_meta_file(&config.output_dir) {
             if existing_meta.metadata.fingerprint == fingerprint
                 && existing_meta.metadata.vendor_mode == config.vendor_mode
             {
                 let claudeignore_updated =
-                    emitter::ensure_claudeignore_entry(&config.output_dir).unwrap_or(false);
+                    emitter::ensure_claudeignore_entry(&config.repo_path, &config.output_dir)
+                        .unwrap_or(false);
                 existing_meta.metadata.elapsed_ms = start.elapsed().as_millis() as u64;
                 existing_meta.metadata.incremental_reparsed_files = 0;
                 existing_meta.metadata.incremental_reused_files =
@@ -142,10 +137,11 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
     }
 
     // Load incremental per-file AST cache if available and not forcing full rebuild.
-    // If `.chipsrc.json` was added, removed, or modified (`blueprint_hash` mismatch),
-    // invalidate per-file AST cache entries so custom blueprint rules re-apply cleanly.
+    // If `.chipsrc.json` was added, removed, or modified (`blueprint_hash` mismatch) or
+    // `vendor_mode` changed, invalidate per-file AST cache entries so rules re-apply cleanly.
     let existing_cache = if !config.force && cache_path.is_file() {
-        load_cache_file(&config.output_dir).filter(|c| c.blueprint_hash == blueprint_hash)
+        scanner::load_cache_file(&config.output_dir)
+            .filter(|c| c.blueprint_hash == blueprint_hash && c.vendor_mode == config.vendor_mode)
     } else {
         None
     };
@@ -164,6 +160,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         graph::analyze_graph(symbols, &calls, &units);
 
     let (section_summaries, sections) = sharder::build_section_shards(
+        &repo_name,
         &units,
         &mut ranked_symbols,
         &mut types,
@@ -224,12 +221,24 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
     let total_lines: usize = scanned_files.iter().map(|f| f.line_count).sum();
     let languages = compute_language_stats(&scanned_files);
 
+    let file_stamps: Vec<FileStamp> = scanned_files
+        .iter()
+        .map(|f| FileStamp {
+            rel_path: f.rel_path.clone(),
+            size_bytes: f.size_bytes,
+            mtime_secs: f.mtime_secs,
+            blake3_hash: f.blake3_hash.clone(),
+            scope: f.scope,
+            arch_layer: f.arch_layer,
+        })
+        .collect();
+
     let mut cache_files = BTreeMap::new();
     for unit in units {
         cache_files.insert(unit.scanned.rel_path.clone(), unit);
     }
     let cache = IncrementalAstCache {
-        schema_version: "1.0.0".to_string(),
+        schema_version: CACHE_SCHEMA_VERSION.to_string(),
         repo_root: source_root.clone(),
         vendor_mode: config.vendor_mode,
         fingerprint: fingerprint.clone(),
@@ -261,6 +270,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         elapsed_ms,
         incremental_reused_files,
         incremental_reparsed_files,
+        file_stamps,
     };
 
     let claudeignore_updated =
@@ -285,7 +295,7 @@ pub fn ensure_repo(
     force: bool,
     vendor_mode: VendorMode,
 ) -> Result<ConversionBundle> {
-    let (_, repo_stem) = canonical_repo_root_and_name(repo_path);
+    let (_, repo_stem) = scanner::canonical_repo_root_and_name(repo_path);
     let output_dir = output_root.join(repo_stem);
     let mut cfg = ConvertConfig::new(repo_path.to_path_buf(), output_dir);
     cfg.force = force;
@@ -299,7 +309,7 @@ pub fn auto_refresh_bundles(bundles: &[PathBuf]) -> Result<usize> {
     let mut refreshed = 0usize;
 
     for bundle_dir in bundles {
-        let Some(meta_file) = load_meta_file(bundle_dir) else {
+        let Some(meta_file) = scanner::load_meta_file(bundle_dir) else {
             continue;
         };
         let meta = meta_file.metadata;
@@ -308,13 +318,20 @@ pub fn auto_refresh_bundles(bundles: &[PathBuf]) -> Result<usize> {
             continue;
         }
 
-        let needs_refresh = if let Some(mut cache) = load_cache_file(bundle_dir) {
+        // Fast-path: check `meta.file_stamps` directly from `meta.json` (~2 KB) without loading
+        // the multi-megabyte `cache.json` when no source files have changed (Issue #41).
+        let needs_refresh = if let Some(count) =
+            scanner::check_meta_files_changed(source_path, &meta, DEFAULT_MAX_FILE_BYTES)
+        {
+            count > 0
+        } else if let Some(mut cache) = scanner::load_cache_file(bundle_dir) {
             if cache.fingerprint.is_empty() {
                 cache.fingerprint = meta.fingerprint.clone();
             }
-            scanner::check_files_changed(source_path, &cache, 4 * 1024 * 1024).unwrap_or(0) > 0
+            scanner::check_files_changed(source_path, &cache, DEFAULT_MAX_FILE_BYTES).unwrap_or(0)
+                > 0
         } else if let Ok((_, fp)) =
-            scanner::scan_repository(source_path, meta.vendor_mode, 4 * 1024 * 1024)
+            scanner::scan_repository(source_path, meta.vendor_mode, DEFAULT_MAX_FILE_BYTES)
         {
             fp != meta.fingerprint
         } else {
@@ -332,24 +349,6 @@ pub fn auto_refresh_bundles(bundles: &[PathBuf]) -> Result<usize> {
     }
 
     Ok(refreshed)
-}
-
-fn canonical_repo_root_and_name(repo_path: &Path) -> (String, String) {
-    let canonical = repo_path
-        .canonicalize()
-        .unwrap_or_else(|_| repo_path.to_path_buf());
-    let repo_name = canonical
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty() && *s != ".")
-        .unwrap_or("repo")
-        .to_string();
-    let raw_str = canonical.to_string_lossy();
-    let clean_root = raw_str
-        .strip_prefix(r"\\?\")
-        .unwrap_or(&raw_str)
-        .replace('\\', "/");
-    (clean_root, repo_name)
 }
 
 fn compute_language_stats(scanned_files: &[ScannedFile]) -> Vec<LanguageStat> {
@@ -380,14 +379,4 @@ fn compute_language_stats(scanned_files: &[ScannedFile]) -> Vec<LanguageStat> {
             .then_with(|| a.language.cmp(&b.language))
     });
     stats
-}
-
-fn load_meta_file(bundle_dir: &Path) -> Option<BundleMetaFile> {
-    let bytes = fs::read(bundle_dir.join("meta.json")).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn load_cache_file(bundle_dir: &Path) -> Option<IncrementalAstCache> {
-    let bytes = fs::read(bundle_dir.join("cache.json")).ok()?;
-    serde_json::from_slice(&bytes).ok()
 }

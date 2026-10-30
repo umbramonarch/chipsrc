@@ -118,7 +118,7 @@ enum Commands {
         show: bool,
 
         /// Maximum matching symbols to return
-        #[arg(short, long, default_value_t = 30)]
+        #[arg(short, short_alias = 'n', long, default_value_t = 30)]
         limit: usize,
 
         /// Skip automatic incremental bundle refresh before querying
@@ -143,7 +143,7 @@ enum Commands {
         show: bool,
 
         /// Maximum caller edges to return
-        #[arg(short, long, default_value_t = 30)]
+        #[arg(short, short_alias = 'n', long, default_value_t = 30)]
         limit: usize,
 
         /// Skip automatic incremental bundle refresh before querying
@@ -168,7 +168,7 @@ enum Commands {
         show: bool,
 
         /// Maximum callee edges to return
-        #[arg(short, long, default_value_t = 30)]
+        #[arg(short, short_alias = 'n', long, default_value_t = 30)]
         limit: usize,
 
         /// Skip automatic incremental bundle refresh before querying
@@ -193,7 +193,7 @@ enum Commands {
         show: bool,
 
         /// Maximum matching types to return
-        #[arg(short, long, default_value_t = 30)]
+        #[arg(short, short_alias = 'n', long, default_value_t = 30)]
         limit: usize,
 
         /// Skip automatic incremental bundle refresh before querying
@@ -219,7 +219,7 @@ enum Commands {
         show: bool,
 
         /// Maximum matching macros/MMIO entries to return
-        #[arg(short, long, default_value_t = 30)]
+        #[arg(short, short_alias = 'n', long, default_value_t = 30)]
         limit: usize,
 
         /// Skip automatic incremental bundle refresh before querying
@@ -245,7 +245,7 @@ enum Commands {
         show: bool,
 
         /// Maximum matching sections to return
-        #[arg(short, long, default_value_t = 20)]
+        #[arg(short, short_alias = 'n', long, default_value_t = 20)]
         limit: usize,
 
         /// Skip automatic incremental bundle refresh before querying
@@ -267,7 +267,7 @@ enum Commands {
         bundle: Option<PathBuf>,
 
         /// Maximum cross-reference edges to return
-        #[arg(short, long, default_value_t = 40)]
+        #[arg(short, short_alias = 'n', long, default_value_t = 40)]
         limit: usize,
 
         /// Skip automatic incremental bundle refresh before querying
@@ -316,7 +316,7 @@ enum Commands {
         max_depth: usize,
 
         /// Maximum impacted callers to display
-        #[arg(short, long, default_value_t = 40)]
+        #[arg(short, short_alias = 'n', long, default_value_t = 40)]
         limit: usize,
 
         /// Skip automatic incremental bundle refresh before querying
@@ -336,16 +336,20 @@ enum Commands {
         #[arg(short, long)]
         bundle: Option<PathBuf>,
 
-        /// Filter search target (`all`, `symbols`, `types`, `calls`, `macros`, `xref`, `sections`)
+        /// Filter search target (`all`, `source`, `symbols`, `types`, `calls`, `macros`, `xref`, `sections`)
         #[arg(short, long, default_value = "all")]
         kind: String,
+
+        /// Search raw source files directly (`--kind source`)
+        #[arg(short = 'S', long = "source")]
+        source: bool,
 
         /// Case-insensitive matching
         #[arg(short, long)]
         ignore_case: bool,
 
         /// Maximum matches to return
-        #[arg(short, long, default_value_t = 50)]
+        #[arg(short, short_alias = 'n', long, default_value_t = 50)]
         limit: usize,
 
         /// Truncate long snippets for minimal token usage
@@ -737,25 +741,28 @@ fn main() -> Result<()> {
             query,
             bundle,
             kind,
+            source,
             ignore_case,
             limit,
             compact,
             no_sync,
         } => {
+            let effective_kind = if source { "source" } else { kind.as_str() };
             let (bundles, pattern) = resolve_cli_target_and_query(
                 &target_or_query,
                 query.as_deref(),
                 bundle.as_deref(),
                 no_sync,
             )?;
-            let hits = parallel_bundle_search(&bundles, &pattern, &kind, ignore_case, limit)?;
+            let hits =
+                parallel_bundle_search(&bundles, &pattern, effective_kind, ignore_case, limit)?;
             if hits.is_empty() {
-                println!("No search hits for pattern '{pattern}' (kind={kind}).");
+                println!("No search hits for pattern '{pattern}' (kind={effective_kind}).");
             } else {
                 println!(
                     "=== Search Hits for '{}' (kind={}, {} matches) ===",
                     pattern,
-                    kind,
+                    effective_kind,
                     hits.len()
                 );
                 for hit in &hits {
@@ -796,13 +803,7 @@ fn parse_vendor_mode(raw: &str) -> Result<VendorMode> {
 }
 
 fn derive_repo_stem(repo: &Path) -> String {
-    let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
-    canonical
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty() && *s != ".")
-        .unwrap_or("repo")
-        .to_string()
+    chipsrc_core::scanner::canonical_repo_root_and_name(repo).1
 }
 
 fn resolve_cli_target_and_query(

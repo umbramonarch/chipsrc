@@ -13,54 +13,16 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 
-SOURCE_EXTENSIONS = {
-    ".c",
-    ".h",
-    ".cc",
-    ".cpp",
-    ".cxx",
-    ".hpp",
-    ".hh",
-    ".hxx",
-    ".inl",
-    ".rs",
-    ".py",
-    ".pyi",
-    ".ts",
-    ".mts",
-    ".cts",
-    ".tsx",
-    ".js",
-    ".mjs",
-    ".cjs",
-    ".jsx",
-}
-
-IGNORED_PATH_PARTS = {".git", "target", "node_modules", "output", ".claude", ".factory"}
-
-
-def find_chipsrc_binary(project_dir: Path) -> str | None:
-    env_bin = os.environ.get("CHIPSRC_BIN")
-    if env_bin and Path(env_bin).is_file():
-        return env_bin
-
-    which_bin = shutil.which("chipsrc")
-    if which_bin:
-        return which_bin
-
-    plugin_root = Path(os.environ.get("CLAUDE_PLUGIN_ROOT", project_dir)).resolve()
-    exe_names = ["chipsrc.exe", "chipsrc"] if os.name == "nt" else ["chipsrc"]
-    for base in (project_dir, plugin_root):
-        for profile in ("release", "debug"):
-            for exe in exe_names:
-                candidate = base / "target" / profile / exe
-                if candidate.is_file():
-                    return str(candidate)
-    return None
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _hook_common import (  # noqa: E402
+    IGNORED_DIRS,
+    SOURCE_EXTENSIONS,
+    find_chipsrc_binary,
+    is_path_within,
+)
 
 
 def find_matching_bundles(project_dir: Path, edited_file: Path) -> list[tuple[Path, str, str]]:
@@ -86,7 +48,7 @@ def find_matching_bundles(project_dir: Path, edited_file: Path) -> list[tuple[Pa
                 if not source_root:
                     continue
                 src_path = Path(source_root).resolve()
-                if edited_resolved == src_path or src_path in edited_resolved.parents:
+                if is_path_within(edited_resolved, src_path):
                     matches.append((output_root, str(src_path), str(vendor_mode)))
             except Exception:
                 continue
@@ -121,7 +83,7 @@ def main() -> int:
     if edited_path.suffix.lower() not in SOURCE_EXTENSIONS:
         return 0
 
-    if any(part in IGNORED_PATH_PARTS for part in edited_path.parts):
+    if any(part in IGNORED_DIRS for part in edited_path.parts):
         return 0
 
     project_dir = Path(os.environ.get("CLAUDE_PROJECT_DIR", ".")).resolve()

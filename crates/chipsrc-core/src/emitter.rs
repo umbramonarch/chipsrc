@@ -1,45 +1,59 @@
 use crate::error::{ChipsrcError, Result};
 use crate::model::{
-    BundleIndexes, BundleMetaFile, ConvertConfig, IncrementalAstCache, RankedSymbol, RepoMetadata,
-    SanityReport, SectionShard,
+    BundleIndexes, BundleMetaFile, ConvertConfig, ExtractedType, FileScope, IncrementalAstCache,
+    RankedSymbol, RepoMetadata, SanityReport, SectionShard,
 };
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fs;
 use std::path::Path;
 
-/// Sanitizes a string for TSV emission by replacing tabs and newlines with spaces
-/// and collapsing consecutive whitespace into a single space.
+/// Sanitizes a string for TSV emission by replacing tabs, newlines, and control characters
+/// with spaces and collapsing consecutive whitespace into a single space.
 pub fn sanitize_tsv(value: &str) -> String {
     value
-        .replace(['\t', '\r', '\n'], " ")
+        .chars()
+        .map(|c| {
+            if c == '\t' || c == '\r' || c == '\n' || c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-/// Ensures `.claudeignore` in the workspace contains the bundle output directory so
-/// generating or refreshing bundles never invalidates Claude Code's prompt cache.
-pub fn ensure_claudeignore_entry(output_root: &Path) -> Result<bool> {
-    let target_root = if output_root
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        == Some("output")
-    {
-        output_root.parent().unwrap_or(output_root)
-    } else {
-        output_root
-    };
+/// Ensures `.claudeignore` in `repo_path` contains the bundle output directory ONLY when
+/// `output_root` resides inside `repo_path`, preventing out-of-tree conversions from mutating
+/// external directories.
+pub fn ensure_claudeignore_entry(repo_path: &Path, output_root: &Path) -> Result<bool> {
+    let canon_repo = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf());
+    let canon_out = output_root
+        .canonicalize()
+        .unwrap_or_else(|_| output_root.to_path_buf());
 
-    let dir_name = target_root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
+    let Ok(rel_out) = canon_out.strip_prefix(&canon_repo) else {
+        // Output directory is outside the repository tree; never mutate `.claudeignore`.
+        return Ok(false);
+    };
+    let Some(first_comp) = rel_out
+        .components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str())
+    else {
+        return Ok(false);
+    };
+    if first_comp.is_empty() || first_comp == "." || first_comp == ".." {
+        return Ok(false);
+    }
+
+    let dir_name = first_comp;
     let entry = format!("{dir_name}/");
-    let claudeignore_path = target_root
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.join(".claudeignore"))
-        .unwrap_or_else(|| Path::new(".claudeignore").to_path_buf());
+    let claudeignore_path = canon_repo.join(".claudeignore");
 
     let existing = fs::read_to_string(&claudeignore_path).unwrap_or_default();
     if existing
@@ -78,12 +92,27 @@ pub fn emit_bundle(
     create_dir(&sections_dir)?;
     create_dir(&index_dir)?;
 
-    // Clean stale .md files in output_dir/sections/
+    // Clean stale .md files in output_dir/sections/ that are no longer part of `sections`
+    let expected_md: FxHashSet<&str> = sections
+        .iter()
+        .map(|s| {
+            s.summary
+                .md_file
+                .strip_prefix("sections/")
+                .unwrap_or(s.summary.md_file.as_str())
+        })
+        .collect();
     if let Ok(entries) = fs::read_dir(&sections_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.extension().and_then(|s| s.to_str()) == Some("md") {
-                let _ = fs::remove_file(p);
+                let keep = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| expected_md.contains(name));
+                if !keep {
+                    let _ = fs::remove_file(p);
+                }
             }
         }
     }
@@ -124,14 +153,14 @@ pub fn emit_bundle(
     }
     write_file(&index_dir.join("sections.tsv"), &sec_tsv)?;
 
-    // 4. Write index/symbols.tsv
+    // 4. Write index/symbols.tsv (includes doc_summary as 15th column)
     let mut sym_tsv = String::from(
-        "symbol_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tsignature\tpagerank\tin_deg\tout_deg\tarch_layer\tscope\tsection_id\n",
+        "symbol_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tsignature\tpagerank\tin_deg\tout_deg\tarch_layer\tscope\tsection_id\tdoc_summary\n",
     );
     for rs in &indexes.symbols {
         let s = &rs.symbol;
         sym_tsv.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             sanitize_tsv(&s.symbol_id),
             sanitize_tsv(&s.name),
             s.kind.as_str(),
@@ -146,17 +175,18 @@ pub fn emit_bundle(
             s.arch_layer.as_str(),
             s.scope.as_str(),
             sanitize_tsv(&s.section_id),
+            sanitize_tsv(&s.doc_summary),
         ));
     }
     write_file(&index_dir.join("symbols.tsv"), &sym_tsv)?;
 
-    // 5. Write index/types.tsv
+    // 5. Write index/types.tsv (includes doc_summary as 12th column)
     let mut typ_tsv = String::from(
-        "type_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tfields_summary\tarch_layer\tscope\tsection_id\n",
+        "type_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tfields_summary\tarch_layer\tscope\tsection_id\tdoc_summary\n",
     );
     for t in &indexes.types {
         typ_tsv.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             sanitize_tsv(&t.type_id),
             sanitize_tsv(&t.name),
             t.kind.as_str(),
@@ -168,6 +198,7 @@ pub fn emit_bundle(
             t.arch_layer.as_str(),
             t.scope.as_str(),
             sanitize_tsv(&t.section_id),
+            sanitize_tsv(&t.doc_summary),
         ));
     }
     write_file(&index_dir.join("types.tsv"), &typ_tsv)?;
@@ -255,8 +286,8 @@ pub fn emit_bundle(
         write_file(&single_path, &combined)?;
     }
 
-    // 12. Ensure .claudeignore entry
-    let claudeignore_updated = ensure_claudeignore_entry(output_dir)?;
+    // 12. Ensure .claudeignore entry (only when output_dir is inside repo_path)
+    let claudeignore_updated = ensure_claudeignore_entry(&config.repo_path, output_dir)?;
     Ok(claudeignore_updated)
 }
 
@@ -433,6 +464,34 @@ fn build_master_index_markdown(
     }
     lines.push(String::new());
 
+    // Core Domain Types & Data Structures (Issue #45)
+    let top_types = select_core_domain_types(indexes);
+    if !top_types.is_empty() {
+        lines.push("## Core Domain Types & Data Structures".to_string());
+        lines.push(String::new());
+        lines.push("| Type | Kind | Layer | Refs | Location | Fields / Variants |".to_string());
+        lines.push("| --- | --- | --- | ---: | --- | --- |".to_string());
+        for (t, refs) in top_types.into_iter().take(12) {
+            let fields = if t.fields_summary.is_empty() {
+                "-".to_string()
+            } else {
+                escape_table(&t.fields_summary)
+            };
+            lines.push(format!(
+                "| `{}` | `{}` | `{}` | {} | `{}:{}-{}` | `{}` |",
+                escape_table(&t.name),
+                t.kind.as_str(),
+                t.arch_layer.as_str(),
+                refs,
+                t.file,
+                t.start_line,
+                t.end_line,
+                fields
+            ));
+        }
+        lines.push(String::new());
+    }
+
     // Active Hardware / MMIO & Vendor SDK Surface
     lines.push("## Active Hardware / MMIO & Vendor SDK Surface".to_string());
     lines.push(String::new());
@@ -536,6 +595,77 @@ fn select_god_nodes(indexes: &BundleIndexes) -> Vec<&RankedSymbol> {
     nodes
 }
 
+fn select_core_domain_types(indexes: &BundleIndexes) -> Vec<(&ExtractedType, usize)> {
+    if indexes.types.is_empty() {
+        return Vec::new();
+    }
+    let has_first_party = indexes
+        .types
+        .iter()
+        .any(|t| t.scope == FileScope::FirstParty);
+
+    let mut ref_counts: FxHashMap<&str, usize> = FxHashMap::default();
+    for t in &indexes.types {
+        if has_first_party && t.scope != FileScope::FirstParty {
+            continue;
+        }
+        ref_counts.entry(t.name.as_str()).or_insert(0);
+    }
+
+    for rs in &indexes.symbols {
+        if let Some(et) = rs.symbol.enclosing_type.as_deref() {
+            if let Some(cnt) = ref_counts.get_mut(et) {
+                *cnt += 1;
+            }
+        }
+        for tok in rs
+            .symbol
+            .signature
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(cnt) = ref_counts.get_mut(tok) {
+                *cnt += 1;
+            }
+        }
+    }
+
+    for t in &indexes.types {
+        for tok in t
+            .fields_summary
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|s| !s.is_empty() && *s != t.name)
+        {
+            if let Some(cnt) = ref_counts.get_mut(tok) {
+                *cnt += 1;
+            }
+        }
+    }
+
+    let mut ranked: Vec<(&ExtractedType, usize)> = indexes
+        .types
+        .iter()
+        .filter(|t| !has_first_party || t.scope == FileScope::FirstParty)
+        .map(|t| {
+            let refs = ref_counts.get(t.name.as_str()).copied().unwrap_or(0);
+            (t, refs)
+        })
+        .collect();
+
+    ranked.sort_by(|(ta, ra), (tb, rb)| {
+        rb.cmp(ra)
+            .then_with(|| {
+                tb.fields_summary
+                    .is_empty()
+                    .cmp(&ta.fields_summary.is_empty())
+                    .reverse()
+            })
+            .then_with(|| ta.file.cmp(&tb.file))
+            .then_with(|| ta.start_line.cmp(&tb.start_line))
+    });
+    ranked
+}
+
 fn escape_table(s: &str) -> String {
     sanitize_tsv(s).replace('|', "\\|")
 }
@@ -545,12 +675,38 @@ fn create_dir(path: &Path) -> Result<()> {
 }
 
 fn write_file(path: &Path, content: &str) -> Result<()> {
+    if content.len() <= 256 * 1024 {
+        if let Ok(existing) = fs::read(path) {
+            if existing == content.as_bytes() {
+                return Ok(());
+            }
+        }
+    }
     fs::write(path, content.as_bytes()).map_err(|source| ChipsrcError::io(path, source))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    struct TestTempDir(PathBuf);
+
+    impl TestTempDir {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("chipsrc_emitter_{label}_{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn test_sanitize_tsv_strips_tabs_and_newlines() {
@@ -559,24 +715,27 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_claudeignore_entry_idempotent() {
-        let tmp = std::env::temp_dir().join(format!("chipsrc_emitter_test_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp).expect("create temp dir");
-
-        let out_dir = tmp.join("output").join("demo_repo");
+    fn test_ensure_claudeignore_entry_idempotent_and_scoped_to_repo() {
+        let tmp = TestTempDir::new("claudeignore");
+        let out_dir = tmp.0.join("output").join("demo_repo");
         fs::create_dir_all(&out_dir).expect("create out_dir");
 
-        let first = ensure_claudeignore_entry(&out_dir).expect("first ensure");
+        let first = ensure_claudeignore_entry(&tmp.0, &out_dir).expect("first ensure");
         assert!(first);
 
-        let claudeignore = fs::read_to_string(tmp.join(".claudeignore")).expect("read ignore");
+        let claudeignore = fs::read_to_string(tmp.0.join(".claudeignore")).expect("read ignore");
         assert!(claudeignore.contains("# chipsrc generated bundles"));
         assert!(claudeignore.contains("output/"));
 
-        let second = ensure_claudeignore_entry(&out_dir).expect("second ensure");
+        let second = ensure_claudeignore_entry(&tmp.0, &out_dir).expect("second ensure");
         assert!(!second);
 
-        let _ = fs::remove_dir_all(&tmp);
+        // Out-of-tree output directory must NOT write `.claudeignore`
+        let external = TestTempDir::new("external_out");
+        let ext_out = external.0.join("qa_bundles").join("demo");
+        fs::create_dir_all(&ext_out).expect("create ext_out");
+        let ext_updated = ensure_claudeignore_entry(&tmp.0, &ext_out).expect("external ensure");
+        assert!(!ext_updated);
+        assert!(!external.0.join(".claudeignore").exists());
     }
 }

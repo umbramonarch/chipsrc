@@ -270,6 +270,15 @@ impl ResolutionTier {
     pub fn is_resolved(self) -> bool {
         !matches!(self, Self::ExternalOrMacro)
     }
+
+    /// High-confidence call resolution tiers (`SameFile`, `ImportResolved`, `UniqueGlobal`)
+    /// eligible for PageRank hub scoring, layer violation checks, and resolution metrics.
+    pub fn is_high_confidence(self) -> bool {
+        matches!(
+            self,
+            Self::SameFile | Self::ImportResolved | Self::UniqueGlobal
+        )
+    }
 }
 
 /// Vendor SDK handling mode for bundle generation.
@@ -589,6 +598,19 @@ pub struct LanguageStat {
     pub vendor_files: usize,
 }
 
+/// Lightweight per-file freshness stamp stored in `meta.json` so `status` and
+/// `auto_refresh_bundles` can detect modified files without deserializing `cache.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStamp {
+    pub rel_path: String,
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub mtime_secs: u64,
+    pub blake3_hash: String,
+    pub scope: FileScope,
+    pub arch_layer: ArchLayer,
+}
+
 /// Repository-level metadata serialized in `meta.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoMetadata {
@@ -613,6 +635,8 @@ pub struct RepoMetadata {
     pub elapsed_ms: u64,
     pub incremental_reused_files: usize,
     pub incremental_reparsed_files: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_stamps: Vec<FileStamp>,
 }
 
 /// Conversion health and token-efficiency report serialized in `meta.json`.
@@ -634,6 +658,12 @@ pub struct BundleMetaFile {
     pub sanity: SanityReport,
 }
 
+/// Default maximum source file size (4 MiB) indexed by `chipsrc`.
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Current schema version for `cache.json` (`IncrementalAstCache`).
+pub const CACHE_SCHEMA_VERSION: &str = "1.0.0";
+
 /// Configuration for repository conversion / indexing.
 #[derive(Debug, Clone)]
 pub struct ConvertConfig {
@@ -653,7 +683,7 @@ impl ConvertConfig {
             single_file: false,
             force: false,
             vendor_mode: VendorMode::Active,
-            max_file_bytes: 4 * 1024 * 1024, // 4 MiB default per-file cap
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
         }
     }
 }

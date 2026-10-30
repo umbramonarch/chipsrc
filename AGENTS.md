@@ -9,24 +9,22 @@ The architecture enforces a strict unidirectional **Layered DAG (`Layer 0` -> `L
 - `Cargo.toml`: Workspace manifest defining shared dependencies, lints, and release profiles.
 - `crates/chipsrc-core/`: Core source scanning, Tree-sitter AST parsing, symbol/type/call/macro extraction, cross-reference graph, incremental AST caching, query engine, and bundle emission library.
   - **Layer 0 — Domain Model (`src/model.rs`, `src/error.rs`)**: Pure canonical domain data structures (`LanguageKind`, `FileScope`, `ArchLayer`, `VendorMode`, `ScannedFile`, `ExtractedSymbol`, `ExtractedType`, `ExtractedMacro`, `ParsedFileUnit`, `IncrementalAstCache`, `RankedSymbol`, `ResolvedCallEdge`, `XrefEntry`, `SectionShard`, `RepoMetadata`, `SanityReport`, `ConvertConfig`, `ConversionBundle`, `InspectReport`, `SearchHit`, `BundleStatusEntry`) and typed error enum (`ChipsrcError`).
-  - **Layer 1 — Ingestion & AST Parsing (`src/scanner.rs`, `src/parser.rs`)**:
+  - **Layer 1 — Ingestion, MMIO & AST Parsing (`src/mmio.rs`, `src/scanner.rs`, `src/parser.rs`)**:
+    - `src/mmio.rs`: Hardware/MMIO register address classification, datasheet hex normalization (`0x400` <-> `400h`), peripheral `PERIPH->REG` / `*(volatile ...)` extraction, and linker section attribute detection.
     - `src/scanner.rs`: Parallel `.gitignore`-aware directory walker (`ignore` + `rayon`), `FirstParty` / `VendorSdk` / `Test` scope classification, architectural layer detection (`app`, `bsp`, `drvs`, `config`, `libs`, `domain`, `services`, `api`, `core`, `cli`, `vendor_hal`, `tests`), and deterministic BLAKE3 per-file & Merkle repository fingerprinting.
-    - `src/parser.rs`: Multi-language Tree-sitter dispatcher (`C`, `C++`, `Rust`, `Python`, `TypeScript`, `TSX`, `JavaScript`, `JSX`) with incremental per-file AST caching (`cache.json`) so code edits only re-parse changed files.
-  - **Layer 2 — Structural Extractors (`src/symbols.rs`, `src/types.rs`, `src/calls.rs`, `src/macros.rs`)**:
-    - `src/symbols.rs`: Extracts functions, methods, constructors, entrypoints, and ISR handlers (`index/symbols.tsv`).
-    - `src/types.rs`: Extracts `struct`, `enum`, `union`, `typedef`, `trait`, `interface`, and `class` definitions with ordered fields and types (`index/types.tsv`).
-    - `src/calls.rs`: Extracts static `caller -> callee` call-graph edges with resolution provenance (`SameFile`, `ImportResolved`, `UniqueGlobal`, `AmbiguousName`, `ExternalOrMacro`) (`index/calls.tsv`).
-    - `src/macros.rs`: Extracts `#define` constants, function-like macros, `const` / `constexpr` items, bitmasks, and MMIO hex register addresses (`index/macros.tsv`).
-  - **Layer 3 — Cross-Reference Graph & Module Sharding (`src/xref.rs`, `src/sharding.rs`)**:
-    - `src/xref.rs`: Builds the Unified Code + Hardware Cross-Reference Graph (`index/xref.tsv`), computes PageRank (`god_nodes`), Tarjan SCC cycles, upward layer-violation edges, and active vendor SDK / MMIO surfaces (`--vendor-mode active|all|none`).
-    - `src/sharding.rs`: Groups source files by architectural module hierarchy into compact Markdown signature skeletons (`sections/*.md`) that omit verbose function bodies while preserving docstrings, signatures, type definitions, and `file:start_line-end_line` coordinates.
-  - **Layer 4 — Emission, Sanity & 1-Turn Query Engine (`src/emitter.rs`, `src/sanity.rs`, `src/query.rs`)**:
-    - `src/emitter.rs`: Writes `INDEX.md`, `sections/*.md`, `index/*.tsv`, `meta.json`, `cache.json`, `--single-file`, and `.claudeignore`.
-    - `src/sanity.rs`: Computes token-compression ratio, clean parse coverage, call resolution ratio, and structural sanity score (0–100).
-    - `src/query.rs`: Multi-bundle discovery, automatic stale-bundle incremental refresh (`auto_refresh_bundles`), C/vendor hex & peripheral prefix normalization (`0x400` <-> `400h`, `GPIO_MODER` <-> `GPIO->MODER`), 1-turn domain queries (`sym`, `callers`, `callees`, `type`, `macro`/`reg`/`mmio`, `section`, `xref`), and parallel SIMD (`memchr` + `rayon`) search.
+    - `src/parser.rs`: Multi-language Tree-sitter dispatcher (`C`, `C++`, `Rust`, `Python`, `TypeScript`, `TSX`, `JavaScript`, `JSX`, plus `.astro`/`.vue`/`.svelte` SFCs) with incremental per-file AST caching (`cache.json`) so code edits only re-parse changed files.
+  - **Layer 2 — Call Resolution, Graph Analysis, Sharding & Sanity (`src/resolver.rs`, `src/graph.rs`, `src/sharder.rs`, `src/sanity.rs`)**:
+    - `src/resolver.rs`: Resolves static `caller -> callee` call-graph edges with 5-tier provenance (`SameFile`, `ImportResolved`, `UniqueGlobal`, `AmbiguousName`, `ExternalOrMacro`), builds the Unified Code + Hardware Cross-Reference Graph (`index/xref.tsv`), and computes active vendor SDK / MMIO surfaces (`--vendor-mode active|all|none`).
+    - `src/graph.rs`: Runs 25-iteration deterministic PageRank (`god_nodes`), iterative Tarjan SCC cycle detection, entrypoint/ISR identification, and cross-layer dependency edge analysis (`from_layer -> to_layer` with upward violation detection).
+    - `src/sharder.rs`: Groups source files by architectural module hierarchy (auto-splitting oversized modules into cohesive sub-shards) into compact Markdown signature skeletons (`sections/*.md`) that omit verbose function bodies while preserving docstrings, signatures, type definitions, and `file:start_line-end_line` coordinates.
+    - `src/sanity.rs`: Computes token-compression ratio, clean parse coverage, high-confidence call resolution ratio, and structural sanity score (0–100).
+  - **Layer 3 — Bundle Emission & 1-Turn Query Engine (`src/emitter.rs`, `src/query.rs`)**:
+    - `src/emitter.rs`: Writes `INDEX.md`, `sections/*.md`, `index/*.tsv`, `meta.json`, `cache.json`, `--single-file`, and `.claudeignore` (only when output is inside the target repository).
+    - `src/query.rs`: Multi-bundle discovery, automatic stale-bundle incremental refresh (`auto_refresh_bundles`), C/vendor hex & peripheral prefix normalization (`0x400` <-> `400h`, `GPIO_MODER` <-> `GPIO->MODER`), 1-turn domain queries (`sym`, `callers`, `callees`, `path`, `impact`, `type`, `macro`/`reg`/`mmio`, `section`, `xref`), and parallel SIMD (`memchr` + `rayon`) index & raw-source search.
+  - **Layer 4 — Library Facade (`src/lib.rs`)**: Orchestrates `inspect_repo`, `convert_repo`, `ensure_repo`, and `auto_refresh_bundles`.
 - **Layer 5 — CLI & Auto-Sync Plugin (`crates/chipsrc-cli/`, `.claude-plugin/`, `hooks/`, `scripts/`, `skills/chipsrc/`)**:
-  - `crates/chipsrc-cli/src/main.rs`: Command-line interface binary (`chipsrc`) implementing `convert` (alias `index`), `ensure`, `status`, `inspect`, `sym`, `callers`, `callees`, `type`, `macro` (aliases `reg`, `mmio`), `section`, `xref` (alias `explain`), and `search`.
-  - `.claude-plugin/`, `hooks/hooks.json`, `scripts/session_start_hook.py`, `scripts/post_edit_hook.py`, `skills/chipsrc/SKILL.md`: Hybrid Claude Code plugin with `SessionStart` bundle discovery/refresh hook and `PostToolUse` (`Edit|Write|MultiEdit`) incremental `<50ms` auto-sync hook.
+  - `crates/chipsrc-cli/src/main.rs`: Command-line interface binary (`chipsrc`) implementing `convert` (alias `index`), `ensure`, `status`, `inspect`, `sym`, `callers`, `callees`, `path`, `impact`, `type`, `macro` (aliases `reg`, `mmio`), `section`, `xref` (alias `explain`), and `search` (`-S`/`--source`).
+  - `.claude-plugin/`, `hooks/hooks.json`, `scripts/_hook_common.py`, `scripts/session_start_hook.py`, `scripts/post_edit_hook.py`, `skills/chipsrc/SKILL.md`: Hybrid Claude Code plugin with `SessionStart` bundle discovery/refresh hook and `PostToolUse` (`Edit|Write|MultiEdit`) incremental `<50ms` auto-sync hook.
 
 ## Build, Test, and Development Commands
 

@@ -23,38 +23,69 @@ fn module_layer(module: &str) -> Option<u8> {
     }
 }
 
+/// Masks standard string literals (`"..."`) so module names inside format strings or error
+/// messages are never mistaken for code imports.
+fn strip_string_literals_in_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    let mut in_str = false;
+    while let Some(c) = chars.next() {
+        if in_str {
+            if c == '\\' {
+                let _ = chars.next();
+            } else if c == '"' {
+                in_str = false;
+                out.push('"');
+            } else {
+                out.push(' ');
+            }
+        } else if c == '"' {
+            in_str = true;
+            out.push('"');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Extracts all referenced `crate::<module>` dependencies from production code (before `#[cfg(test)]`).
 fn parse_crate_dependencies(source: &str) -> BTreeSet<String> {
     let prod_source = source.split("#[cfg(test)]").next().unwrap_or(source);
     let mut deps = BTreeSet::new();
 
-    for line in prod_source.lines() {
-        let trimmed = line.trim();
+    for raw_line in prod_source.lines() {
+        let trimmed = raw_line.trim();
         if trimmed.starts_with("//") {
             continue;
         }
-        let mut rest = trimmed;
-        while let Some(pos) = rest.find("crate::") {
-            let after = &rest[pos + "crate::".len()..];
-            let ident: String = after
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            if module_layer(&ident).is_some() {
-                deps.insert(ident);
-            }
-            rest = after;
-        }
-    }
+        let clean_line = strip_string_literals_in_line(trimmed);
+        let code_part = clean_line.split("//").next().unwrap_or(&clean_line);
 
-    // For `lib.rs`, also detect direct `module::` invocations
-    for known in [
-        "error", "model", "mmio", "scanner", "parser", "resolver", "graph", "sharder", "sanity",
-        "emitter", "query",
-    ] {
-        let pat = format!("{known}::");
-        if prod_source.contains(&pat) {
-            deps.insert(known.to_string());
+        for prefix in ["crate::", "super::"] {
+            let mut rest = code_part;
+            while let Some(pos) = rest.find(prefix) {
+                let after = &rest[pos + prefix.len()..];
+                let ident: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if module_layer(&ident).is_some() {
+                    deps.insert(ident);
+                }
+                rest = after;
+            }
+        }
+
+        // For `lib.rs`, also detect direct `module::` invocations outside strings/comments
+        for known in [
+            "error", "model", "mmio", "scanner", "parser", "resolver", "graph", "sharder",
+            "sanity", "emitter", "query",
+        ] {
+            let pat = format!("{known}::");
+            if code_part.contains(&pat) {
+                deps.insert(known.to_string());
+            }
         }
     }
 

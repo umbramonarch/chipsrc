@@ -11,6 +11,24 @@ use chipsrc_core::{
 use std::fs;
 use std::path::{Path, PathBuf};
 
+struct TestTempDir(PathBuf);
+
+impl TestTempDir {
+    fn new(label: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("chipsrc_integ_{label}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        Self(dir)
+    }
+}
+
+impl Drop for TestTempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn create_synthetic_repo(root: &Path) {
     let _ = fs::remove_dir_all(root);
     fs::create_dir_all(root.join("src/app")).unwrap();
@@ -172,9 +190,9 @@ export function formatMotorStatus(status: MotorStatus): string {
 
 #[test]
 fn test_full_pipeline_vendor_modes_incremental_sync_and_queries() {
-    let base = std::env::temp_dir().join(format!("chipsrc_integ_test_{}", std::process::id()));
-    let repo_dir = base.join("synth_fw");
-    let output_root = base.join("output");
+    let base = TestTempDir::new("pipeline");
+    let repo_dir = base.0.join("synth_fw");
+    let output_root = repo_dir.join("output");
     let bundle_dir = output_root.join("synth_fw");
 
     create_synthetic_repo(&repo_dir);
@@ -201,12 +219,13 @@ fn test_full_pipeline_vendor_modes_incremental_sync_and_queries() {
     assert_eq!(bundle.metadata.incremental_reused_files, 0);
     assert!(bundle.sanity.score >= 85);
 
-    // Verify all emitted files exist
+    // Verify all emitted files exist (and `.claudeignore` is written inside `repo_dir`, not parent `base`)
     assert!(bundle_dir.join("INDEX.md").is_file());
     assert!(bundle_dir.join("meta.json").is_file());
     assert!(bundle_dir.join("cache.json").is_file());
     assert!(bundle_dir.join("synth_fw.md").is_file());
-    assert!(base.join(".claudeignore").is_file());
+    assert!(repo_dir.join(".claudeignore").is_file());
+    assert!(!base.0.join(".claudeignore").is_file());
 
     for tsv in [
         "sections.tsv",
@@ -345,16 +364,13 @@ int main(void) {
     assert_eq!(none_bundle.metadata.vendor_mode, VendorMode::None);
     assert_eq!(none_bundle.metadata.total_files, 6);
     assert_eq!(none_bundle.metadata.vendor_files, 0);
-
-    let _ = fs::remove_dir_all(&base);
 }
 
 #[test]
 fn test_blueprint_onboarding_overrides_cache_invalidation_and_empty_repo() {
-    let base = std::env::temp_dir().join(format!("chipsrc_bp_test_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&base);
-    let repo_dir = base.join("custom_repo");
-    let bundle_dir = base.join("output").join("custom_repo");
+    let base = TestTempDir::new("blueprint");
+    let repo_dir = base.0.join("custom_repo");
+    let bundle_dir = base.0.join("output").join("custom_repo");
 
     fs::create_dir_all(repo_dir.join("custom_hw/fpga_box")).unwrap();
     fs::create_dir_all(repo_dir.join("packages/telemetry")).unwrap();
@@ -535,23 +551,20 @@ void custom_boot_entry(void) {
     assert_eq!(boot_sym_updated.symbol.arch_layer, ArchLayer::Drivers);
 
     // 4. Empty/fresh repository with `.chipsrc.json` must succeed on inspect_repo
-    let empty_dir = base.join("empty_with_bp");
+    let empty_dir = base.0.join("empty_with_bp");
     fs::create_dir_all(&empty_dir).unwrap();
     fs::write(empty_dir.join(".chipsrc.json"), "{}\n").unwrap();
     let empty_report =
         inspect_repo(&empty_dir, VendorMode::Active).expect("inspect empty repo with bp");
     assert!(empty_report.has_blueprint);
     assert_eq!(empty_report.total_files, 0);
-
-    let _ = fs::remove_dir_all(&base);
 }
 
 #[test]
 fn test_local_receiver_binding_fn_ptr_dispatch_mutability_and_path_impact_queries() {
-    let base = std::env::temp_dir().join(format!("chipsrc_ideas_test_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&base);
-    let repo_dir = base.join("fw_ideas");
-    let bundle_dir = base.join("output").join("fw_ideas");
+    let base = TestTempDir::new("ideas");
+    let repo_dir = base.0.join("fw_ideas");
+    let bundle_dir = base.0.join("output").join("fw_ideas");
 
     fs::create_dir_all(repo_dir.join("src/app")).unwrap();
     fs::create_dir_all(repo_dir.join("src/drvs")).unwrap();
@@ -787,6 +800,4 @@ int main(void) {
         impact_out.contains("uart_error_IRQHandler"),
         "Impact should reach ISR uart_error_IRQHandler:\n{impact_out}"
     );
-
-    let _ = fs::remove_dir_all(&base);
 }
