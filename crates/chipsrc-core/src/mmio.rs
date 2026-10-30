@@ -1,7 +1,7 @@
 //! Layer 1 — Hardware MMIO address normalization, bitmask classification,
 //! and fast register/linker construct extraction.
 
-use crate::model::{ArchLayer, ExtractedMacro, FileScope, MacroKind, RawXrefSite};
+use crate::model::{ArchLayer, ExtractedMacro, FileScope, MacroKind, RawXrefSite, RepoBlueprint};
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -146,11 +146,28 @@ fn format_cleaned_hex_digits(raw_digits: &str) -> Option<String> {
     }
 }
 
+fn parse_hex_u64(raw: &str) -> Option<u64> {
+    let norm = normalize_hex_literal(raw)?;
+    let digits = norm.strip_prefix("0x")?;
+    u64::from_str_radix(digits, 16).ok()
+}
+
 /// Classifies `#define` macros and `const` declarations into domain categories.
 pub fn classify_macro_value(
     name: &str,
     raw_value: &str,
     is_fn_like: bool,
+) -> (MacroKind, Option<String>, String) {
+    classify_macro_value_with_blueprint(name, raw_value, is_fn_like, None)
+}
+
+/// Classifies `#define` macros and `const` declarations into domain categories,
+/// checking custom `mmio_ranges` from `.chipsrc.json` (`RepoBlueprint`) when provided.
+pub fn classify_macro_value_with_blueprint(
+    name: &str,
+    raw_value: &str,
+    is_fn_like: bool,
+    blueprint: Option<&RepoBlueprint>,
 ) -> (MacroKind, Option<String>, String) {
     let trimmed_val = raw_value.trim();
     let upper_name = name.to_ascii_uppercase();
@@ -182,6 +199,25 @@ pub fn classify_macro_value(
         || trimmed_val.contains("volatile uint")
         || trimmed_val.contains("volatile u32")
         || (trimmed_val.contains("*(") && trimmed_val.contains("volatile"));
+
+    // 0. Check custom MMIO ranges from `.chipsrc.json`
+    if let (Some(bp), Some(v)) = (blueprint, hex_val) {
+        if !is_mask_name {
+            if let Some(custom_range) = bp.mmio_ranges.iter().find(|r| {
+                match (parse_hex_u64(&r.start), parse_hex_u64(&r.end)) {
+                    (Some(s), Some(e)) => (s..=e).contains(&v),
+                    _ => false,
+                }
+            }) {
+                let desc = if custom_range.name.is_empty() {
+                    "MMIO register/base address".to_string()
+                } else {
+                    format!("MMIO register/base address ({})", custom_range.name)
+                };
+                return (MacroKind::MmioAddress, hex_addr, desc);
+            }
+        }
+    }
 
     // 1. Check MMIO address
     let is_mmio_range = hex_val.is_some_and(|v| {
@@ -242,6 +278,50 @@ pub fn classify_macro_value(
     )
 }
 
+/// Inspects tokens immediately before `match_start_byte` and immediately after `match_end_byte`
+/// to classify whether a hardware register access (`PERIPH->REG` or `*(volatile ...)`) is a
+/// write/mutation (`=`, `|=`, `&=`, `^=`, `+=`, `-=`, `<<=`, `>>=`, `++`, `--`) vs. a read.
+pub fn is_register_write_in_line(
+    line: &str,
+    match_start_byte: usize,
+    match_end_byte: usize,
+) -> bool {
+    let before = line
+        .get(..match_start_byte)
+        .unwrap_or("")
+        .trim_end_matches(|c: char| c.is_whitespace() || c == '(');
+    if before.ends_with("++") || before.ends_with("--") {
+        return true;
+    }
+
+    let after = line
+        .get(match_end_byte..)
+        .unwrap_or("")
+        .trim_start_matches(|c: char| c.is_whitespace() || c == ')');
+
+    if after.starts_with("++")
+        || after.starts_with("--")
+        || after.starts_with("|=")
+        || after.starts_with("&=")
+        || after.starts_with("^=")
+        || after.starts_with("+=")
+        || after.starts_with("-=")
+        || after.starts_with("*=")
+        || after.starts_with("/=")
+        || after.starts_with("%=")
+        || after.starts_with("<<=")
+        || after.starts_with(">>=")
+    {
+        return true;
+    }
+
+    if after.starts_with('=') && !after.starts_with("==") {
+        return true;
+    }
+
+    false
+}
+
 /// Scans source text line-by-line for hardware peripheral struct register dereferences
 /// (`PERIPH->REG`), volatile MMIO pointer dereferences, and linker section placement attributes.
 pub fn extract_mmio_and_linker_constructs(
@@ -298,10 +378,25 @@ pub fn extract_mmio_and_linker_constructs(
 
         if !is_define_line && memchr::memmem::find(trimmed.as_bytes(), b"->").is_some() {
             for caps in periph_re.captures_iter(trimmed) {
+                let Some(m0) = caps.get(0) else {
+                    continue;
+                };
                 let periph = &caps[1];
                 let reg = &caps[2];
                 let full_access = format!("{periph}->{reg}");
                 let hex_addr = normalize_hex_literal(trimmed);
+                let is_write = is_register_write_in_line(trimmed, m0.start(), m0.end());
+                let (category, description) = if is_write {
+                    (
+                        "mmio_write",
+                        format!("Hardware register write {periph}->{reg}"),
+                    )
+                } else {
+                    (
+                        "mmio_read",
+                        format!("Hardware register read {periph}->{reg}"),
+                    )
+                };
 
                 macros.push(ExtractedMacro {
                     name: full_access.clone(),
@@ -313,7 +408,7 @@ pub fn extract_mmio_and_linker_constructs(
                     scope,
                     arch_layer,
                     section_id: section_id.to_string(),
-                    description: format!("Hardware register access {periph}->{reg}"),
+                    description,
                 });
 
                 xrefs.push(RawXrefSite {
@@ -321,7 +416,7 @@ pub fn extract_mmio_and_linker_constructs(
                     line: line_num,
                     enclosing_symbol: None,
                     target_name: full_access,
-                    category: "mmio_access".to_string(),
+                    category: category.to_string(),
                     context: trimmed.to_string(),
                 });
             }
@@ -330,9 +425,18 @@ pub fn extract_mmio_and_linker_constructs(
         // Check volatile MMIO pointer dereferences
         if !is_define_line && memchr::memmem::find(trimmed.as_bytes(), b"volatile").is_some() {
             for caps in volatile_re.captures_iter(trimmed) {
+                let Some(m0) = caps.get(0) else {
+                    continue;
+                };
                 let raw_target = &caps[1];
                 let hex_addr = normalize_hex_literal(raw_target);
                 let target_name = hex_addr.clone().unwrap_or_else(|| raw_target.to_string());
+                let is_write = is_register_write_in_line(trimmed, m0.start(), m0.end());
+                let (category, description) = if is_write {
+                    ("mmio_write", "Volatile MMIO pointer write".to_string())
+                } else {
+                    ("mmio_read", "Volatile MMIO pointer read".to_string())
+                };
 
                 macros.push(ExtractedMacro {
                     name: target_name.clone(),
@@ -344,7 +448,7 @@ pub fn extract_mmio_and_linker_constructs(
                     scope,
                     arch_layer,
                     section_id: section_id.to_string(),
-                    description: "Volatile MMIO pointer dereference".to_string(),
+                    description,
                 });
 
                 xrefs.push(RawXrefSite {
@@ -352,7 +456,7 @@ pub fn extract_mmio_and_linker_constructs(
                     line: line_num,
                     enclosing_symbol: None,
                     target_name,
-                    category: "mmio_access".to_string(),
+                    category: category.to_string(),
                     context: trimmed.to_string(),
                 });
             }
@@ -518,7 +622,9 @@ mod tests {
 __attribute__((section(".ramfunc")))
 void motor_set_pwm(uint32_t duty) {
     VENDOR_TIM1->CCR1 = duty;
-    GPIOA->BSRR = (1U << 5);
+    if (VENDOR_TIM1->SR & 1U) {
+        GPIOA->BSRR = (1U << 5);
+    }
     *(volatile uint32_t *)0x40021000 = 0x1;
 }
 "#;
@@ -544,6 +650,9 @@ void motor_set_pwm(uint32_t duty) {
             .any(|m| m.kind == MacroKind::RegisterAccess && m.name == "0x40021000"));
         assert!(xrefs
             .iter()
-            .any(|x| x.category == "mmio_access" && x.target_name == "VENDOR_TIM1->CCR1"));
+            .any(|x| x.category == "mmio_write" && x.target_name == "VENDOR_TIM1->CCR1"));
+        assert!(xrefs
+            .iter()
+            .any(|x| x.category == "mmio_read" && x.target_name == "VENDOR_TIM1->SR"));
     }
 }

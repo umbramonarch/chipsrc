@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use chipsrc_core::query::{
-    parallel_bundle_search, query_callees, query_callers, query_macros, query_sections,
-    query_symbols, query_types, query_xref, resolve_bundles, resolve_target_and_query,
-    workspace_status,
+    parallel_bundle_search, query_call_path, query_callees, query_callers, query_impact,
+    query_macros, query_sections, query_symbols, query_types, query_xref, resolve_bundles,
+    resolve_target_and_query, workspace_status,
 };
 use chipsrc_core::{
     auto_refresh_bundles, convert_repo, ensure_repo, inspect_repo, ConversionBundle, ConvertConfig,
@@ -275,6 +275,55 @@ enum Commands {
         no_sync: bool,
     },
 
+    /// Find the shortest static call path (`from -> ... -> to`) across the call graph
+    Path {
+        /// Either `<from>` (searches `./output`) or `<bundle_or_repo>` followed by `<from>` and `<to>`
+        from_or_target: String,
+
+        /// Either `<to>` or `<from>` when the first argument is a bundle/repo path
+        to_or_from: String,
+
+        /// Optional `<to>` when the first argument is a bundle/repo path
+        to: Option<String>,
+
+        /// Explicit bundle or root directory to search
+        #[arg(short, long)]
+        bundle: Option<PathBuf>,
+
+        /// Maximum BFS hop depth to search
+        #[arg(short = 'd', long, default_value_t = 8)]
+        max_depth: usize,
+
+        /// Skip automatic incremental bundle refresh before querying
+        #[arg(long)]
+        no_sync: bool,
+    },
+
+    /// Compute the reverse-BFS blast radius (`callee <- caller <- ...`) of modifying a symbol
+    Impact {
+        /// Either `<symbol>` or `<bundle_or_repo>` followed by `<symbol>`
+        target_or_query: String,
+
+        /// Optional `<symbol>` when the first positional argument is a bundle/repo path
+        query: Option<String>,
+
+        /// Explicit bundle or root directory to search
+        #[arg(short, long)]
+        bundle: Option<PathBuf>,
+
+        /// Maximum reverse-BFS hop depth
+        #[arg(short = 'd', long, default_value_t = 5)]
+        max_depth: usize,
+
+        /// Maximum impacted callers to display
+        #[arg(short, long, default_value_t = 40)]
+        limit: usize,
+
+        /// Skip automatic incremental bundle refresh before querying
+        #[arg(long)]
+        no_sync: bool,
+    },
+
     /// Parallel SIMD + Regex search across all indexed Agent Codebase Bundles
     Search {
         /// Either `<pattern>` or `<bundle_or_repo>` followed by `<pattern>`
@@ -445,6 +494,14 @@ fn main() -> Result<()> {
             println!("Source Root    : {}", report.source_root);
             println!("Fingerprint    : {}", report.fingerprint);
             println!(
+                "Blueprint      : {}",
+                if report.has_blueprint {
+                    "present (.chipsrc.json)"
+                } else {
+                    "none"
+                }
+            );
+            println!(
                 "Files          : {} total ({} first-party, {} vendor SDK, {} test)",
                 report.total_files,
                 report.first_party_files,
@@ -469,6 +526,35 @@ fn main() -> Result<()> {
                     lang.first_party_files,
                     lang.vendor_files,
                     lang.lines
+                );
+            }
+
+            if !report.has_blueprint
+                && (!report.unclassified_dirs.is_empty()
+                    || !report.detected_workspaces.is_empty()
+                    || !report.candidate_c_macros.is_empty())
+            {
+                println!("\n=== Onboarding Digest (.chipsrc.json missing) ===");
+                if !report.unclassified_dirs.is_empty() {
+                    println!(
+                        "  Unclassified Dirs  : {}",
+                        report.unclassified_dirs.join(", ")
+                    );
+                }
+                if !report.detected_workspaces.is_empty() {
+                    println!(
+                        "  Workspace Roots    : {}",
+                        report.detected_workspaces.join(", ")
+                    );
+                }
+                if !report.candidate_c_macros.is_empty() {
+                    println!(
+                        "  Candidate C Macros : {}",
+                        report.candidate_c_macros.join(", ")
+                    );
+                }
+                println!(
+                    "  Tip                : Write a root `.chipsrc.json` (`scopes`, `layers`, `shards`, `c_qualifiers`, `mmio_ranges`) to lock in repo architecture before running `chipsrc ensure`."
                 );
             }
         }
@@ -596,6 +682,53 @@ fn main() -> Result<()> {
                 no_sync,
             )?;
             let out = query_xref(&bundles, &q, limit)?;
+            print!("{out}");
+        }
+
+        Commands::Path {
+            from_or_target,
+            to_or_from,
+            to,
+            bundle,
+            max_depth,
+            no_sync,
+        } => {
+            let (bundles, from_sym, to_sym) = if let Some(explicit_to) = to {
+                let (bundles, from_sym) = resolve_cli_target_and_query(
+                    &from_or_target,
+                    Some(&to_or_from),
+                    bundle.as_deref(),
+                    no_sync,
+                )?;
+                (bundles, from_sym, explicit_to)
+            } else {
+                let (bundles, from_sym) = resolve_cli_target_and_query(
+                    &from_or_target,
+                    None,
+                    bundle.as_deref(),
+                    no_sync,
+                )?;
+                (bundles, from_sym, to_or_from)
+            };
+            let out = query_call_path(&bundles, &from_sym, &to_sym, max_depth)?;
+            print!("{out}");
+        }
+
+        Commands::Impact {
+            target_or_query,
+            query,
+            bundle,
+            max_depth,
+            limit,
+            no_sync,
+        } => {
+            let (bundles, sym) = resolve_cli_target_and_query(
+                &target_or_query,
+                query.as_deref(),
+                bundle.as_deref(),
+                no_sync,
+            )?;
+            let out = query_impact(&bundles, &sym, max_depth, limit)?;
             print!("{out}");
         }
 

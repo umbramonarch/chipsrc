@@ -80,8 +80,9 @@ pub fn resolve_and_link(
         by_file_name_line.insert((sym.file.as_str(), sym.name.as_str(), sym.start_line), idx);
     }
 
-    // 3. Resolve every RawCallSite across units
+    // 3. Resolve every RawCallSite and function-pointer candidate across units
     let mut calls: Vec<ResolvedCallEdge> = Vec::new();
+    let mut promoted_fn_ptr_xrefs: Vec<XrefEntry> = Vec::new();
 
     // File -> language lookup used to keep cross-language name collisions from resolving.
     let mut file_languages: FxHashMap<&str, LanguageKind> = FxHashMap::default();
@@ -93,8 +94,10 @@ pub fn resolve_and_link(
     for unit in units {
         let unit_sec_id = infer_unit_section_id(unit);
         let unit_language = unit.scanned.language;
+        let mut direct_call_sites: FxHashSet<(usize, &str)> = FxHashSet::default();
 
         for raw in &unit.raw_calls {
+            direct_call_sites.insert((raw.call_line, raw.callee_name.as_str()));
             let caller_idx = by_file_name_line
                 .get(&(
                     raw.caller_file.as_str(),
@@ -129,6 +132,7 @@ pub fn resolve_and_link(
                 .or_else(|| raw.callee_name.rsplit_once("->"))
                 .map(|(_, s)| s)
                 .unwrap_or(raw.callee_name.as_str());
+            direct_call_sites.insert((raw.call_line, short_callee));
 
             let candidates = by_name
                 .get(raw.callee_name.as_str())
@@ -177,6 +181,96 @@ pub fn resolve_and_link(
                 section_id: caller_section_id,
             });
         }
+
+        // Idea 4: Precision-filter `fn_ptr_candidate` raw xrefs against known repository symbols.
+        // Only candidates that resolve to an actual function/method/ISR/entrypoint in a compatible
+        // language family are promoted to `fn_ptr_ref` xrefs and synthesized `ResolvedCallEdge`s.
+        for rx in &unit.raw_xrefs {
+            if rx.category != "fn_ptr_candidate" {
+                continue;
+            }
+            let target_name = rx.target_name.as_str();
+            if direct_call_sites.contains(&(rx.line, target_name))
+                || is_language_builtin(target_name, Some(unit_language))
+                || is_ubiquitous_member_name(target_name)
+            {
+                continue;
+            }
+
+            let Some(candidates) = by_name.get(target_name) else {
+                continue;
+            };
+            let candidate_indices: Vec<usize> = candidates
+                .iter()
+                .copied()
+                .filter(|&idx| {
+                    let sym = &symbols[idx];
+                    !(sym.file == rx.file && rx.line == sym.start_line)
+                        && languages_compatible(
+                            Some(unit_language),
+                            resolve_file_language(sym.file.as_str(), &file_languages),
+                        )
+                })
+                .collect();
+            if candidate_indices.is_empty() {
+                continue;
+            }
+
+            let caller_name = rx.enclosing_symbol.as_deref().unwrap_or("<module_init>");
+            let caller_idx = by_file_name.get(&(rx.file.as_str(), caller_name)).copied();
+            let (caller_id, caller_section_id, caller_enclosing_type) = match caller_idx {
+                Some(idx) => (
+                    symbols[idx].symbol_id.clone(),
+                    symbols[idx].section_id.clone(),
+                    symbols[idx].enclosing_type.as_deref(),
+                ),
+                None => (
+                    format!("{}::{}", rx.file, caller_name),
+                    unit_sec_id.clone(),
+                    None,
+                ),
+            };
+
+            let (callee_id, tier) = resolve_callee_candidates(
+                CallerSite {
+                    file: rx.file.as_str(),
+                    section_id: &caller_section_id,
+                    language: Some(unit_language),
+                    enclosing_type: caller_enclosing_type,
+                },
+                target_name,
+                None,
+                &unit.imports,
+                &candidate_indices,
+                &symbols,
+            );
+
+            if !tier.is_resolved() {
+                continue;
+            }
+
+            calls.push(ResolvedCallEdge {
+                caller_id: caller_id.clone(),
+                caller_name: caller_name.to_string(),
+                callee_name: rx.target_name.clone(),
+                callee_id,
+                file: rx.file.clone(),
+                line: rx.line,
+                tier,
+                section_id: caller_section_id.clone(),
+            });
+
+            promoted_fn_ptr_xrefs.push(XrefEntry {
+                symbol: rx.target_name.clone(),
+                category: "fn_ptr_ref".to_string(),
+                relation: "dispatches_fn".to_string(),
+                target: caller_id,
+                file: rx.file.clone(),
+                line: rx.line,
+                section_id: caller_section_id,
+                context: rx.context.clone(),
+            });
+        }
     }
 
     calls.sort_by(|a, b| {
@@ -196,8 +290,9 @@ pub fn resolve_and_link(
     });
 
     // 4. Build unified XrefEntry list
-    let mut xrefs: Vec<XrefEntry> =
-        Vec::with_capacity(calls.len() + types.len() + macros.len() + units.len() * 4);
+    let mut xrefs: Vec<XrefEntry> = Vec::with_capacity(
+        calls.len() + promoted_fn_ptr_xrefs.len() + types.len() + macros.len() + units.len() * 4,
+    );
 
     for edge in &calls {
         xrefs.push(XrefEntry {
@@ -212,11 +307,21 @@ pub fn resolve_and_link(
         });
     }
 
+    xrefs.extend(promoted_fn_ptr_xrefs);
+
     for unit in units {
         let unit_sec_id = infer_unit_section_id(unit);
         for rx in &unit.raw_xrefs {
+            if rx.category == "fn_ptr_candidate" {
+                continue;
+            }
             let relation = match rx.category.as_str() {
+                "mmio_write" => "writes_reg",
+                "mmio_read" => "reads_reg",
                 "mmio_access" => "accesses_reg",
+                "field_write" => "writes_field",
+                "field_read" => "reads_field",
+                "fn_ptr_ref" => "dispatches_fn",
                 "import" => "imports",
                 "type_ref" => "references_type",
                 "macro_ref" => "expands_macro",
@@ -1322,7 +1427,10 @@ fn compute_vendor_surface(
     {
         for rx in &unit.raw_xrefs {
             let target = rx.target_name.as_str();
-            if rx.category == "mmio_access" {
+            if matches!(
+                rx.category.as_str(),
+                "mmio_access" | "mmio_write" | "mmio_read"
+            ) {
                 active_mmio_registers.insert(rx.target_name.clone());
             }
             if vendor_sym_names.contains(target)

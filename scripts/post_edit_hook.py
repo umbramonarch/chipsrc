@@ -136,10 +136,9 @@ def main() -> int:
     if not binary:
         return 0
 
-    synced_bundles: list[str] = []
     for output_root, source_root, vendor_mode in matches:
         try:
-            proc = subprocess.run(
+            subprocess.run(
                 [
                     binary,
                     "ensure",
@@ -150,27 +149,13 @@ def main() -> int:
                     vendor_mode,
                 ],
                 cwd=str(project_dir),
-                capture_output=True,
-                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 timeout=5,
                 check=False,
             )
-            if proc.returncode == 0 and proc.stdout.strip():
-                synced_bundles.append(proc.stdout.strip().splitlines()[0])
         except Exception:
             continue
-
-    if synced_bundles:
-        payload = {
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": (
-                    f"[chipsrc auto-sync] Incrementally updated bundle after editing "
-                    f"`{edited_path.name}`: {'; '.join(synced_bundles)}"
-                ),
-            }
-        }
-        sys.stdout.write(json.dumps(payload) + "\n")
 
     return 0
 

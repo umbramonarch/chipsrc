@@ -32,6 +32,13 @@ pub fn inspect_repo(repo_path: &Path, vendor_mode: VendorMode) -> Result<Inspect
     let (scanned_files, fingerprint) =
         scanner::scan_repository(repo_path, vendor_mode, 4 * 1024 * 1024)?;
     let (source_root, repo_name) = canonical_repo_root_and_name(repo_path);
+    let blueprint_opt = scanner::load_repo_blueprint(repo_path);
+    let (has_blueprint, unclassified_dirs, detected_workspaces, candidate_c_macros) =
+        scanner::analyze_onboarding_signals(
+            repo_path,
+            &scanned_files,
+            blueprint_opt.as_ref().map(|(bp, _)| bp),
+        );
 
     let total_files = scanned_files.len();
     let first_party_files = scanned_files
@@ -75,6 +82,10 @@ pub fn inspect_repo(repo_path: &Path, vendor_mode: VendorMode) -> Result<Inspect
         total_lines,
         languages,
         detected_layers,
+        has_blueprint,
+        unclassified_dirs,
+        detected_workspaces,
+        candidate_c_macros,
     })
 }
 
@@ -88,6 +99,11 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
     let (scanned_files, fingerprint) =
         scanner::scan_repository(&config.repo_path, config.vendor_mode, config.max_file_bytes)?;
     let (source_root, repo_name) = canonical_repo_root_and_name(&config.repo_path);
+    let blueprint_opt = scanner::load_repo_blueprint(&config.repo_path);
+    let blueprint_hash = blueprint_opt
+        .as_ref()
+        .map(|(_, h)| h.clone())
+        .unwrap_or_default();
 
     let meta_path = config.output_dir.join("meta.json");
     let index_md_path = config.output_dir.join("INDEX.md");
@@ -125,15 +141,21 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         }
     }
 
-    // Load incremental per-file AST cache if available and not forcing full rebuild
+    // Load incremental per-file AST cache if available and not forcing full rebuild.
+    // If `.chipsrc.json` was added, removed, or modified (`blueprint_hash` mismatch),
+    // invalidate per-file AST cache entries so custom blueprint rules re-apply cleanly.
     let existing_cache = if !config.force && cache_path.is_file() {
-        load_cache_file(&config.output_dir)
+        load_cache_file(&config.output_dir).filter(|c| c.blueprint_hash == blueprint_hash)
     } else {
         None
     };
 
     let (units, incremental_reused_files, incremental_reparsed_files) =
-        parser::parse_files_incremental(&scanned_files, existing_cache.as_ref())?;
+        parser::parse_files_incremental_with_blueprint(
+            &scanned_files,
+            existing_cache,
+            blueprint_opt.as_ref().map(|(bp, _)| bp),
+        )?;
 
     let (symbols, mut types, mut macros, mut calls, mut xrefs, vendor_surface) =
         resolver::resolve_and_link(&units);
@@ -210,6 +232,8 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         schema_version: "1.0.0".to_string(),
         repo_root: source_root.clone(),
         vendor_mode: config.vendor_mode,
+        fingerprint: fingerprint.clone(),
+        blueprint_hash,
         files: cache_files,
     };
 
@@ -284,11 +308,11 @@ pub fn auto_refresh_bundles(bundles: &[PathBuf]) -> Result<usize> {
             continue;
         }
 
-        let needs_refresh = if let Some(cache) = load_cache_file(bundle_dir) {
+        let needs_refresh = if let Some(mut cache) = load_cache_file(bundle_dir) {
+            if cache.fingerprint.is_empty() {
+                cache.fingerprint = meta.fingerprint.clone();
+            }
             scanner::check_files_changed(source_path, &cache, 4 * 1024 * 1024).unwrap_or(0) > 0
-                || scanner::scan_repository(source_path, meta.vendor_mode, 4 * 1024 * 1024)
-                    .map(|(_, fp)| fp != meta.fingerprint)
-                    .unwrap_or(false)
         } else if let Ok((_, fp)) =
             scanner::scan_repository(source_path, meta.vendor_mode, 4 * 1024 * 1024)
         {

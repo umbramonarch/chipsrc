@@ -60,8 +60,11 @@ impl LanguageKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileScope {
+    #[serde(alias = "first-party", alias = "firstparty")]
     FirstParty,
+    #[serde(alias = "vendor", alias = "vendor-sdk", alias = "vendorsdk")]
     VendorSdk,
+    #[serde(alias = "tests")]
     Test,
 }
 
@@ -79,17 +82,29 @@ impl FileScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchLayer {
+    #[serde(alias = "application", alias = "apps")]
     App,
+    #[serde(alias = "board", alias = "platform")]
     Bsp,
+    #[serde(alias = "drvs", alias = "drv", alias = "driver")]
     Drivers,
+    #[serde(alias = "cfg", alias = "configs")]
     Config,
+    #[serde(alias = "lib", alias = "utils", alias = "common")]
     Libs,
+    #[serde(alias = "models", alias = "entities")]
     Domain,
+    #[serde(alias = "service")]
     Services,
+    #[serde(alias = "routes", alias = "frontend", alias = "web")]
     Api,
+    #[serde(alias = "engine", alias = "kernel")]
     Core,
+    #[serde(alias = "bin", alias = "tools")]
     Cli,
+    #[serde(alias = "vendor", alias = "hal", alias = "vendor-hal")]
     VendorHal,
+    #[serde(alias = "test")]
     Tests,
     Other,
 }
@@ -398,7 +413,62 @@ pub struct IncrementalAstCache {
     pub schema_version: String,
     pub repo_root: String,
     pub vendor_mode: VendorMode,
+    #[serde(default)]
+    pub fingerprint: String,
+    #[serde(default)]
+    pub blueprint_hash: String,
     pub files: BTreeMap<String, ParsedFileUnit>,
+}
+
+/// Custom MMIO hex address range defined in `.chipsrc.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MmioAddressRange {
+    pub start: String,
+    pub end: String,
+    #[serde(alias = "description")]
+    pub name: String,
+}
+
+fn deserialize_c_qualifiers<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum QualifiersRepr {
+        List(Vec<String>),
+        Map(BTreeMap<String, String>),
+    }
+
+    match Option::<QualifiersRepr>::deserialize(deserializer)? {
+        Some(QualifiersRepr::List(v)) => Ok(v),
+        Some(QualifiersRepr::Map(m)) => Ok(m.into_keys().collect()),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Agent-once repository onboarding blueprint (`.chipsrc.json`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepoBlueprint {
+    /// Path prefix -> FileScope ("first_party" | "vendor_sdk" | "test")
+    pub scopes: BTreeMap<String, FileScope>,
+    /// Path prefix -> ArchLayer ("app", "bsp", "drvs", "config", "libs", "domain", "services", "api", "core", "cli", "vendor_hal", "tests")
+    pub layers: BTreeMap<String, ArchLayer>,
+    /// Path prefix -> custom module shard slug/path (e.g. "packages/ui" -> "packages-ui")
+    pub shards: BTreeMap<String, String>,
+    /// Additional directories or glob prefixes to ignore
+    pub ignore_dirs: Vec<String>,
+    /// Additional C/C++ storage/attribute qualifier macros to strip before declarators
+    #[serde(deserialize_with = "deserialize_c_qualifiers")]
+    pub c_qualifiers: Vec<String>,
+    /// Additional function names or attributes to classify as entrypoints
+    pub entrypoints: Vec<String>,
+    /// Additional function names or attributes to classify as hardware ISRs
+    pub isr_patterns: Vec<String>,
+    /// Custom MMIO hex address ranges (e.g. RISC-V `0x10000000`..`0x1FFFFFFF`)
+    pub mmio_ranges: Vec<MmioAddressRange>,
 }
 
 /// Symbol enriched with deterministic PageRank, degree centrality, and SCC cycle info.
@@ -613,6 +683,14 @@ pub struct InspectReport {
     pub total_lines: usize,
     pub languages: Vec<LanguageStat>,
     pub detected_layers: Vec<String>,
+    #[serde(default)]
+    pub has_blueprint: bool,
+    #[serde(default)]
+    pub unclassified_dirs: Vec<String>,
+    #[serde(default)]
+    pub detected_workspaces: Vec<String>,
+    #[serde(default)]
+    pub candidate_c_macros: Vec<String>,
 }
 
 /// Single search hit across TSV indexes or section shards.

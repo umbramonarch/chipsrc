@@ -28,12 +28,30 @@ the modified file in **<50 ms**:
 chipsrc status
 chipsrc status --sync
 
-# Inspect language breakdown, first-party vs vendor SDK file counts, and architectural layers
+# Inspect language breakdown, first-party vs vendor SDK file counts, architectural layers, and Onboarding Digest
 chipsrc inspect .
 
 # Index a repository or incrementally sync changed files (--vendor-mode active|all|none)
 chipsrc ensure . -o output/ --vendor-mode active
 chipsrc convert . -o output/my_repo --vendor-mode active
+```
+
+### Turn-1 Agent-Once Onboarding Blueprint (`.chipsrc.json`)
+When `chipsrc inspect .` prints an `=== Onboarding Digest (.chipsrc.json missing) ===` with unclassified
+directories, workspace roots, or custom C qualifier macros, write a root `.chipsrc.json` **once** before
+running `chipsrc ensure . -o output/`:
+
+```json
+{
+  "scopes": { "external/vendor_sdk": "vendor_sdk", "fw/app": "first_party" },
+  "layers": { "fw/app": "app", "fw/board": "bsp", "fw/drivers": "drvs" },
+  "shards": { "fw/drivers/can": "can-stack" },
+  "ignore_dirs": ["legacy_archive"],
+  "c_qualifiers": ["FAST_RAM_CODE", "BOARD_ATTR"],
+  "entrypoints": ["custom_boot_entry"],
+  "isr_patterns": ["_CustomISR"],
+  "mmio_ranges": [{ "start": "0xB0000000", "end": "0xBFFFFFFF", "name": "Custom FPGA MMIO" }]
+}
 ```
 
 ### Vendor SDK Active Surface Filtering (`--vendor-mode`)
@@ -55,10 +73,12 @@ chipsrc sym lock_actuator
 chipsrc sym lock_actuator --show
 chipsrc sym Handler --kind isr
 
-# 2. Static Call-Graph Traversal (who calls X, and what does X call?)
+# 2. Static Call-Graph Traversal (who calls X, what does X call, shortest path, and blast radius)
 chipsrc callers parse_register
 chipsrc callers parse_register --show
 chipsrc callees ensure_repo --show
+chipsrc path main lock_actuator
+chipsrc impact lock_actuator
 
 # 3. Struct / Enum / Union / Trait / Interface Layout Lookup (-s / --show)
 chipsrc type ConvertConfig
@@ -70,6 +90,7 @@ chipsrc reg 0x41C00004 --show
 chipsrc mmio VENDOR_ADC1
 
 # 5. Unified Code + Hardware Cross-Reference Graph Traversal (alias: `explain`)
+# Includes mutability & dispatch relations: `writes_reg`, `reads_reg`, `writes_field`, `reads_field`, `dispatches_fn`
 chipsrc xref GPIOA
 chipsrc explain ConvertConfig
 

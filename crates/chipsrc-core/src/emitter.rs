@@ -238,8 +238,8 @@ pub fn emit_bundle(
     let meta_json = serde_json::to_string_pretty(&meta_file)?;
     write_file(&output_dir.join("meta.json"), &meta_json)?;
 
-    // 10. Write cache.json
-    let cache_json = serde_json::to_string_pretty(cache)?;
+    // 10. Write cache.json (compact single-line JSON for fast I/O and minimal footprint)
+    let cache_json = serde_json::to_string(cache)?;
     write_file(&output_dir.join("cache.json"), &cache_json)?;
 
     // 11. Optional <repo_name>.md if config.single_file is true

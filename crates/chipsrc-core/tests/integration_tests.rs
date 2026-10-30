@@ -1,12 +1,12 @@
 //! End-to-end integration tests for `chipsrc-core`.
 
 use chipsrc_core::query::{
-    parallel_bundle_search, query_callees, query_callers, query_macros, query_sections,
-    query_symbols, query_types, query_xref, workspace_status,
+    parallel_bundle_search, query_call_path, query_callees, query_callers, query_impact,
+    query_macros, query_sections, query_symbols, query_types, query_xref, workspace_status,
 };
 use chipsrc_core::{
-    auto_refresh_bundles, convert_repo, ensure_repo, inspect_repo, BundleMetaFile, ConvertConfig,
-    VendorMode,
+    auto_refresh_bundles, convert_repo, ensure_repo, inspect_repo, ArchLayer, BundleMetaFile,
+    ConvertConfig, FileScope, MacroKind, ResolutionTier, SymbolKind, VendorMode,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -345,6 +345,448 @@ int main(void) {
     assert_eq!(none_bundle.metadata.vendor_mode, VendorMode::None);
     assert_eq!(none_bundle.metadata.total_files, 6);
     assert_eq!(none_bundle.metadata.vendor_files, 0);
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn test_blueprint_onboarding_overrides_cache_invalidation_and_empty_repo() {
+    let base = std::env::temp_dir().join(format!("chipsrc_bp_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let repo_dir = base.join("custom_repo");
+    let bundle_dir = base.join("output").join("custom_repo");
+
+    fs::create_dir_all(repo_dir.join("custom_hw/fpga_box")).unwrap();
+    fs::create_dir_all(repo_dir.join("packages/telemetry")).unwrap();
+    fs::create_dir_all(repo_dir.join("legacy_drop")).unwrap();
+
+    fs::write(
+        repo_dir.join("custom_hw/fpga_box/fpga_reg.c"),
+        r#"#include <stdint.h>
+
+#define FPGA_DOORBELL_REG 0xB4000010UL
+
+CHIP_FAST_RAM void fpga_ring_doorbell(uint32_t code) {
+    *(volatile uint32_t *)0xB4000010UL = code;
+}
+
+void fpga_dma_done_CustomISR(void) {
+    fpga_ring_doorbell(1U);
+}
+
+void custom_boot_entry(void) {
+    fpga_ring_doorbell(0U);
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        repo_dir.join("packages/telemetry/index.ts"),
+        r#"export function encodePacket(id: number): string {
+    return `pkt:${id}`;
+}
+"#,
+    )
+    .unwrap();
+
+    fs::write(
+        repo_dir.join("legacy_drop/old.c"),
+        "void ignored_legacy_fn(void) {}\n",
+    )
+    .unwrap();
+
+    // 1. Inspect before `.chipsrc.json` exists -> onboarding signals must be populated
+    let report_before = inspect_repo(&repo_dir, VendorMode::Active).expect("inspect before bp");
+    assert!(!report_before.has_blueprint);
+    assert!(
+        report_before
+            .unclassified_dirs
+            .iter()
+            .any(|d| d.contains("custom_hw/fpga_box")),
+        "Expected unclassified dir in {:?}",
+        report_before.unclassified_dirs
+    );
+    assert!(
+        report_before
+            .detected_workspaces
+            .iter()
+            .any(|w| w == "packages/telemetry"),
+        "Expected workspace root in {:?}",
+        report_before.detected_workspaces
+    );
+    assert!(
+        report_before
+            .candidate_c_macros
+            .iter()
+            .any(|m| m == "CHIP_FAST_RAM"),
+        "Expected candidate C macro in {:?}",
+        report_before.candidate_c_macros
+    );
+
+    // 2. Write `.chipsrc.json` blueprint
+    fs::write(
+        repo_dir.join(".chipsrc.json"),
+        r#"{
+  "scopes": {
+    "custom_hw/fpga_box": "first_party"
+  },
+  "layers": {
+    "custom_hw/fpga_box": "bsp",
+    "packages/telemetry": "services"
+  },
+  "shards": {
+    "custom_hw/fpga_box": "fpga-bsp"
+  },
+  "ignore_dirs": ["legacy_drop"],
+  "c_qualifiers": {
+    "CHIP_FAST_RAM": "static inline"
+  },
+  "entrypoints": ["custom_boot_entry"],
+  "isr_patterns": ["_CustomISR"],
+  "mmio_ranges": [
+    {
+      "start": "0xB0000000",
+      "end": "0xBFFFFFFF",
+      "description": "Custom FPGA MMIO aperture"
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let report_after = inspect_repo(&repo_dir, VendorMode::Active).expect("inspect after bp");
+    assert!(report_after.has_blueprint);
+    assert_ne!(report_before.fingerprint, report_after.fingerprint);
+    // `legacy_drop/old.c` is excluded by `ignore_dirs`
+    assert_eq!(report_after.total_files, 2);
+
+    let cfg = ConvertConfig::new(repo_dir.clone(), bundle_dir.clone());
+    let bundle = convert_repo(&cfg).expect("convert with blueprint");
+    assert_eq!(bundle.metadata.total_files, 2);
+
+    // Verify custom C qualifier macro allowed clean parse (0 errors)
+    assert_eq!(bundle.sanity.parse_clean_ratio, 1.0);
+
+    // Verify custom entrypoint and ISR pattern classification
+    let boot_sym = bundle
+        .indexes
+        .symbols
+        .iter()
+        .find(|rs| rs.symbol.name == "custom_boot_entry")
+        .expect("custom_boot_entry symbol");
+    assert_eq!(boot_sym.symbol.kind, SymbolKind::Entrypoint);
+    assert_eq!(boot_sym.symbol.arch_layer, ArchLayer::Bsp);
+    assert_eq!(boot_sym.symbol.scope, FileScope::FirstParty);
+    assert!(boot_sym.symbol.section_id.ends_with("fpga-bsp"));
+
+    let isr_sym = bundle
+        .indexes
+        .symbols
+        .iter()
+        .find(|rs| rs.symbol.name == "fpga_dma_done_CustomISR")
+        .expect("fpga_dma_done_CustomISR symbol");
+    assert_eq!(isr_sym.symbol.kind, SymbolKind::Isr);
+
+    // Verify custom MMIO range classified `0xB4000010` as MmioAddress
+    let fpga_mac = bundle
+        .indexes
+        .macros
+        .iter()
+        .find(|m| m.name == "FPGA_DOORBELL_REG")
+        .expect("FPGA_DOORBELL_REG macro");
+    assert_eq!(fpga_mac.kind, MacroKind::MmioAddress);
+    assert!(fpga_mac.description.contains("Custom FPGA MMIO aperture"));
+
+    // Verify `cache.json` is compact single-line JSON
+    let cache_raw = fs::read_to_string(bundle_dir.join("cache.json")).expect("read cache.json");
+    assert_eq!(
+        cache_raw.lines().count(),
+        1,
+        "cache.json must be compact JSON"
+    );
+
+    // 3. Modifying `.chipsrc.json` must invalidate the cache and re-parse
+    fs::write(
+        repo_dir.join(".chipsrc.json"),
+        r#"{
+  "layers": {
+    "custom_hw/fpga_box": "drvs"
+  },
+  "ignore_dirs": ["legacy_drop"],
+  "c_qualifiers": {
+    "CHIP_FAST_RAM": "static inline"
+  }
+}"#,
+    )
+    .unwrap();
+
+    let bundle_reindexed = convert_repo(&cfg).expect("convert after blueprint edit");
+    assert!(
+        !bundle_reindexed.cache_hit,
+        "Blueprint change must invalidate cache"
+    );
+    let boot_sym_updated = bundle_reindexed
+        .indexes
+        .symbols
+        .iter()
+        .find(|rs| rs.symbol.name == "custom_boot_entry")
+        .expect("custom_boot_entry symbol after update");
+    assert_eq!(boot_sym_updated.symbol.arch_layer, ArchLayer::Drivers);
+
+    // 4. Empty/fresh repository with `.chipsrc.json` must succeed on inspect_repo
+    let empty_dir = base.join("empty_with_bp");
+    fs::create_dir_all(&empty_dir).unwrap();
+    fs::write(empty_dir.join(".chipsrc.json"), "{}\n").unwrap();
+    let empty_report =
+        inspect_repo(&empty_dir, VendorMode::Active).expect("inspect empty repo with bp");
+    assert!(empty_report.has_blueprint);
+    assert_eq!(empty_report.total_files, 0);
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn test_local_receiver_binding_fn_ptr_dispatch_mutability_and_path_impact_queries() {
+    let base = std::env::temp_dir().join(format!("chipsrc_ideas_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let repo_dir = base.join("fw_ideas");
+    let bundle_dir = base.join("output").join("fw_ideas");
+
+    fs::create_dir_all(repo_dir.join("src/app")).unwrap();
+    fs::create_dir_all(repo_dir.join("src/drvs")).unwrap();
+
+    // Rust file testing:
+    // - Idea 3: Two structs (`SpiDriver`, `I2cDriver`) both define `transfer()`.
+    //   `run_bus(spi: &mut SpiDriver)` and `let dev = I2cDriver::new(); dev.transfer()` must
+    //   resolve unambiguously to their respective struct methods (`SameFile`) rather than `AmbiguousName`.
+    // - Idea 5: `self.tx_count += 1` (`writes_field`) vs `let n = self.tx_count` (`reads_field`).
+    fs::write(
+        repo_dir.join("src/drvs/bus.rs"),
+        r#"pub struct SpiDriver {
+    pub tx_count: u32,
+}
+
+pub struct I2cDriver {
+    pub tx_count: u32,
+}
+
+impl SpiDriver {
+    pub fn new() -> Self {
+        Self { tx_count: 0 }
+    }
+
+    pub fn transfer(&mut self, byte: u8) -> u32 {
+        self.tx_count += u32::from(byte);
+        let current = self.tx_count;
+        current
+    }
+}
+
+impl I2cDriver {
+    pub fn new() -> Self {
+        Self { tx_count: 0 }
+    }
+
+    pub fn transfer(&mut self, byte: u8) -> u32 {
+        u32::from(byte)
+    }
+}
+
+pub fn run_spi_transaction(spi: &mut SpiDriver) -> u32 {
+    spi.transfer(0x42)
+}
+
+pub fn run_i2c_transaction() -> u32 {
+    let mut dev = I2cDriver::new();
+    dev.transfer(0x10)
+}
+"#,
+    )
+    .unwrap();
+
+    // C file testing:
+    // - Idea 4: Function-pointer dispatch table (`.on_frame = handle_uart_frame`) and callback argument (`register_irq(uart_error_isr)`),
+    //   plus precision filtering of non-function constant `BAUD_RATE_CONST`.
+    // - Idea 5: MMIO register write (`UART0->DR = byte`) vs read (`uint32_t status = UART0->SR`).
+    // - Idea 6: Multi-hop call chain `main -> system_startup -> register_uart_driver -> handle_uart_frame -> low_level_fifo_push`.
+    fs::write(
+        repo_dir.join("src/app/uart_app.c"),
+        r#"#include <stdint.h>
+
+#define UART0_BASE 0x40011000UL
+typedef struct {
+    volatile uint32_t SR;
+    volatile uint32_t DR;
+} UART_TypeDef;
+#define UART0 ((UART_TypeDef *) UART0_BASE)
+#define BAUD_RATE_CONST 115200U
+
+typedef struct {
+    void (*on_frame)(uint8_t);
+    uint32_t baud;
+} UartOps_t;
+
+void low_level_fifo_push(uint8_t b) {
+    uint32_t status = UART0->SR;
+    if (status != 0U) {
+        UART0->DR = (uint32_t)b;
+    }
+}
+
+void handle_uart_frame(uint8_t b) {
+    low_level_fifo_push(b);
+}
+
+void uart_error_IRQHandler(void) {
+    low_level_fifo_push(0xFFU);
+}
+
+void install_irq_callback(uint32_t irq_num, void (*cb)(void)) {
+    (void)irq_num;
+    (void)cb;
+}
+
+void register_uart_driver(void) {
+    UartOps_t ops = {
+        .on_frame = handle_uart_frame,
+        .baud = BAUD_RATE_CONST
+    };
+    (void)ops;
+    install_irq_callback(37U, uart_error_IRQHandler);
+}
+
+void system_startup(void) {
+    register_uart_driver();
+}
+
+int main(void) {
+    system_startup();
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+
+    let cfg = ConvertConfig::new(repo_dir.clone(), bundle_dir.clone());
+    let bundle = convert_repo(&cfg).expect("convert_repo ideas");
+
+    // Verify Idea 3: `run_spi_transaction` -> `SpiDriver::transfer` and `run_i2c_transaction` -> `I2cDriver::transfer`
+    let spi_call = bundle
+        .indexes
+        .calls
+        .iter()
+        .find(|c| c.caller_name == "run_spi_transaction" && c.callee_name == "transfer")
+        .expect("run_spi_transaction -> transfer call");
+    assert!(
+        spi_call.callee_id.ends_with("SpiDriver::transfer"),
+        "Expected SpiDriver::transfer, got {}",
+        spi_call.callee_id
+    );
+    assert_eq!(spi_call.tier, ResolutionTier::SameFile);
+
+    let i2c_call = bundle
+        .indexes
+        .calls
+        .iter()
+        .find(|c| c.caller_name == "run_i2c_transaction" && c.callee_name == "transfer")
+        .expect("run_i2c_transaction -> transfer call");
+    assert!(
+        i2c_call.callee_id.ends_with("I2cDriver::transfer"),
+        "Expected I2cDriver::transfer, got {}",
+        i2c_call.callee_id
+    );
+    assert_eq!(i2c_call.tier, ResolutionTier::SameFile);
+
+    // Verify Idea 4: `register_uart_driver` has synthesized call edges and `dispatches_fn` xrefs
+    // to `handle_uart_frame` and `uart_error_IRQHandler`, while `BAUD_RATE_CONST` is NOT in `fn_ptr_ref`
+    assert!(
+        bundle.indexes.calls.iter().any(
+            |c| c.caller_name == "register_uart_driver" && c.callee_name == "handle_uart_frame"
+        ),
+        "Missing synthesized fn_ptr call edge to handle_uart_frame"
+    );
+    assert!(
+        bundle
+            .indexes
+            .calls
+            .iter()
+            .any(|c| c.caller_name == "register_uart_driver"
+                && c.callee_name == "uart_error_IRQHandler"),
+        "Missing synthesized callback call edge to uart_error_IRQHandler"
+    );
+    assert!(
+        bundle
+            .indexes
+            .xrefs
+            .iter()
+            .any(|x| x.symbol == "handle_uart_frame" && x.relation == "dispatches_fn"),
+        "Missing dispatches_fn xref for handle_uart_frame"
+    );
+    assert!(
+        !bundle
+            .indexes
+            .xrefs
+            .iter()
+            .any(|x| x.symbol == "BAUD_RATE_CONST" && x.category == "fn_ptr_ref"),
+        "Non-function constant BAUD_RATE_CONST must be precision-filtered out of fn_ptr_ref"
+    );
+
+    // Verify Idea 5: MMIO `writes_reg` (`UART0->DR`) and `reads_reg` (`UART0->SR`),
+    // plus struct field `writes_field` and `reads_field` (`SpiDriver::tx_count`)
+    assert!(
+        bundle
+            .indexes
+            .xrefs
+            .iter()
+            .any(|x| x.symbol == "UART0->DR" && x.relation == "writes_reg"),
+        "Expected writes_reg for UART0->DR"
+    );
+    assert!(
+        bundle
+            .indexes
+            .xrefs
+            .iter()
+            .any(|x| x.symbol == "UART0->SR" && x.relation == "reads_reg"),
+        "Expected reads_reg for UART0->SR"
+    );
+    assert!(
+        bundle
+            .indexes
+            .xrefs
+            .iter()
+            .any(|x| x.symbol == "SpiDriver::tx_count" && x.relation == "writes_field"),
+        "Expected writes_field for SpiDriver::tx_count"
+    );
+    assert!(
+        bundle
+            .indexes
+            .xrefs
+            .iter()
+            .any(|x| x.symbol == "SpiDriver::tx_count" && x.relation == "reads_field"),
+        "Expected reads_field for SpiDriver::tx_count"
+    );
+
+    // Verify Idea 6: `query_call_path` and `query_impact`
+    let bundles = vec![bundle_dir.clone()];
+    let path_out =
+        query_call_path(&bundles, "main", "low_level_fifo_push", 8).expect("query_call_path");
+    assert!(
+        path_out.contains("4 hops"),
+        "Expected 4-hop path (main -> system_startup -> register_uart_driver -> handle_uart_frame -> low_level_fifo_push), got:\n{path_out}"
+    );
+    assert!(path_out.contains("register_uart_driver"));
+    assert!(path_out.contains("handle_uart_frame"));
+
+    let impact_out = query_impact(&bundles, "low_level_fifo_push", 6, 40).expect("query_impact");
+    assert!(
+        impact_out.contains("main"),
+        "Impact should reach entrypoint main:\n{impact_out}"
+    );
+    assert!(
+        impact_out.contains("uart_error_IRQHandler"),
+        "Impact should reach ISR uart_error_IRQHandler:\n{impact_out}"
+    );
 
     let _ = fs::remove_dir_all(&base);
 }

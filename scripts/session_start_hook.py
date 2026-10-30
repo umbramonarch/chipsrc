@@ -187,6 +187,7 @@ def main() -> int:
         return 0
 
     lines: list[str] = ["[chipsrc] Source Code & Hardware Cross-Reference Intelligence active:"]
+    has_blueprint = (project_dir / ".chipsrc.json").is_file()
     if bundles:
         summary = ", ".join(
             f"`{b['path']}` ({b['files']} files, {b['symbols']} syms, {b['types']} types, "
@@ -195,13 +196,21 @@ def main() -> int:
         )
         lines.append(f"- Indexed codebase bundles ready (auto-synced via `cache.json`): {summary}")
     else:
-        lines.append(
-            "- Unindexed source repository detected (run `chipsrc ensure . -o output` to build the Agent Codebase Bundle)."
-        )
+        if has_blueprint:
+            lines.append(
+                "- Unindexed source repository with `.chipsrc.json` blueprint detected "
+                "(run `chipsrc ensure . -o output` to build the Agent Codebase Bundle)."
+            )
+        else:
+            lines.append(
+                "- Unindexed source repository detected: run `chipsrc inspect .` first; if an Onboarding Digest appears, "
+                "write a root `.chipsrc.json` blueprint once, then run `chipsrc ensure . -o output`."
+            )
 
     lines.append(
         "- Prefer 1-turn CLI queries over blind Grep/Read loops (all queries auto-refresh changed files): "
         "`chipsrc sym <name> [-s]`, `chipsrc callers <fn>`, `chipsrc callees <fn>`, "
+        "`chipsrc path <from> <to>`, `chipsrc impact <fn>`, "
         "`chipsrc type <name> [-s]`, `chipsrc macro|reg|mmio <name|0xHEX>`, "
         "`chipsrc xref <symbol>`, `chipsrc section [query] [-s]`, `chipsrc search <pattern>`."
     )

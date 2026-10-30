@@ -736,10 +736,15 @@ fn derive_unit_shard_meta(unit: &ParsedFileUnit) -> (String, String, String) {
     let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
     let layer_str = unit.scanned.arch_layer.as_str();
 
-    let (computed_slug, title, module_path) = if parts.len() >= 3 && parts[0] == "crates" {
+    let (computed_slug, title, module_path) = if parts.len() >= 3
+        && matches!(
+            parts[0],
+            "crates" | "packages" | "apps" | "services" | "modules" | "components"
+        ) {
+        let ws_root = parts[0];
         let crate_name = parts[1];
-        let module_path = format!("crates/{crate_name}");
-        let slug = sanitize_slug(&format!("crates-{crate_name}"));
+        let module_path = format!("{ws_root}/{crate_name}");
+        let slug = sanitize_slug(&format!("{ws_root}-{crate_name}"));
         let title = format!("{module_path} ({layer_str})");
         (slug, title, module_path)
     } else {

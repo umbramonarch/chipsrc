@@ -3,11 +3,11 @@
 
 use crate::error::{ChipsrcError, Result};
 use crate::model::{
-    ArchLayer, FileScope, IncrementalAstCache, LanguageKind, ScannedFile, VendorMode,
+    ArchLayer, FileScope, IncrementalAstCache, LanguageKind, RepoBlueprint, ScannedFile, VendorMode,
 };
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -134,7 +134,80 @@ fn is_bundled_js_asset(lower_filename: &str) -> bool {
             .any(|prefix| stem.starts_with(prefix))
 }
 
-/// Walks `repo_path` respecting `.gitignore` and `.claudeignore`, skips generated
+/// Loads `<repo_path>/.chipsrc.json` if present, returning the parsed [`RepoBlueprint`]
+/// together with its 16-character BLAKE3 content hash.
+pub fn load_repo_blueprint(repo_path: &Path) -> Option<(RepoBlueprint, String)> {
+    let bp_path = repo_path.join(".chipsrc.json");
+    let bytes = fs::read(&bp_path).ok()?;
+    let bp: RepoBlueprint = serde_json::from_slice(&bytes).ok()?;
+    let full_hash = blake3::hash(&bytes).to_hex();
+    let hash = full_hash[..16].to_string();
+    Some((bp, hash))
+}
+
+/// Finds the longest normalized path prefix in `map` that matches `rel_path`.
+fn match_longest_prefix<'a, V>(
+    rel_path: &str,
+    map: &'a BTreeMap<String, V>,
+) -> Option<(String, &'a V)> {
+    let norm_path = rel_path.replace('\\', "/");
+    let trimmed_path = norm_path.trim_matches('/');
+    let mut best: Option<(usize, String, &'a V)> = None;
+
+    for (raw_prefix, val) in map {
+        let clean_prefix = raw_prefix
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .trim_matches('/')
+            .to_string();
+        if clean_prefix.is_empty() {
+            continue;
+        }
+        let matched = trimmed_path == clean_prefix
+            || trimmed_path
+                .strip_prefix(clean_prefix.as_str())
+                .is_some_and(|rest| rest.starts_with('/'));
+        if matched {
+            let len = clean_prefix.len();
+            if best.as_ref().is_none_or(|(best_len, _, _)| len > *best_len) {
+                best = Some((len, clean_prefix, val));
+            }
+        }
+    }
+
+    best.map(|(_, prefix, val)| (prefix, val))
+}
+
+fn path_matches_ignore_dirs(rel_path: &str, ignore_dirs: &[String]) -> bool {
+    if ignore_dirs.is_empty() {
+        return false;
+    }
+    let norm = rel_path.replace('\\', "/");
+    let trimmed = norm.trim_matches('/');
+    for raw_ig in ignore_dirs {
+        let ig = raw_ig
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .trim_end_matches("/**")
+            .trim_end_matches("/*")
+            .trim_matches('/')
+            .to_string();
+        if ig.is_empty() {
+            continue;
+        }
+        if trimmed == ig
+            || trimmed
+                .strip_prefix(ig.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+            || trimmed.split('/').any(|seg| seg.eq_ignore_ascii_case(&ig))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Walks `repo_path` respecting `.gitignore`, `.claudeignore`, and `.chipsrc.json`, skips generated
 /// documentation assets and minified/bundled third-party JavaScript, classifies each
 /// supported source file by language, ownership scope, and architectural layer, and returns the
 /// sorted file list along with a 16-character BLAKE3 repository fingerprint.
@@ -147,6 +220,12 @@ pub fn scan_repository(
         return Err(ChipsrcError::InvalidRepoPath(repo_path.to_path_buf()));
     }
 
+    let blueprint_opt = load_repo_blueprint(repo_path);
+    let custom_ignore_dirs: Vec<String> = blueprint_opt
+        .as_ref()
+        .map(|(bp, _)| bp.ignore_dirs.clone())
+        .unwrap_or_default();
+
     let mut walker = WalkBuilder::new(repo_path);
     walker
         .git_ignore(true)
@@ -155,7 +234,7 @@ pub fn scan_repository(
         .ignore(true)
         .hidden(true)
         .add_custom_ignore_filename(".claudeignore")
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
             if entry.depth() == 0 {
                 return true;
             }
@@ -165,12 +244,19 @@ pub fn scan_repository(
                     if IGNORED_DIRS.contains(&lower.as_str()) {
                         return false;
                     }
+                    if custom_ignore_dirs.iter().any(|ig| {
+                        let clean = ig.trim_matches('/');
+                        clean.eq_ignore_ascii_case(name)
+                    }) {
+                        return false;
+                    }
                 }
             }
             true
         });
 
     let mut candidate_paths: Vec<(PathBuf, String, LanguageKind, u64, u64)> = Vec::new();
+    let bp_ref = blueprint_opt.as_ref().map(|(bp, _)| bp);
 
     for entry_res in walker.build() {
         let entry = match entry_res {
@@ -222,6 +308,11 @@ pub fn scan_repository(
         if rel_path.is_empty() {
             continue;
         }
+        if let Some(bp) = bp_ref {
+            if path_matches_ignore_dirs(&rel_path, &bp.ignore_dirs) {
+                continue;
+            }
+        }
 
         candidate_paths.push((abs_path, rel_path, language, size_bytes, mtime_secs));
     }
@@ -234,12 +325,12 @@ pub fn scan_repository(
                 return None;
             }
 
-            let scope = classify_file_scope(&rel_path, size_bytes, &bytes);
+            let scope = classify_file_scope_with_blueprint(&rel_path, size_bytes, &bytes, bp_ref);
             if vendor_mode == VendorMode::None && scope == FileScope::VendorSdk {
                 return None;
             }
 
-            let arch_layer = classify_arch_layer(&rel_path, scope);
+            let arch_layer = classify_arch_layer_with_blueprint(&rel_path, scope, bp_ref);
             let line_count = memchr::memchr_iter(b'\n', &bytes).count() + 1;
             let full_hash = blake3::hash(&bytes).to_hex();
             let blake3_hash = full_hash[..16].to_string();
@@ -260,11 +351,16 @@ pub fn scan_repository(
 
     scanned_files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
-    if scanned_files.is_empty() {
+    if scanned_files.is_empty() && blueprint_opt.is_none() {
         return Err(ChipsrcError::NoSourceFilesFound(repo_path.to_path_buf()));
     }
 
     let mut repo_hasher = blake3::Hasher::new();
+    if let Some((_, ref bp_hash)) = blueprint_opt {
+        repo_hasher.update(b"blueprint:");
+        repo_hasher.update(bp_hash.as_bytes());
+        repo_hasher.update(b"\n");
+    }
     for file in &scanned_files {
         repo_hasher.update(file.rel_path.as_bytes());
         repo_hasher.update(b":");
@@ -284,11 +380,12 @@ pub fn check_files_changed(
     cached: &IncrementalAstCache,
     max_file_bytes: u64,
 ) -> Result<usize> {
-    let scanned_files = match scan_repository(repo_path, cached.vendor_mode, max_file_bytes) {
-        Ok((files, _)) => files,
-        Err(ChipsrcError::NoSourceFilesFound(_)) => return Ok(cached.files.len()),
-        Err(e) => return Err(e),
-    };
+    let (scanned_files, live_fp) =
+        match scan_repository(repo_path, cached.vendor_mode, max_file_bytes) {
+            Ok(res) => res,
+            Err(ChipsrcError::NoSourceFilesFound(_)) => return Ok(cached.files.len()),
+            Err(e) => return Err(e),
+        };
 
     let mut changed = 0usize;
     let mut seen_paths = HashSet::with_capacity(scanned_files.len());
@@ -299,6 +396,8 @@ pub fn check_files_changed(
             Some(cached_unit) => {
                 if cached_unit.scanned.size_bytes != file.size_bytes
                     || cached_unit.scanned.blake3_hash != file.blake3_hash
+                    || cached_unit.scanned.scope != file.scope
+                    || cached_unit.scanned.arch_layer != file.arch_layer
                 {
                     changed += 1;
                 }
@@ -315,7 +414,30 @@ pub fn check_files_changed(
         }
     }
 
+    if changed == 0 && !cached.fingerprint.is_empty() && cached.fingerprint != live_fp {
+        changed = 1;
+    }
+
     Ok(changed)
+}
+
+/// Deterministically groups files into logical module shards while honoring `.chipsrc.json`
+/// `shards` overrides when present.
+pub fn assign_section_id_with_blueprint(
+    rel_path: &str,
+    scope: FileScope,
+    arch_layer: ArchLayer,
+    blueprint: Option<&RepoBlueprint>,
+) -> (String, String, String) {
+    if let Some(bp) = blueprint {
+        if let Some((matched_prefix, custom_shard)) = match_longest_prefix(rel_path, &bp.shards) {
+            let slug = sanitize_slug(custom_shard);
+            let layer_str = arch_layer.as_str();
+            let title = format!("{matched_prefix} ({layer_str})");
+            return (slug, title, matched_prefix);
+        }
+    }
+    assign_section_id(rel_path, scope, arch_layer)
 }
 
 /// Deterministically groups files into logical module shards and returns
@@ -329,11 +451,18 @@ pub fn assign_section_id(
     let parts: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
     let layer_str = arch_layer.as_str();
 
-    // Case 1: Rust workspace crate layout `crates/<crate_name>/...`
-    if parts.len() >= 3 && parts[0] == "crates" {
-        let crate_name = parts[1];
-        let module_path = format!("crates/{crate_name}");
-        let slug = sanitize_slug(&format!("crates-{crate_name}"));
+    // Case 1: Workspace / multi-package layouts (`crates/<name>/...`, `packages/<name>/...`,
+    // `apps/<name>/...`, `services/<name>/...`, `modules/<name>/...`, `components/<name>/...`)
+    if parts.len() >= 3
+        && matches!(
+            parts[0],
+            "crates" | "packages" | "apps" | "services" | "modules" | "components"
+        )
+    {
+        let container = parts[0];
+        let pkg_name = parts[1];
+        let module_path = format!("{container}/{pkg_name}");
+        let slug = sanitize_slug(&format!("{container}-{pkg_name}"));
         let title = format!("{module_path} ({layer_str})");
         return (slug, title, module_path);
     }
@@ -359,6 +488,202 @@ pub fn assign_section_id(
         let title = format!("Root Module ({layer_str})");
         (slug, title, module_path)
     }
+}
+
+/// Analyzes onboarding signals for `chipsrc inspect` so an agent on Turn 1 can see
+/// unclassified directories, workspace subprojects, and unknown C qualifier macros.
+pub fn analyze_onboarding_signals(
+    repo_path: &Path,
+    scanned_files: &[ScannedFile],
+    blueprint: Option<&RepoBlueprint>,
+) -> (bool, Vec<String>, Vec<String>, Vec<String>) {
+    let has_blueprint = blueprint.is_some();
+
+    // 1. Unclassified directories (first-party files that fell back to ArchLayer::Other)
+    let mut unclassified_set: BTreeSet<String> = BTreeSet::new();
+    for file in scanned_files {
+        if file.scope == FileScope::FirstParty && file.arch_layer == ArchLayer::Other {
+            let parts: Vec<&str> = file.rel_path.split('/').filter(|s| !s.is_empty()).collect();
+            let dir_count = parts.len().saturating_sub(1);
+            if dir_count >= 2 {
+                unclassified_set.insert(format!("{}/{}", parts[0], parts[1]));
+            } else if dir_count == 1 {
+                unclassified_set.insert(parts[0].to_string());
+            }
+        }
+    }
+
+    // 2. Detected workspaces / subproject manifests
+    let mut workspaces_set: BTreeSet<String> = BTreeSet::new();
+    const MANIFEST_NAMES: &[&str] = &[
+        "Cargo.toml",
+        "package.json",
+        "CMakeLists.txt",
+        "platformio.ini",
+        "Kconfig",
+        "pyproject.toml",
+    ];
+    for container in [
+        "crates",
+        "packages",
+        "apps",
+        "services",
+        "modules",
+        "components",
+    ] {
+        let container_dir = repo_path.join(container);
+        if let Ok(entries) = fs::read_dir(&container_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    if let Some(sub) = p.file_name().and_then(|s| s.to_str()) {
+                        if !sub.starts_with('.') {
+                            workspaces_set.insert(format!("{container}/{sub}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(repo_path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let Some(dir_name) = p.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if dir_name.starts_with('.') || IGNORED_DIRS.contains(&dir_name) {
+                continue;
+            }
+            if MANIFEST_NAMES.iter().any(|m| p.join(m).is_file()) {
+                workspaces_set.insert(dir_name.to_string());
+            }
+        }
+    }
+
+    // 3. Candidate C/C++ qualifier macros before function declarators
+    let mut candidate_macros: BTreeSet<String> = BTreeSet::new();
+    let custom_quals: HashSet<&str> = blueprint
+        .map(|bp| bp.c_qualifiers.iter().map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+
+    for file in scanned_files
+        .iter()
+        .filter(|f| matches!(f.language, LanguageKind::C | LanguageKind::Cpp))
+        .take(40)
+    {
+        let Ok(content) = fs::read_to_string(&file.abs_path) else {
+            continue;
+        };
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with('#')
+                || trimmed.starts_with('/')
+                || trimmed.starts_with('*')
+                || !trimmed.contains('(')
+            {
+                continue;
+            }
+            let mut tokens = trimmed.split_whitespace();
+            let Some(first) = tokens.next() else {
+                continue;
+            };
+            let Some(second) = tokens.next() else {
+                continue;
+            };
+            if is_candidate_unknown_c_qualifier(first, second, &custom_quals) {
+                candidate_macros.insert(first.to_string());
+            }
+        }
+    }
+
+    (
+        has_blueprint,
+        unclassified_set.into_iter().collect(),
+        workspaces_set.into_iter().collect(),
+        candidate_macros.into_iter().collect(),
+    )
+}
+
+fn is_candidate_unknown_c_qualifier(
+    first: &str,
+    second: &str,
+    custom_quals: &HashSet<&str>,
+) -> bool {
+    if first.len() < 3
+        || custom_quals.contains(first)
+        || !first
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        || !first.bytes().any(|b| b.is_ascii_uppercase())
+    {
+        return false;
+    }
+    // Skip macros already normalized by parser.rs
+    if matches!(
+        first,
+        "STATIC"
+            | "CONST"
+            | "INLINE"
+            | "__INLINE"
+            | "__INLINE__"
+            | "FORCEINLINE"
+            | "__FORCEINLINE"
+            | "__STATIC_INLINE"
+            | "__STATIC_FORCEINLINE"
+            | "STATIC_INLINE"
+            | "STATIC_FORCEINLINE"
+            | "WEAK"
+            | "__WEAK"
+            | "__IRQ"
+            | "__INTERRUPT"
+            | "__RAMFUNC"
+            | "RAMFUNC"
+            | "__PACKED"
+            | "PACKED"
+            | "ISR"
+            | "SIGNAL"
+            | "EXTERN"
+    ) || first.ends_with("_STATIC_INLINE")
+        || first.ends_with("_STATIC_FORCEINLINE")
+        || first.ends_with("_INLINE")
+        || first.ends_with("_FORCEINLINE")
+        || first.ends_with("_WEAK")
+        || first.ends_with("_IRQ")
+        || first.ends_with("_INTERRUPT")
+        || first.ends_with("_RAMFUNC")
+        || first.ends_with("_PACKED")
+        || first.ends_with("_ATTR")
+        || first.ends_with("_ATTRIBUTE")
+    {
+        return false;
+    }
+    let clean_second = second.trim_matches('*');
+    matches!(
+        clean_second,
+        "void"
+            | "int"
+            | "char"
+            | "short"
+            | "long"
+            | "float"
+            | "double"
+            | "bool"
+            | "uint8_t"
+            | "uint16_t"
+            | "uint32_t"
+            | "uint64_t"
+            | "int8_t"
+            | "int16_t"
+            | "int32_t"
+            | "int64_t"
+            | "size_t"
+            | "static"
+            | "inline"
+    )
 }
 
 fn normalize_rel_path(path: &Path) -> String {
@@ -439,6 +764,20 @@ fn dir_segments_are_vendor(dir_segments: &[&str]) -> bool {
     false
 }
 
+fn classify_file_scope_with_blueprint(
+    rel_path: &str,
+    size_bytes: u64,
+    bytes: &[u8],
+    blueprint: Option<&RepoBlueprint>,
+) -> FileScope {
+    if let Some(bp) = blueprint {
+        if let Some((_, &scope)) = match_longest_prefix(rel_path, &bp.scopes) {
+            return scope;
+        }
+    }
+    classify_file_scope(rel_path, size_bytes, bytes)
+}
+
 fn classify_file_scope(rel_path: &str, size_bytes: u64, bytes: &[u8]) -> FileScope {
     let parts: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
     let filename = parts.last().copied().unwrap_or(rel_path);
@@ -490,6 +829,19 @@ fn classify_file_scope(rel_path: &str, size_bytes: u64, bytes: &[u8]) -> FileSco
     }
 
     FileScope::FirstParty
+}
+
+fn classify_arch_layer_with_blueprint(
+    rel_path: &str,
+    scope: FileScope,
+    blueprint: Option<&RepoBlueprint>,
+) -> ArchLayer {
+    if let Some(bp) = blueprint {
+        if let Some((_, &layer)) = match_longest_prefix(rel_path, &bp.layers) {
+            return layer;
+        }
+    }
+    classify_arch_layer(rel_path, scope)
 }
 
 fn classify_arch_layer(rel_path: &str, scope: FileScope) -> ArchLayer {

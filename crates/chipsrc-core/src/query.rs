@@ -7,6 +7,8 @@ use crate::scanner::{check_files_changed, scan_repository};
 use memchr::memmem;
 use rayon::prelude::*;
 use regex::RegexBuilder;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1147,6 +1149,473 @@ pub fn query_xref(bundles: &[PathBuf], query: &str, limit: usize) -> Result<Stri
             "... +{} more cross-references omitted (pass `--limit {}` to view all).\n",
             total - limit,
             total
+        ));
+    }
+
+    Ok(out)
+}
+
+#[derive(Clone, Debug)]
+struct GraphSymMeta {
+    symbol_id: String,
+    name: String,
+    kind: String,
+    file: String,
+    start_line: usize,
+    arch_layer: String,
+    scope: String,
+    section_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct GraphCallEdge {
+    caller_id: String,
+    caller_name: String,
+    callee_name: String,
+    callee_id: String,
+    file: String,
+    line: usize,
+    tier: String,
+    section_id: String,
+}
+
+fn load_bundle_call_graph(
+    bundle_dir: &Path,
+) -> (FxHashMap<String, GraphSymMeta>, Vec<GraphCallEdge>) {
+    let mut syms: FxHashMap<String, GraphSymMeta> = FxHashMap::default();
+    let syms_tsv = bundle_dir.join("index").join("symbols.tsv");
+    if let Ok(content) = fs::read_to_string(&syms_tsv) {
+        for line in content.lines().skip(1) {
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() < 14 {
+                continue;
+            }
+            let symbol_id = cols[0].to_string();
+            syms.insert(
+                symbol_id.clone(),
+                GraphSymMeta {
+                    symbol_id,
+                    name: cols[1].to_string(),
+                    kind: cols[2].to_string(),
+                    file: cols[4].to_string(),
+                    start_line: cols[5].parse().unwrap_or(1),
+                    arch_layer: cols[11].to_string(),
+                    scope: cols[12].to_string(),
+                    section_id: cols[13].to_string(),
+                },
+            );
+        }
+    }
+
+    let mut edges: Vec<GraphCallEdge> = Vec::new();
+    let calls_tsv = bundle_dir.join("index").join("calls.tsv");
+    if let Ok(content) = fs::read_to_string(&calls_tsv) {
+        for line in content.lines().skip(1) {
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() < 8 {
+                continue;
+            }
+            let caller_id = cols[0].to_string();
+            let caller_name = cols[1].to_string();
+            let callee_name = cols[2].to_string();
+            let callee_id = cols[3].to_string();
+            let file = cols[4].to_string();
+            let call_line: usize = cols[5].parse().unwrap_or(1);
+            let tier = cols[6].to_string();
+            let section_id = cols[7].to_string();
+
+            syms.entry(caller_id.clone())
+                .or_insert_with(|| GraphSymMeta {
+                    symbol_id: caller_id.clone(),
+                    name: caller_name.clone(),
+                    kind: "fn".to_string(),
+                    file: file.clone(),
+                    start_line: call_line,
+                    arch_layer: "other".to_string(),
+                    scope: "first_party".to_string(),
+                    section_id: section_id.clone(),
+                });
+
+            syms.entry(callee_id.clone())
+                .or_insert_with(|| GraphSymMeta {
+                    symbol_id: callee_id.clone(),
+                    name: callee_name.clone(),
+                    kind: "fn".to_string(),
+                    file: file.clone(),
+                    start_line: call_line,
+                    arch_layer: "other".to_string(),
+                    scope: "first_party".to_string(),
+                    section_id: section_id.clone(),
+                });
+
+            edges.push(GraphCallEdge {
+                caller_id,
+                caller_name,
+                callee_name,
+                callee_id,
+                file,
+                line: call_line,
+                tier,
+                section_id,
+            });
+        }
+    }
+
+    (syms, edges)
+}
+
+fn match_symbol_ids_for_query(syms: &FxHashMap<String, GraphSymMeta>, query: &str) -> Vec<String> {
+    let q_trim = query.trim();
+    if q_trim.is_empty() {
+        return Vec::new();
+    }
+    let q_lower = q_trim.to_ascii_lowercase();
+    let suffix = format!("::{q_lower}");
+
+    let mut scored: Vec<(u8, String)> = Vec::new();
+    for (id, meta) in syms {
+        let name_lower = meta.name.to_ascii_lowercase();
+        let id_lower = id.to_ascii_lowercase();
+        let score = if meta.name == q_trim || id == q_trim {
+            4
+        } else if name_lower == q_lower || id_lower == q_lower || id_lower.ends_with(&suffix) {
+            3
+        } else if name_lower.contains(&q_lower) || id_lower.contains(&q_lower) {
+            2
+        } else {
+            0
+        };
+        if score > 0 {
+            scored.push((score, id.clone()));
+        }
+    }
+
+    let Some(max_score) = scored.iter().map(|(s, _)| *s).max() else {
+        return Vec::new();
+    };
+    let min_keep = if max_score >= 3 { 3 } else { max_score };
+    let mut ids: Vec<String> = scored
+        .into_iter()
+        .filter(|(s, _)| *s >= min_keep)
+        .map(|(_, id)| id)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Computes the shortest static call path (`from_query` -> ... -> `to_query`) across indexed
+/// bundles using Breadth-First Search (BFS) over `index/calls.tsv` and `index/symbols.tsv`.
+pub fn query_call_path(
+    bundles: &[PathBuf],
+    from_query: &str,
+    to_query: &str,
+    max_depth: usize,
+) -> Result<String> {
+    let max_hops = max_depth.max(1);
+
+    for bundle_dir in bundles {
+        let (syms, edges) = load_bundle_call_graph(bundle_dir);
+        if syms.is_empty() {
+            continue;
+        }
+        let start_ids = match_symbol_ids_for_query(&syms, from_query);
+        let target_ids: FxHashSet<String> = match_symbol_ids_for_query(&syms, to_query)
+            .into_iter()
+            .collect();
+
+        if start_ids.is_empty() || target_ids.is_empty() {
+            continue;
+        }
+
+        let mut adj: FxHashMap<&str, Vec<&GraphCallEdge>> = FxHashMap::default();
+        for edge in &edges {
+            adj.entry(edge.caller_id.as_str()).or_default().push(edge);
+        }
+
+        let mut visited: FxHashSet<String> = FxHashSet::default();
+        let mut parent_map: FxHashMap<String, (String, GraphCallEdge)> = FxHashMap::default();
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+
+        for sid in &start_ids {
+            if target_ids.contains(sid) {
+                let meta = &syms[sid];
+                let bundle_name = bundle_name_from_dir(bundle_dir);
+                return Ok(format!(
+                    "=== Shortest Call Path: '{}' -> '{}' (0 hops in [{}]) ===\n  [0] `{}` (`{}`) ({}) at `{}:{}` [layer={}, shard=`{}`]\n",
+                    from_query,
+                    to_query,
+                    bundle_name,
+                    meta.name,
+                    meta.symbol_id,
+                    meta.kind,
+                    meta.file,
+                    meta.start_line,
+                    meta.arch_layer,
+                    meta.section_id
+                ));
+            }
+            visited.insert(sid.clone());
+            queue.push_back((sid.clone(), 0));
+        }
+
+        let mut reached_target: Option<String> = None;
+
+        'bfs: while let Some((curr_id, depth)) = queue.pop_front() {
+            if depth >= max_hops {
+                continue;
+            }
+            let Some(out_edges) = adj.get(curr_id.as_str()) else {
+                continue;
+            };
+            for &edge in out_edges {
+                let next_id = &edge.callee_id;
+                if visited.insert(next_id.clone()) {
+                    parent_map.insert(next_id.clone(), (curr_id.clone(), edge.clone()));
+                    if target_ids.contains(next_id) {
+                        reached_target = Some(next_id.clone());
+                        break 'bfs;
+                    }
+                    queue.push_back((next_id.clone(), depth + 1));
+                }
+            }
+        }
+
+        if let Some(target_id) = reached_target {
+            let mut hops: Vec<(String, GraphCallEdge)> = Vec::new();
+            let mut cursor = target_id.clone();
+            while let Some((prev_id, edge)) = parent_map.get(&cursor) {
+                hops.push((cursor.clone(), edge.clone()));
+                cursor = prev_id.clone();
+            }
+            hops.reverse();
+
+            let bundle_name = bundle_name_from_dir(bundle_dir);
+            let start_meta = &syms[&cursor];
+            let mut out = format!(
+                "=== Shortest Call Path: '{}' -> '{}' ({} hop{} in [{}]) ===\n",
+                from_query,
+                to_query,
+                hops.len(),
+                if hops.len() == 1 { "" } else { "s" },
+                bundle_name
+            );
+            out.push_str(&format!(
+                "  [0] `{}` (`{}`) ({}) at `{}:{}` [layer={}, shard=`{}`]\n",
+                start_meta.name,
+                start_meta.symbol_id,
+                start_meta.kind,
+                start_meta.file,
+                start_meta.start_line,
+                start_meta.arch_layer,
+                start_meta.section_id
+            ));
+
+            for (idx, (node_id, edge)) in hops.iter().enumerate() {
+                let meta = syms.get(node_id);
+                let kind = meta.map(|m| m.kind.as_str()).unwrap_or("fn");
+                let layer = meta.map(|m| m.arch_layer.as_str()).unwrap_or("other");
+                out.push_str(&format!(
+                    "  -> [{}] `{}` (`{}`) ({}) via `{}:{}` [tier={}, layer={}, shard=`{}`]\n",
+                    idx + 1,
+                    edge.callee_name,
+                    edge.callee_id,
+                    kind,
+                    edge.file,
+                    edge.line,
+                    edge.tier,
+                    layer,
+                    edge.section_id
+                ));
+            }
+            return Ok(out);
+        }
+    }
+
+    Ok(format!(
+        "No call path found from '{from_query}' to '{to_query}' within max depth {max_hops}.\n"
+    ))
+}
+
+/// Computes the reverse-BFS blast radius (`callee` <- `caller` <- ...) of modifying `symbol_query`,
+/// grouping transitive callers by hop distance and highlighting reached entrypoints, ISRs, and tests.
+pub fn query_impact(
+    bundles: &[PathBuf],
+    symbol_query: &str,
+    max_depth: usize,
+    limit: usize,
+) -> Result<String> {
+    let max_hops = max_depth.max(1);
+    let mut out = String::new();
+    let mut any_seed_found = false;
+
+    for bundle_dir in bundles {
+        let (syms, edges) = load_bundle_call_graph(bundle_dir);
+        if syms.is_empty() {
+            continue;
+        }
+        let seed_ids = match_symbol_ids_for_query(&syms, symbol_query);
+        if seed_ids.is_empty() {
+            continue;
+        }
+        any_seed_found = true;
+
+        let mut rev_adj: FxHashMap<&str, Vec<&GraphCallEdge>> = FxHashMap::default();
+        for edge in &edges {
+            rev_adj
+                .entry(edge.callee_id.as_str())
+                .or_default()
+                .push(edge);
+        }
+
+        let mut visited: FxHashSet<String> = FxHashSet::default();
+        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+        for sid in &seed_ids {
+            visited.insert(sid.clone());
+            queue.push_back((sid.clone(), 0));
+        }
+
+        let mut hops_by_depth: Vec<Vec<(GraphSymMeta, GraphCallEdge)>> =
+            vec![Vec::new(); max_hops + 1];
+        let mut affected_shards: BTreeSet<String> = BTreeSet::new();
+        let mut reached_entrypoints: BTreeSet<String> = BTreeSet::new();
+        let mut reached_isrs: BTreeSet<String> = BTreeSet::new();
+        let mut reached_tests: BTreeSet<String> = BTreeSet::new();
+        let mut total_impacted = 0usize;
+
+        while let Some((curr_id, depth)) = queue.pop_front() {
+            if depth >= max_hops {
+                continue;
+            }
+            let Some(in_edges) = rev_adj.get(curr_id.as_str()) else {
+                continue;
+            };
+            for &edge in in_edges {
+                let caller_id = &edge.caller_id;
+                if visited.insert(caller_id.clone()) {
+                    let next_depth = depth + 1;
+                    let meta = syms
+                        .get(caller_id)
+                        .cloned()
+                        .unwrap_or_else(|| GraphSymMeta {
+                            symbol_id: caller_id.clone(),
+                            name: edge.caller_name.clone(),
+                            kind: "fn".to_string(),
+                            file: edge.file.clone(),
+                            start_line: edge.line,
+                            arch_layer: "other".to_string(),
+                            scope: "first_party".to_string(),
+                            section_id: edge.section_id.clone(),
+                        });
+
+                    affected_shards.insert(meta.section_id.clone());
+                    if meta.kind == "entrypoint" {
+                        reached_entrypoints.insert(meta.name.clone());
+                    } else if meta.kind == "isr" {
+                        reached_isrs.insert(meta.name.clone());
+                    }
+                    if meta.scope == "test"
+                        || meta.arch_layer == "tests"
+                        || meta.name.starts_with("test_")
+                    {
+                        reached_tests.insert(meta.name.clone());
+                    }
+
+                    hops_by_depth[next_depth].push((meta, edge.clone()));
+                    total_impacted += 1;
+                    queue.push_back((caller_id.clone(), next_depth));
+                }
+            }
+        }
+
+        let bundle_name = bundle_name_from_dir(bundle_dir);
+        out.push_str(&format!(
+            "=== Impact / Blast Radius for '{}' in [{}] ({} transitive callers across {} shards, max_depth={}) ===\n",
+            symbol_query,
+            bundle_name,
+            total_impacted,
+            affected_shards.len(),
+            max_hops
+        ));
+        out.push_str(&format!(
+            "  Affected Shards : {}\n",
+            if affected_shards.is_empty() {
+                "-".to_string()
+            } else {
+                affected_shards
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+        out.push_str(&format!(
+            "  Entrypoints     : {}\n",
+            if reached_entrypoints.is_empty() {
+                "-".to_string()
+            } else {
+                reached_entrypoints
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ));
+        out.push_str(&format!(
+            "  ISR Handlers    : {}\n",
+            if reached_isrs.is_empty() {
+                "-".to_string()
+            } else {
+                reached_isrs.iter().cloned().collect::<Vec<_>>().join(", ")
+            }
+        ));
+        out.push_str(&format!(
+            "  Test Roots      : {}\n",
+            if reached_tests.is_empty() {
+                "-".to_string()
+            } else {
+                reached_tests.iter().cloned().collect::<Vec<_>>().join(", ")
+            }
+        ));
+
+        let mut shown = 0usize;
+        for (depth, group) in hops_by_depth.into_iter().enumerate().skip(1) {
+            if group.is_empty() || shown >= limit {
+                continue;
+            }
+            out.push_str(&format!("  Hop {depth} ({} callers):\n", group.len()));
+            for (meta, edge) in group {
+                if shown >= limit {
+                    break;
+                }
+                out.push_str(&format!(
+                    "    - `{}` (`{}`) ({}) at `{}:{}` -> calls `{}` at line {} [layer={}, scope={}, shard=`{}`]\n",
+                    meta.name,
+                    meta.symbol_id,
+                    meta.kind,
+                    meta.file,
+                    meta.start_line,
+                    edge.callee_name,
+                    edge.line,
+                    meta.arch_layer,
+                    meta.scope,
+                    meta.section_id
+                ));
+                shown += 1;
+            }
+        }
+        if total_impacted > shown {
+            out.push_str(&format!(
+                "  ... +{} more impacted callers omitted (pass `--limit {}` to view all).\n",
+                total_impacted - shown,
+                total_impacted
+            ));
+        }
+    }
+
+    if !any_seed_found {
+        return Ok(format!(
+            "No symbol or call edges matched '{symbol_query}' for impact analysis.\n"
         ));
     }
 

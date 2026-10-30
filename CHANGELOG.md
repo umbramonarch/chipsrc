@@ -8,6 +8,19 @@ All notable changes to this project are listed here. Versions follow
 
 ### Added
 
+- **Agent-Once Onboarding Blueprint (`.chipsrc.json`) & Turn-1 Discovery (`model.rs`, `scanner.rs`, `mmio.rs`, `parser.rs`, `lib.rs`, `main.rs`)**:
+  - Added root `.chipsrc.json` `RepoBlueprint` support (`scopes`, `layers`, `shards`, `ignore_dirs`, `c_qualifiers`, `entrypoints`, `isr_patterns`, `mmio_ranges`) with BLAKE3 hash folding into the repository Merkle `fingerprint` and `cache.json` (`blueprint_hash`) for automatic cache invalidation.
+  - Extended `chipsrc inspect` (`InspectReport`) with an **Onboarding Digest** (`has_blueprint`, `unclassified_dirs`, `detected_workspaces`, `candidate_c_macros`) and multi-package workspace sharding (`crates/`, `packages/`, `apps/`, `services/`, `modules/`, `components/`).
+- **Local Variable & Parameter Type Binding for Receiver Resolution (`parser.rs`, `resolver.rs`)**:
+  - Added function-scoped local variable and parameter type binding across C/C++, Rust, Python, and TypeScript/JavaScript so `var.method()` and `ptr->method()` calls resolve accurately to their static enclosing type.
+- **Function-Pointer Dispatch Tables, ISR Vectors & Callback Tracking (`parser.rs`, `resolver.rs`)**:
+  - Extracted function-pointer references from struct/array/object initializers and callback arguments (`fn_ptr_candidate`), precision-filtered against known repository symbols in compatible language families (`fn_ptr_ref` / `dispatches_fn`), and synthesized static call-graph edges.
+- **MMIO Register & Struct/Class Field Mutability Dataflow (`mmio.rs`, `parser.rs`, `resolver.rs`)**:
+  - Classified MMIO peripheral accesses and struct/class member accesses into write vs read dataflow relations (`writes_reg`, `reads_reg`, `writes_field`, `reads_field`) in `index/xref.tsv`.
+- **Multi-Hop Shortest Call-Path (`chipsrc path`) & Blast-Radius (`chipsrc impact`) Queries (`query.rs`, `main.rs`)**:
+  - Added `chipsrc path <from> <to> [--max-depth N]` (BFS shortest static call chain) and `chipsrc impact <symbol> [--max-depth N]` (reverse-BFS blast radius highlighting affected shards, entrypoints, ISR handlers, and test roots).
+- **Thread-Local Parser Pool, Zero-Clone Incremental Cache & Single-Pass Auto-Refresh (`parser.rs`, `emitter.rs`, `lib.rs`, `post_edit_hook.py`)**:
+  - Added thread-local Tree-sitter `Parser` pooling (`THREAD_PARSERS`), in-place `IncrementalAstCache` entry removal (`existing_cache.files.remove`), compact single-line `cache.json` serialization, single-pass `auto_refresh_bundles` fingerprint checking, and silent `post_edit_hook.py` execution on clean incremental syncs.
 - **Single-File Component (`.astro`, `.vue`, `.svelte`) & JSX/TSX Extraction (`model.rs`, `parser.rs`)**:
   - Added byte-aligned SFC preprocessing (`preprocess_sfc_to_tsx`) that preserves exact 1:1 byte and line coordinates across frontmatter (`---`), `<script>` blocks, and component templates.
   - Added component symbol synthesis, JSX/template PascalCase component usage call/xref edges (`<Component />`), nested helper arrow-function extraction, HTTP route handler entrypoint classification (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `ALL`), and exported constant indexing.
