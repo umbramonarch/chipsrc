@@ -18,6 +18,8 @@ ASSERTION_LABELS = [
 
 ALL_LABELS = [
     *ASSERTION_LABELS,
+    "dup-content: fixture directory exists",
+    "dup-content: fixture bundle ready",
     "dup-content: initial convert",
     "dup-content: incremental edit convert",
     "dup-content: query sibling symbol",
@@ -80,10 +82,7 @@ def run_suite(ctx: HarnessContext) -> None:
         )
         return
 
-    if (
-        not ctx.ensure_fixture_bundle(fixture_name, fixture_src)
-        and ctx.fixtures_mode == "require"
-    ):
+    if not ctx.ensure_fixture_bundle(fixture_name, fixture_src):
         return
 
     source = ctx.sandbox_dir / "copies" / fixture_name

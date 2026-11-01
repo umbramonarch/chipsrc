@@ -47,6 +47,11 @@ All notable changes to this project are listed here. Versions follow
 
 ### Fixed
 
+- **QA Harness Rerun Idempotency, Fixture-Bundle Separation, Build-Failure Recording & Sandbox Cleanup (`qa/qa_blackbox.py`, `qa/lib/runner.py`, `qa/suites/real.py`, `qa/suites/dup_content.py`, `qa/README.md`)**:
+  - Separated checked-in fixture bundles (`<out>/fixture-bundles/<fixture>` via `ensure_fixture_bundle`) from real-repository baseline bundles (`<out>/bundles/<repo>` via `ensure_repo_bundle`), automatically migrating any stray `<out>/bundles/<fixture>` directories and filtering `real` multi-bundle freshness checks to named repository bundles so repeated `--suite core` runs into the same `--out` directory are idempotent.
+  - Recorded `<name>: fixture bundle ready` as a failed check with the command's `args`, `exit`, and `wall_ms` when a fixture or baseline bundle build fails under `--fixtures-mode build`.
+  - Updated `HarnessContext.check` (along with `skip_record` and `record_observational`) to emit `null` for `args`, `exit`, and `wall_ms` on non-command assertions instead of inheriting values from the previous subprocess invocation.
+  - Removed per-suite `<out>/sandboxes/<suite>-<timestamp>/` directories at the end of a successful suite unless `--keep-sandboxes` is passed.
 - **Honest Incremental Stage Timings, Header-Validated TSV Integrity & Exact-Symbol Loader (`scanner.rs`, `query.rs`, `lib.rs`)**:
   - Removed the artificial `link_ms = graph_ms = 0` override in `convert_repo` when `resolve_and_link` and `analyze_graph` run after line-count-changing comment edits; `link_ms = graph_ms = shard_ms = 0` is reported only when the real `can_short_circuit` fast path skips those stages.
   - Added `scanner::has_valid_tsv_header` and wired it into `scanner::first_missing_bundle_artifact` and `query::load_index_table` so zero-byte or header-less `index/*.tsv` files are treated as missing/incomplete, self-healed by `ensure`/`convert`/`auto_refresh_bundles`, and flagged as stale by `status --check`.

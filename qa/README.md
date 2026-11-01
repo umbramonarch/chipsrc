@@ -41,7 +41,8 @@ python -I qa/qa_blackbox.py --suite core --bin target/release/chipsrc.exe --repo
 | `--only <PATTERN>` | *(none)* | Only record/run assertions whose `label` matches `<PATTERN>` (case-insensitive substring, repeatable). |
 | `--skip <PATTERN>` | *(none)* | Skip assertions whose `label` matches `<PATTERN>` (case-insensitive substring, repeatable). |
 | `--timeout <SECONDS>` | `120.0` | Per-command subprocess timeout in seconds. Timeouts are recorded as failed records without uncaught Python tracebacks. |
-| `--fixtures-mode <MODE>` | `build` | `build` (default) builds or refreshes missing/stale baseline bundles under `<out>/bundles/` when `meta.json` fingerprint or cache schema (`2.1.0`) differs from `inspect`. `require` fails if a required fixture bundle is missing or stale. |
+| `--fixtures-mode <MODE>` | `build` | `build` (default) builds or refreshes missing/stale baseline repo bundles under `<out>/bundles/` and fixture bundles under `<out>/fixture-bundles/` when `meta.json` fingerprint or cache schema (`2.1.0`) differs from `inspect` (recording a failed check if a build fails). `require` fails if a required bundle is missing or stale. |
+| `--keep-sandboxes` | `false` | Preserve per-suite `<out>/sandboxes/<suite>-<timestamp>/` directories after a successful suite run (removed by default when a suite passes with 0 failures). |
 | `-h`, `--help` | — | Display CLI usage, flags, and available suites. |
 
 ---
@@ -86,9 +87,9 @@ Each executed suite writes `<out>/<suite>-results.json` containing a JSON array 
   "passed": true,
   "skipped": false,
   "detail": null,
-  "args": ["sym", "-b", "...", "pm_match_key", "--json"],
-  "exit": 0,
-  "wall_ms": 14.2
+  "args": null,
+  "exit": null,
+  "wall_ms": null
 }
 ```
 
@@ -96,9 +97,9 @@ Each executed suite writes `<out>/<suite>-results.json` containing a JSON array 
 - `passed`: `true` (passed), `false` (failed), or `null` (skipped)
 - `skipped`: `true` when skipped due to missing repository/corpus, otherwise `false`
 - `detail`: diagnostic value, mismatch diff, or skip/failure reason
-- `args`: CLI argument list passed to `chipsrc`
-- `exit`: process exit code (`0`, non-zero, `-1` on timeout/OS error, or `null` when skipped)
-- `wall_ms`: elapsed wall-clock time in milliseconds
+- `args`: CLI argument list passed to `chipsrc` for command invocations, or `null` for non-command assertion/skip/observational records
+- `exit`: process exit code (`0`, non-zero, `-1` on timeout/OS error, or `null` when not a command or skipped)
+- `wall_ms`: elapsed wall-clock time in milliseconds for command invocations, or `null` when not a command
 
 Intentionally negative CLI probes (`run(..., expected=None)`, such as `missing repo`, `missing bundle`, `bad vendor mode`, and `negative limit` in `real`) record their actual non-zero `exit` code, carry `"probe": true`, `"expected_exit": null`, `"expected_failure": true`, `"surfaced": true`, and `"paired_assertion": "<label>: fails without panic"`, and are listed under `surfaced_probes` in `<out>/summary.json`.
 
@@ -109,7 +110,8 @@ Intentionally negative CLI probes (`run(..., expected=None)`, such as `missing r
 ## Oracles (`qa/oracles/*.json`) & Sandbox Isolation
 
 - **Externalized Oracles**: All repository-specific and fixture golden values (symbol names, file paths, line numbers, cross-module caller `(file, line)` pairs, section counts, and expected substrings) live in `qa/oracles/<repo>.json` (`chipsrc.json`, `smart_locker.json`, `volt_website.json`, `beautiful-embedded-c.json`, `dup-content.json`). No drive letters (`[A-Za-z]:\`) or hardcoded golden numbers are inlined in `qa/**/*.py`.
-- **Read-Only Real Repositories**: Real repositories under `--repos-root` and `--corpus-root` are treated as strictly **read-only**. The harness never writes bundles (`-o`) or edits inside real repositories; all mutation tests copy source files into isolated sandboxes under `<out>/sandboxes/<suite>-<timestamp>/`.
+- **Bundle Layout Separation**: Real-repository baseline bundles (`chipsrc`, `smart_locker`, `volt_website`, `beautiful-embedded-c`) live under `<out>/bundles/<repo>`, while checked-in fixture bundles (`dup-content`, etc.) are built under `<out>/fixture-bundles/<fixture>` so multi-bundle status checks on `<out>/bundles/` remain idempotent across reruns.
+- **Read-Only Real Repositories & Sandbox Cleanup**: Real repositories under `--repos-root` and `--corpus-root` are treated as strictly **read-only**. The harness never writes bundles (`-o`) or edits inside real repositories; all mutation tests copy source files into isolated sandboxes under `<out>/sandboxes/<suite>-<timestamp>/`. Per-suite sandboxes under `<out>/sandboxes/` are removed at the end of a successful suite unless `--keep-sandboxes` is passed.
 - **Same-Second Sub-Second Mutation**: `qa/lib/mutate.py` (`mutate_same_second`) applies equal-byte replacements and shifts `st_mtime_ns` by `±100 ms` with carry protection (`os.utime(..., ns=...)`) so the integer second (`int(st_mtime)`) never rolls over into the next second.
 
 ---

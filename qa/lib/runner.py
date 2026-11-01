@@ -63,15 +63,41 @@ class HarnessContext:
 
         self.bundles_dir = self.out_dir / "bundles"
         self.fixture_bundles_dir = self.out_dir / "fixture-bundles"
-        self.sandbox_dir = self.out_dir / "sandboxes" / f"{suite_name}-{time.time_ns()}"
+        self.sandboxes_dir = self.out_dir / "sandboxes"
+        self.sandbox_dir = self.sandboxes_dir / f"{suite_name}-{time.time_ns()}"
         self.log_path = self.out_dir / f"{suite_name}-results.json"
 
         self.results: list[dict] = []
         self.surfaced_probes: list[dict] = []
-        self._last_invocation: dict | None = None
         self._oracle_cache: dict[str, dict] = {}
 
         self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.sandboxes_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_stray_fixture_bundles()
+
+    def _migrate_stray_fixture_bundles(self) -> None:
+        if not (self.fixtures_dir.is_dir() and self.bundles_dir.is_dir()):
+            return
+        for fx in self.fixtures_dir.iterdir():
+            if not fx.is_dir():
+                continue
+            stray = self.bundles_dir / fx.name
+            if stray.exists():
+                dest = self.fixture_bundles_dir / fx.name
+                if not dest.exists():
+                    self.fixture_bundles_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(stray), str(dest))
+                else:
+                    shutil.rmtree(stray, ignore_errors=True)
+
+    def cleanup_sandbox(self) -> None:
+        if self.sandbox_dir.exists():
+            shutil.rmtree(self.sandbox_dir, ignore_errors=True)
+        if self.sandboxes_dir.is_dir():
+            prefix = f"{self.suite_name}-"
+            for entry in self.sandboxes_dir.iterdir():
+                if entry.is_dir() and entry.name.startswith(prefix):
+                    shutil.rmtree(entry, ignore_errors=True)
 
     def matches_filter(self, label: str) -> bool:
         lower = label.lower()
@@ -154,21 +180,26 @@ class HarnessContext:
             "passed": None,
             "skipped": True,
             "detail": reason,
-            "args": [],
+            "args": None,
             "exit": None,
-            "wall_ms": 0.0,
+            "wall_ms": None,
         }
         self.results.append(record)
         self.save()
 
-    def check(self, label: str, passed: bool, detail: object = None) -> bool:
+    def check(
+        self,
+        label: str,
+        passed: bool,
+        detail: object = None,
+        *,
+        args: list[str] | None = None,
+        exit_code: int | None = None,
+        wall_ms: float | None = None,
+    ) -> bool:
         ok = bool(passed)
         if not self.matches_filter(label):
             return ok
-        last = self._last_invocation
-        args = list(last["args"]) if last and "args" in last else []
-        exit_code = last["exit"] if last and "exit" in last else 0
-        wall_ms = last["wall_ms"] if last and "wall_ms" in last else 0.0
         status = "passed" if ok else "failed"
         record = {
             "label": label,
@@ -177,7 +208,7 @@ class HarnessContext:
             "passed": ok,
             "skipped": False,
             "detail": detail,
-            "args": args,
+            "args": list(args) if args is not None else None,
             "exit": exit_code,
             "wall_ms": wall_ms,
         }
@@ -197,9 +228,9 @@ class HarnessContext:
             "passed": True,
             "skipped": False,
             "detail": payload,
-            "args": [],
-            "exit": 0,
-            "wall_ms": 0.0,
+            "args": None,
+            "exit": None,
+            "wall_ms": None,
         }
         record.update(payload)
         self.results.append(record)
@@ -325,7 +356,6 @@ class HarnessContext:
             if paired_assertion:
                 record["paired_assertion"] = paired_assertion
 
-        self._last_invocation = record
         should_emit = self.matches_filter(label) or (
             paired_assertion is not None and self.matches_filter(paired_assertion)
         )
@@ -387,7 +417,6 @@ class HarnessContext:
             "stderr": stderr,
             "wall_ms": wall_ms,
         }
-        self._last_invocation = record
         if self.matches_filter(label):
             self.results.append(record)
             if not passed:
@@ -506,9 +535,12 @@ class HarnessContext:
             return False
         return True
 
-    def ensure_fixture_bundle(self, repo: str, repo_path: Path | None = None) -> bool:
-        target_repo = repo_path if repo_path is not None else (self.repos_root / repo)
-        bundle_dir = self.bundles_dir / repo
+    def _ensure_bundle(
+        self,
+        repo: str,
+        target_repo: Path,
+        bundle_dir: Path,
+    ) -> bool:
         if self._bundle_is_ready_and_fresh(target_repo, bundle_dir):
             return True
 
@@ -520,21 +552,52 @@ class HarnessContext:
             )
             return False
 
-        self.bundles_dir.mkdir(parents=True, exist_ok=True)
-        code, _, _, stderr, err = self._exec_Raw(
-            ["convert", str(target_repo), "-o", str(bundle_dir)],
+        bundle_dir.parent.mkdir(parents=True, exist_ok=True)
+        cmd_args = ["convert", str(target_repo), "-o", str(bundle_dir)]
+        code, wall_ms, _, stderr, err = self._exec_Raw(
+            cmd_args,
             cwd=self.out_dir,
         )
-        if err is not None or code != 0:
+        if (
+            err is not None
+            or code != 0
+            or not self._bundle_is_ready_and_fresh(target_repo, bundle_dir)
+        ):
+            reason = (
+                err
+                or stderr.strip()
+                or f"fixture bundle build failed with exit={code} at {bundle_dir}"
+            )
+            self.check(
+                f"{repo}: fixture bundle ready",
+                False,
+                reason,
+                args=cmd_args,
+                exit_code=code,
+                wall_ms=wall_ms,
+            )
             return False
         return True
+
+    def ensure_repo_bundle(self, repo: str, repo_path: Path | None = None) -> bool:
+        target_repo = repo_path if repo_path is not None else (self.repos_root / repo)
+        bundle_dir = self.bundles_dir / repo
+        return self._ensure_bundle(repo, target_repo, bundle_dir)
+
+    def ensure_fixture_bundle(self, repo: str, repo_path: Path | None = None) -> bool:
+        target_repo = repo_path if repo_path is not None else (self.fixtures_dir / repo)
+        bundle_dir = self.fixture_bundles_dir / repo
+        stray_bundle = self.bundles_dir / repo
+        if stray_bundle.exists():
+            shutil.rmtree(stray_bundle, ignore_errors=True)
+        return self._ensure_bundle(repo, target_repo, bundle_dir)
 
     def copy_corpus(self, repo: str, name: str) -> Path:
         source = self.sandbox_dir / "copies" / name
         source.mkdir(parents=True, exist_ok=True)
         repo_root = self.repos_root / repo
 
-        self.ensure_fixture_bundle(repo, repo_root)
+        self.ensure_repo_bundle(repo, repo_root)
         meta = self.read_meta(self.bundles_dir / repo)
         stamps = meta.get("file_stamps")
         if isinstance(stamps, list) and stamps:

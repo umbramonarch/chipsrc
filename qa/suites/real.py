@@ -88,7 +88,7 @@ def run_suite(ctx: HarnessContext) -> None:
     bec_o = oracles["beautiful-embedded-c"]
 
     for repo in REPOS:
-        ctx.ensure_fixture_bundle(repo)
+        ctx.ensure_repo_bundle(repo)
 
     for repo in REPOS:
         repo_path = ctx.repos_root / repo
@@ -385,11 +385,20 @@ def run_suite(ctx: HarnessContext) -> None:
         >= chipsrc_o["multi_bundle_min_bundles"],
     )
     r = ctx.run("Multi-bundle freshness", "status", ctx.bundles_dir, "--check", "--json")
+    named_entries = (
+        [
+            x
+            for x in r["json"]
+            if isinstance(x, dict) and x.get("bundle_name") in REPOS
+        ]
+        if isinstance(r["json"], list)
+        else []
+    )
     ctx.check(
         "All four bundles fresh",
-        isinstance(r["json"], list)
-        and len(r["json"]) == chipsrc_o["expected_bundle_count"]
-        and all(isinstance(x, dict) and x.get("is_fresh") for x in r["json"]),
+        len(named_entries) == chipsrc_o["expected_bundle_count"]
+        and {x.get("bundle_name") for x in named_entries} == set(REPOS)
+        and all(x.get("is_fresh") for x in named_entries),
     )
 
     for command, text in locker_o["limit_probe_queries"]:

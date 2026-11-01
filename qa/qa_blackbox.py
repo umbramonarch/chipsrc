@@ -93,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out",
         default=str(default_out),
-        help="Output directory for <suite>-results.json, summary.json, bundles/, and sandboxes/.",
+        help="Output directory for <suite>-results.json, summary.json, bundles/, fixture-bundles/, and sandboxes/.",
     )
     parser.add_argument(
         "--suite",
@@ -131,6 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["build", "require"],
         default="build",
         help="Whether to build missing/stale fixture bundles ('build', default) or fail if absent ('require').",
+    )
+    parser.add_argument(
+        "--keep-sandboxes",
+        action="store_true",
+        default=False,
+        help="Preserve per-suite <out>/sandboxes/<suite>-<timestamp>/ directories after a successful run.",
     )
     parser.add_argument(
         "positional_suites",
@@ -248,6 +254,9 @@ def main(argv: list[str] | None = None) -> int:
         s_failed = sum(1 for r in records if r.get("status") == "failed")
         s_skipped = sum(1 for r in records if r.get("status") == "skipped")
         s_total = len(records)
+
+        if s_failed == 0 and not args.keep_sandboxes:
+            ctx.cleanup_sandbox()
 
         a_records = [r for r in records if r.get("kind") == "assertion"]
         a_passed = sum(1 for r in a_records if r.get("status") == "passed")
