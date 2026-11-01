@@ -1320,6 +1320,7 @@ mod tests {
                 arch_layer,
                 size_bytes: 128,
                 mtime_secs: 0,
+                mtime_nanos: 0,
                 blake3_hash: "0123456789abcdef".to_string(),
                 line_count: 16,
             },

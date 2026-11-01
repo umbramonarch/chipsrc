@@ -49,7 +49,7 @@ def find_matching_bundles(project_dir: Path, edited_file: Path) -> list[tuple[Pa
                     continue
                 src_path = Path(source_root).resolve()
                 if is_path_within(edited_resolved, src_path):
-                    matches.append((output_root, str(src_path), str(vendor_mode)))
+                    matches.append((child, str(src_path), str(vendor_mode)))
             except Exception:
                 continue
     except OSError:
@@ -98,15 +98,15 @@ def main() -> int:
     if not binary:
         return 0
 
-    for output_root, source_root, vendor_mode in matches:
+    for bundle_dir, source_root, vendor_mode in matches:
         try:
             subprocess.run(
                 [
                     binary,
-                    "ensure",
+                    "convert",
                     source_root,
                     "-o",
-                    str(output_root),
+                    str(bundle_dir),
                     "--vendor-mode",
                     vendor_mode,
                 ],

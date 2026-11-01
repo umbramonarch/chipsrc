@@ -318,7 +318,7 @@ pub fn scan_repository(
             true
         });
 
-    let mut candidate_paths: Vec<(PathBuf, String, LanguageKind, u64, u64)> = Vec::new();
+    let mut candidate_paths: Vec<(PathBuf, String, LanguageKind, u64, u64, u32)> = Vec::new();
     let bp_ref = blueprint_opt.as_ref().map(|(bp, _)| bp);
 
     for entry_res in walker.build() {
@@ -357,12 +357,7 @@ pub fn scan_repository(
             continue;
         }
 
-        let mtime_secs = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let (mtime_secs, mtime_nanos) = file_mtime_secs_nanos(&meta);
 
         let rel_path = match abs_path.strip_prefix(repo_path) {
             Ok(rel) => normalize_rel_path(rel),
@@ -380,63 +375,74 @@ pub fn scan_repository(
             }
         }
 
-        candidate_paths.push((abs_path, rel_path, language, size_bytes, mtime_secs));
+        candidate_paths.push((
+            abs_path,
+            rel_path,
+            language,
+            size_bytes,
+            mtime_secs,
+            mtime_nanos,
+        ));
     }
 
     let mut scanned_files: Vec<ScannedFile> = candidate_paths
         .into_par_iter()
-        .filter_map(|(abs_path, rel_path, language, size_bytes, mtime_secs)| {
-            let bytes = fs::read(&abs_path).ok()?;
-            if bytes.is_empty() {
-                return None;
-            }
-
-            let explicit_example_scope = bp_ref
-                .and_then(|bp| match_longest_prefix(&rel_path, &bp.scopes))
-                .is_some_and(|(matched_key, _)| {
-                    matched_key.split('/').any(|seg| {
-                        matches!(
-                            seg.to_ascii_lowercase().as_str(),
-                            "examples"
-                                | "example"
-                                | "samples"
-                                | "sample"
-                                | "demos"
-                                | "demo"
-                                | "templates"
-                                | "template"
-                                | "boards"
-                                | "board"
-                        )
-                    })
-                });
-            let scope = classify_file_scope_with_blueprint(&rel_path, size_bytes, &bytes, bp_ref);
-            if scope == FileScope::VendorSdk {
-                if vendor_mode == VendorMode::None {
+        .filter_map(
+            |(abs_path, rel_path, language, size_bytes, mtime_secs, mtime_nanos)| {
+                let bytes = fs::read(&abs_path).ok()?;
+                if bytes.is_empty() {
                     return None;
                 }
-                if !explicit_example_scope && is_vendor_example_or_demo_path(&rel_path) {
-                    return None;
+
+                let explicit_example_scope = bp_ref
+                    .and_then(|bp| match_longest_prefix(&rel_path, &bp.scopes))
+                    .is_some_and(|(matched_key, _)| {
+                        matched_key.split('/').any(|seg| {
+                            matches!(
+                                seg.to_ascii_lowercase().as_str(),
+                                "examples"
+                                    | "example"
+                                    | "samples"
+                                    | "sample"
+                                    | "demos"
+                                    | "demo"
+                                    | "templates"
+                                    | "template"
+                                    | "boards"
+                                    | "board"
+                            )
+                        })
+                    });
+                let scope =
+                    classify_file_scope_with_blueprint(&rel_path, size_bytes, &bytes, bp_ref);
+                if scope == FileScope::VendorSdk {
+                    if vendor_mode == VendorMode::None {
+                        return None;
+                    }
+                    if !explicit_example_scope && is_vendor_example_or_demo_path(&rel_path) {
+                        return None;
+                    }
                 }
-            }
 
-            let arch_layer = classify_arch_layer_with_blueprint(&rel_path, scope, bp_ref);
-            let line_count = memchr::memchr_iter(b'\n', &bytes).count() + 1;
-            let full_hash = blake3::hash(&bytes).to_hex();
-            let blake3_hash = full_hash[..16].to_string();
+                let arch_layer = classify_arch_layer_with_blueprint(&rel_path, scope, bp_ref);
+                let line_count = memchr::memchr_iter(b'\n', &bytes).count() + 1;
+                let full_hash = blake3::hash(&bytes).to_hex();
+                let blake3_hash = full_hash[..16].to_string();
 
-            Some(ScannedFile {
-                rel_path,
-                abs_path,
-                language,
-                scope,
-                arch_layer,
-                size_bytes,
-                mtime_secs,
-                blake3_hash,
-                line_count,
-            })
-        })
+                Some(ScannedFile {
+                    rel_path,
+                    abs_path,
+                    language,
+                    scope,
+                    arch_layer,
+                    size_bytes,
+                    mtime_secs,
+                    mtime_nanos,
+                    blake3_hash,
+                    line_count,
+                })
+            },
+        )
         .collect();
 
     scanned_files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -464,6 +470,14 @@ pub fn scan_repository(
     Ok((scanned_files, fingerprint))
 }
 
+fn file_mtime_secs_nanos(meta: &fs::Metadata) -> (u64, u32) {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0))
+}
+
 /// Canonicalizes `repo_path` into a normalized forward-slash `source_root` and clean `repo_name`.
 pub fn canonical_repo_root_and_name(repo_path: &Path) -> (String, String) {
     let canonical = repo_path
@@ -484,9 +498,19 @@ pub fn canonical_repo_root_and_name(repo_path: &Path) -> (String, String) {
 }
 
 /// Loads `meta.json` from `bundle_dir` if present and valid.
+///
+/// If any `file_stamps` entry in `meta.json` lacks the `mtime_nanos` field (e.g. a legacy
+/// `2.0.0` bundle), `file_stamps` is cleared so callers trigger a one-time rebuild.
 pub fn load_meta_file(bundle_dir: &Path) -> Option<BundleMetaFile> {
     let bytes = fs::read(bundle_dir.join("meta.json")).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let mut meta: BundleMetaFile = serde_json::from_slice(&bytes).ok()?;
+    if !meta.metadata.file_stamps.is_empty() {
+        let nanos_count = memchr::memmem::find_iter(&bytes, b"\"mtime_nanos\"").count();
+        if nanos_count < meta.metadata.file_stamps.len() {
+            meta.metadata.file_stamps.clear();
+        }
+    }
+    Some(meta)
 }
 
 /// Loads `cache/manifest.json` from `bundle_dir` if present and matching `CACHE_SCHEMA_VERSION`.
@@ -494,7 +518,7 @@ pub fn load_cache_manifest(bundle_dir: &Path) -> Option<CacheManifest> {
     let manifest_path = bundle_dir.join("cache").join("manifest.json");
     let bytes = fs::read(manifest_path).ok()?;
     let manifest: CacheManifest = serde_json::from_slice(&bytes).ok()?;
-    if !manifest.schema_version.is_empty() && manifest.schema_version != CACHE_SCHEMA_VERSION {
+    if manifest.schema_version != CACHE_SCHEMA_VERSION {
         return None;
     }
     Some(manifest)
@@ -507,14 +531,13 @@ pub fn load_cache_shard(bundle_dir: &Path, shard_rel: &str) -> Option<ParsedFile
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Returns `true` when `bundle_dir` has either `cache/manifest.json` (schema 2.0.0) or legacy `cache.json`.
+/// Returns `true` when `bundle_dir` has a valid `cache/manifest.json` matching `CACHE_SCHEMA_VERSION`.
 pub fn has_bundle_cache(bundle_dir: &Path) -> bool {
-    bundle_dir.join("cache").join("manifest.json").is_file()
-        || bundle_dir.join("cache.json").is_file()
+    load_cache_manifest(bundle_dir).is_some()
 }
 
 /// Loads the incremental AST cache from `bundle_dir/cache/manifest.json` + `cache/*.json` shards
-/// (schema `2.0.0`), falling back once to legacy `bundle_dir/cache.json` (`1.0.0`) for migration.
+/// (schema `2.1.0`).
 pub fn load_cache_file(bundle_dir: &Path) -> Option<IncrementalAstCache> {
     if let Some(manifest) = load_cache_manifest(bundle_dir) {
         let entries: Vec<(&String, &crate::model::CacheShardEntry)> =
@@ -540,14 +563,10 @@ pub fn load_cache_file(bundle_dir: &Path) -> Option<IncrementalAstCache> {
         });
     }
 
-    // Legacy 1.0.0 `cache.json` fallback (migrated and deleted on next emit)
     let legacy_path = bundle_dir.join("cache.json");
     let bytes = fs::read(&legacy_path).ok()?;
     let mut cache: IncrementalAstCache = serde_json::from_slice(&bytes).ok()?;
-    if !cache.schema_version.is_empty()
-        && cache.schema_version != CACHE_SCHEMA_VERSION
-        && cache.schema_version != "1.0.0"
-    {
+    if cache.schema_version != CACHE_SCHEMA_VERSION {
         return None;
     }
     cache.schema_version = CACHE_SCHEMA_VERSION.to_string();
@@ -564,13 +583,13 @@ pub struct StampCheck {
     pub changed_count: usize,
     pub added: usize,
     pub deleted: usize,
-    pub touched_mtimes: BTreeMap<String, u64>,
+    pub touched_mtimes: BTreeMap<String, (u64, u32)>,
     pub scanned_files: Option<Vec<ScannedFile>>,
     pub fingerprint: String,
 }
 
-/// Walks `repo_path` comparing `(mtime_secs, size_bytes)` against `meta.file_stamps` WITHOUT
-/// reading unchanged files from disk. Only files whose `(mtime_secs, size_bytes)` differ from
+/// Walks `repo_path` comparing `(mtime_secs, mtime_nanos, size_bytes)` against `meta.file_stamps` WITHOUT
+/// reading unchanged files from disk. Only files whose `(mtime_secs, mtime_nanos, size_bytes)` differ from
 /// their recorded stamp ("suspects") are read and BLAKE3-hashed; touch-only suspects whose
 /// BLAKE3 hash matches `stamp.blake3_hash` are treated as unchanged and recorded in `touched_mtimes`.
 pub fn stamp_check(
@@ -689,12 +708,7 @@ pub fn stamp_check(
         if size_bytes == 0 || size_bytes > max_file_bytes {
             continue;
         }
-        let mtime_secs = fs_meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let (mtime_secs, mtime_nanos) = file_mtime_secs_nanos(&fs_meta);
 
         let rel_path = match abs_path.strip_prefix(repo_path) {
             Ok(rel) => normalize_rel_path(rel),
@@ -714,6 +728,7 @@ pub fn stamp_check(
             if !blueprint_changed
                 && stamp.size_bytes == size_bytes
                 && stamp.mtime_secs == mtime_secs
+                && stamp.mtime_nanos == mtime_nanos
                 && stamp.mtime_secs > 0
             {
                 // Trusted stat-only hit: no fs::read needed!
@@ -726,6 +741,7 @@ pub fn stamp_check(
                         arch_layer: stamp.arch_layer,
                         size_bytes,
                         mtime_secs,
+                        mtime_nanos,
                         blake3_hash: stamp.blake3_hash.clone(),
                         line_count: stamp.line_count,
                     });
@@ -752,7 +768,7 @@ pub fn stamp_check(
                 && stamp.scope == scope
                 && stamp.arch_layer == arch_layer
             {
-                touched_mtimes.insert(rel_path.clone(), mtime_secs);
+                touched_mtimes.insert(rel_path.clone(), (mtime_secs, mtime_nanos));
             } else {
                 modified += 1;
             }
@@ -764,6 +780,7 @@ pub fn stamp_check(
                 arch_layer,
                 size_bytes,
                 mtime_secs,
+                mtime_nanos,
                 blake3_hash,
                 line_count,
             });
@@ -1780,5 +1797,56 @@ mod tests {
         assert_eq!(rel_paths, vec!["src/app.c"]);
         assert_eq!(fingerprint.len(), 16);
         assert_eq!(files[0].scope, FileScope::FirstParty);
+    }
+
+    #[test]
+    fn stamp_check_detects_same_second_same_size_edit() {
+        use std::time::Duration;
+
+        let tmp = TestTempDir::new("chipsrc_scanner_same_sec");
+        let repo_dir = tmp.path().join("repo");
+        let out_dir = tmp.path().join("bundle");
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+
+        let file_path = repo_dir.join("src/lib.c");
+        let content_v1 = "int alpha_fn(void) { return 1; }\n";
+        let content_v2 = "int bravo_fn(void) { return 1; }\n";
+        assert_eq!(content_v1.len(), content_v2.len());
+
+        std::fs::write(&file_path, content_v1).unwrap();
+        let t0 = UNIX_EPOCH + Duration::new(1_700_000_000, 100_000_000);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .unwrap()
+            .set_modified(t0)
+            .unwrap();
+
+        let cfg = crate::model::ConvertConfig::new(repo_dir.clone(), out_dir);
+        let bundle = crate::convert_repo(&cfg).expect("initial convert_repo");
+
+        let sc_clean =
+            stamp_check(&repo_dir, &bundle.metadata, DEFAULT_MAX_FILE_BYTES).expect("stamp_check");
+        assert!(sc_clean.unchanged);
+        assert_eq!(sc_clean.changed_count, 0);
+
+        // Same-size edit +100ms within the same whole second
+        std::fs::write(&file_path, content_v2).unwrap();
+        let t1 = UNIX_EPOCH + Duration::new(1_700_000_000, 200_000_000);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file_path)
+            .unwrap()
+            .set_modified(t1)
+            .unwrap();
+
+        let sc_dirty =
+            stamp_check(&repo_dir, &bundle.metadata, DEFAULT_MAX_FILE_BYTES).expect("stamp_check");
+        assert!(
+            !sc_dirty.unchanged,
+            "Expected same-second same-size edit to be detected as changed"
+        );
+        assert_eq!(sc_dirty.changed_count, 1);
+        assert_eq!(sc_dirty.suspects.len(), 1);
     }
 }

@@ -163,8 +163,9 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         && (!config.single_file || single_md_path.is_file());
 
     let existing_meta_opt = if bundle_ready {
-        scanner::load_meta_file(&config.output_dir)
-            .filter(|m| m.metadata.vendor_mode == config.vendor_mode)
+        scanner::load_meta_file(&config.output_dir).filter(|m| {
+            m.metadata.vendor_mode == config.vendor_mode && !m.metadata.file_stamps.is_empty()
+        })
     } else {
         None
     };
@@ -195,8 +196,11 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
 
                 if !sc.touched_mtimes.is_empty() {
                     for stamp in &mut existing_meta.metadata.file_stamps {
-                        if let Some(&new_mtime) = sc.touched_mtimes.get(&stamp.rel_path) {
+                        if let Some(&(new_mtime, new_nanos)) =
+                            sc.touched_mtimes.get(&stamp.rel_path)
+                        {
                             stamp.mtime_secs = new_mtime;
+                            stamp.mtime_nanos = new_nanos;
                         }
                     }
                     if let Ok(json_str) = serde_json::to_string_pretty(&existing_meta) {
@@ -267,7 +271,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
 
     // 3. Incremental AST parse & Structural Digest No-Op Short-Circuit (Bug 7)
     let t_parse = Instant::now();
-    let prev_manifest_opt = if !config.force {
+    let prev_manifest_opt = if existing_meta_opt.is_some() {
         scanner::load_cache_manifest(&config.output_dir)
             .filter(|m| m.blueprint_hash == blueprint_hash && m.vendor_mode == config.vendor_mode)
     } else {
@@ -371,6 +375,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                     rel_path: f.rel_path.clone(),
                     size_bytes: f.size_bytes,
                     mtime_secs: f.mtime_secs,
+                    mtime_nanos: f.mtime_nanos,
                     line_count: f.line_count,
                     blake3_hash: f.blake3_hash.clone(),
                     scope: f.scope,
@@ -451,13 +456,14 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         all_units.sort_by(|a, b| a.scanned.rel_path.cmp(&b.scanned.rel_path));
         (all_units, reused_count, actual_reparsed)
     } else {
-        let existing_cache = if !config.force && scanner::has_bundle_cache(&config.output_dir) {
-            scanner::load_cache_file(&config.output_dir).filter(|c| {
-                c.blueprint_hash == blueprint_hash && c.vendor_mode == config.vendor_mode
-            })
-        } else {
-            None
-        };
+        let existing_cache =
+            if existing_meta_opt.is_some() && scanner::has_bundle_cache(&config.output_dir) {
+                scanner::load_cache_file(&config.output_dir).filter(|c| {
+                    c.blueprint_hash == blueprint_hash && c.vendor_mode == config.vendor_mode
+                })
+            } else {
+                None
+            };
         parser::parse_files_incremental_with_blueprint(
             &scanned_files,
             existing_cache,
@@ -595,6 +601,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
             rel_path: f.rel_path.clone(),
             size_bytes: f.size_bytes,
             mtime_secs: f.mtime_secs,
+            mtime_nanos: f.mtime_nanos,
             line_count: f.line_count,
             blake3_hash: f.blake3_hash.clone(),
             scope: f.scope,
@@ -705,7 +712,10 @@ pub fn auto_refresh_bundles(bundles: &[PathBuf]) -> Result<usize> {
 
         // Fast-path: check `meta.file_stamps` directly from `meta.json` (~2 KB) without loading
         // the multi-megabyte `cache.json` when no source files have changed (Issue #41).
-        let needs_refresh = if let Some(count) =
+        let needs_refresh = if !scanner::has_bundle_cache(bundle_dir) || meta.file_stamps.is_empty()
+        {
+            true
+        } else if let Some(count) =
             scanner::check_meta_files_changed(source_path, &meta, DEFAULT_MAX_FILE_BYTES)
         {
             count > 0

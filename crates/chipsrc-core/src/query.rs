@@ -2,8 +2,8 @@ use crate::error::{ChipsrcError, Result};
 use crate::mmio::{normalize_hex_literal, normalize_query_hex_literal};
 use crate::model::{BundleStatusEntry, LanguageKind, SearchHit, DEFAULT_MAX_FILE_BYTES};
 use crate::scanner::{
-    canonical_repo_root_and_name, check_files_changed, check_meta_files_changed, load_cache_file,
-    load_meta_file, scan_repository,
+    canonical_repo_root_and_name, check_files_changed, check_meta_files_changed, has_bundle_cache,
+    load_cache_file, load_meta_file, scan_repository,
 };
 use memchr::memmem;
 use rayon::prelude::*;
@@ -207,7 +207,9 @@ pub fn workspace_status(workspace: &Path) -> Result<Vec<BundleStatusEntry>> {
 
         let source_path = Path::new(&meta.source_root);
         let changed_files_count = if source_path.is_dir() {
-            if let Some(count) =
+            if !has_bundle_cache(&bundle_dir) || meta.file_stamps.is_empty() {
+                meta.total_files.max(1)
+            } else if let Some(count) =
                 check_meta_files_changed(source_path, &meta, DEFAULT_MAX_FILE_BYTES)
             {
                 count

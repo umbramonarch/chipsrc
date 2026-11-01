@@ -591,10 +591,10 @@ pub fn main() {
         "Expected loop variable receiver binding to FileUnit::scanned, got:\n{xref_out}"
     );
 
-    // Bug 7: Verify per-file cache shards (`cache/manifest.json` schema `2.0.0`) and `stamp_check`
+    // Bug 7: Verify per-file cache shards (`cache/manifest.json` schema `2.1.0`) and `stamp_check`
     assert!(has_bundle_cache(&rs_out));
     let manifest = load_cache_manifest(&rs_out).expect("load cache/manifest.json");
-    assert_eq!(manifest.schema_version, "2.0.0");
+    assert_eq!(manifest.schema_version, "2.1.0");
     assert_eq!(manifest.files.len(), 3);
     for entry in manifest.files.values() {
         assert!(rs_out.join(&entry.shard).is_file());

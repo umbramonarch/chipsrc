@@ -802,3 +802,129 @@ int main(void) {
         "Impact should reach ISR uart_error_IRQHandler:\n{impact_out}"
     );
 }
+
+fn set_file_mtime(path: &Path, secs: u64, nanos: u32) {
+    let t = std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
+}
+
+#[test]
+fn same_second_edit_is_detected_end_to_end() {
+    let tmp = TestTempDir::new("same_second_e2e");
+    let repo_dir = tmp.0.join("repo");
+    let bundle_dir = tmp.0.join("bundle");
+    fs::create_dir_all(repo_dir.join("src")).unwrap();
+
+    let file_a = repo_dir.join("src/a.py");
+    let file_b = repo_dir.join("src/b.py");
+    let v1 = "def pm_match_key(x: int) -> int:\n    return x + 1\n";
+    let v2 = "def pm_match_new(x: int) -> int:\n    return x + 1\n";
+    assert_eq!(v1.len(), v2.len());
+
+    fs::write(&file_a, v1).unwrap();
+    fs::write(
+        &file_b,
+        "def helper_func(y: int) -> int:\n    return y * 2\n",
+    )
+    .unwrap();
+    set_file_mtime(&file_a, 1_700_000_000, 150_000_000);
+
+    let cfg = ConvertConfig::new(repo_dir.clone(), bundle_dir.clone());
+    let b1 = convert_repo(&cfg).expect("initial convert");
+    assert!(!b1.cache_hit);
+    let stamp_a_1 = b1
+        .metadata
+        .file_stamps
+        .iter()
+        .find(|s| s.rel_path == "src/a.py")
+        .expect("stamp for src/a.py");
+    assert_eq!(stamp_a_1.mtime_secs, 1_700_000_000);
+    assert_eq!(stamp_a_1.mtime_nanos, 150_000_000);
+
+    let b1_warm = convert_repo(&cfg).expect("warm convert");
+    assert!(b1_warm.cache_hit);
+
+    // Rewrite with same length and +100ms within the same second
+    fs::write(&file_a, v2).unwrap();
+    set_file_mtime(&file_a, 1_700_000_000, 250_000_000);
+
+    let status = chipsrc_core::query::workspace_status(&bundle_dir).expect("workspace_status");
+    assert_eq!(status.len(), 1);
+    assert!(
+        !status[0].is_fresh,
+        "Expected stale bundle after same-second same-size edit"
+    );
+    assert_eq!(status[0].changed_files_count, 1);
+
+    let b2 = convert_repo(&cfg).expect("incremental convert after same-second edit");
+    assert!(
+        !b2.cache_hit,
+        "Expected INCREMENTAL SYNC, not CACHE HIT, after same-second edit"
+    );
+    assert_eq!(b2.metadata.incremental_reparsed_files, 1);
+    assert_eq!(b2.metadata.incremental_reused_files, 1);
+    let stamp_a_2 = b2
+        .metadata
+        .file_stamps
+        .iter()
+        .find(|s| s.rel_path == "src/a.py")
+        .expect("updated stamp for src/a.py");
+    assert_eq!(stamp_a_2.mtime_secs, 1_700_000_000);
+    assert_eq!(stamp_a_2.mtime_nanos, 250_000_000);
+    for s in &b2.metadata.file_stamps {
+        assert!(s.mtime_nanos < 1_000_000_000);
+    }
+
+    let sym_out = chipsrc_core::query::query_symbols(
+        std::slice::from_ref(&bundle_dir),
+        "pm_match_new",
+        None,
+        false,
+        10,
+    )
+    .expect("query_symbols pm_match_new");
+    assert!(
+        sym_out.contains("pm_match_new"),
+        "Expected pm_match_new in symbol query output:\n{sym_out}"
+    );
+
+    // Sub-case (a): Legacy 2.0.0 manifest triggers one full rebuild, then CACHE HIT
+    let manifest_path = bundle_dir.join("cache/manifest.json");
+    let manifest_raw = fs::read_to_string(&manifest_path).unwrap();
+    fs::write(
+        &manifest_path,
+        manifest_raw.replace("\"2.1.0\"", "\"2.0.0\""),
+    )
+    .unwrap();
+    let b_legacy_manifest = convert_repo(&cfg).expect("rebuild after 2.0.0 manifest");
+    assert!(
+        !b_legacy_manifest.cache_hit,
+        "Legacy 2.0.0 manifest must not CACHE HIT"
+    );
+    assert_eq!(b_legacy_manifest.metadata.incremental_reparsed_files, 2);
+    assert_eq!(b_legacy_manifest.metadata.incremental_reused_files, 0);
+    let b_after_manifest = convert_repo(&cfg).expect("warm after 2.0.0 manifest upgrade");
+    assert!(b_after_manifest.cache_hit);
+
+    // Sub-case (b): meta.json lacking mtime_nanos triggers one full rebuild, then CACHE HIT
+    let meta_path = bundle_dir.join("meta.json");
+    let meta_raw = fs::read_to_string(&meta_path).unwrap();
+    let meta_without_nanos: String = meta_raw
+        .lines()
+        .filter(|line| !line.contains("\"mtime_nanos\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&meta_path, meta_without_nanos).unwrap();
+    let b_legacy_meta = convert_repo(&cfg).expect("rebuild after missing mtime_nanos");
+    assert!(
+        !b_legacy_meta.cache_hit,
+        "meta.json lacking mtime_nanos must not CACHE HIT"
+    );
+    let b_after_meta = convert_repo(&cfg).expect("warm after mtime_nanos upgrade");
+    assert!(b_after_meta.cache_hit);
+}

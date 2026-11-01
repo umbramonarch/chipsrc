@@ -604,6 +604,11 @@ pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Resu
     let cache_dir = output_dir.join("cache");
     create_dir(&cache_dir)?;
 
+    let schema_current = fs::read(cache_dir.join("manifest.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<CacheManifest>(&b).ok())
+        .is_some_and(|m| m.schema_version == cache.schema_version);
+
     let mut manifest_files: BTreeMap<String, CacheShardEntry> = BTreeMap::new();
     let mut expected_shard_names: FxHashSet<String> = FxHashSet::default();
 
@@ -613,7 +618,7 @@ pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Resu
         let shard_rel = format!("cache/{shard_fname}");
         let shard_path = cache_dir.join(&shard_fname);
 
-        if !shard_path.is_file() {
+        if !schema_current || !shard_path.is_file() {
             let unit_json = serde_json::to_string(unit)?;
             fs::write(&shard_path, unit_json.as_bytes())
                 .map_err(|source| ChipsrcError::io(&shard_path, source))?;

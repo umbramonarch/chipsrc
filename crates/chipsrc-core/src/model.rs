@@ -316,6 +316,8 @@ pub struct ScannedFile {
     pub arch_layer: ArchLayer,
     pub size_bytes: u64,
     pub mtime_secs: u64,
+    #[serde(default)]
+    pub mtime_nanos: u32,
     pub blake3_hash: String,
     pub line_count: usize,
 }
@@ -508,7 +510,7 @@ pub struct CacheShardEntry {
     pub structural_digest: String,
 }
 
-/// Per-file cache manifest stored at `output/<stem>/cache/manifest.json` (schema `2.0.0`).
+/// Per-file cache manifest stored at `output/<stem>/cache/manifest.json` (schema `2.1.0`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheManifest {
     pub schema_version: String,
@@ -716,6 +718,8 @@ pub struct FileStamp {
     #[serde(default)]
     pub mtime_secs: u64,
     #[serde(default)]
+    pub mtime_nanos: u32,
+    #[serde(default)]
     pub line_count: usize,
     pub blake3_hash: String,
     pub scope: FileScope,
@@ -785,7 +789,7 @@ pub struct BundleMetaFile {
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Current schema version for `cache/manifest.json` (`IncrementalAstCache`).
-pub const CACHE_SCHEMA_VERSION: &str = "2.0.0";
+pub const CACHE_SCHEMA_VERSION: &str = "2.1.0";
 
 /// Configuration for repository conversion / indexing.
 #[derive(Debug, Clone)]

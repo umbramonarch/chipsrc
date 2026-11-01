@@ -983,6 +983,7 @@ mod tests {
                 arch_layer: layer,
                 size_bytes: 128,
                 mtime_secs: 0,
+                mtime_nanos: 0,
                 blake3_hash: "hash".to_string(),
                 line_count: 10,
             },

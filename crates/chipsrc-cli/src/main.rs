@@ -469,9 +469,15 @@ fn main() -> Result<()> {
             cfg.force = force;
             cfg.vendor_mode = vmode;
 
+            let had_existing_bundle = !cfg.force
+                && chipsrc_core::scanner::has_bundle_cache(&cfg.output_dir)
+                && chipsrc_core::scanner::load_meta_file(&cfg.output_dir).is_some_and(|m| {
+                    m.metadata.vendor_mode == cfg.vendor_mode && !m.metadata.file_stamps.is_empty()
+                });
+
             let bundle = convert_repo(&cfg)
                 .with_context(|| format!("Failed to index repository '{}'", repo.display()))?;
-            print_conversion_summary(&bundle, timings);
+            print_conversion_summary(&bundle, timings, had_existing_bundle);
         }
 
         Commands::Ensure {
@@ -489,11 +495,17 @@ fn main() -> Result<()> {
             };
 
             for repo in targets {
+                let out_dir = output_root.join(derive_repo_stem(&repo));
+                let had_existing_bundle = !force
+                    && chipsrc_core::scanner::has_bundle_cache(&out_dir)
+                    && chipsrc_core::scanner::load_meta_file(&out_dir).is_some_and(|m| {
+                        m.metadata.vendor_mode == vmode && !m.metadata.file_stamps.is_empty()
+                    });
                 let bundle = ensure_repo(&repo, &output_root, force, vmode)
                     .with_context(|| format!("Failed to ensure repository '{}'", repo.display()))?;
                 let tag = if bundle.cache_hit {
                     "CACHE HIT"
-                } else if bundle.metadata.incremental_reused_files > 0 {
+                } else if bundle.metadata.incremental_reused_files > 0 || had_existing_bundle {
                     "INCREMENTAL SYNC"
                 } else {
                     "INDEXED"
@@ -1027,12 +1039,12 @@ fn resolve_cli_target_and_query(
     Ok((bundles, resolved_query))
 }
 
-fn print_conversion_summary(bundle: &ConversionBundle, timings: bool) {
+fn print_conversion_summary(bundle: &ConversionBundle, timings: bool, incremental_sync: bool) {
     let m = &bundle.metadata;
     let s = &bundle.sanity;
     let mode_tag = if bundle.cache_hit {
         "CACHE HIT".to_string()
-    } else if m.incremental_reused_files > 0 {
+    } else if m.incremental_reused_files > 0 || incremental_sync {
         format!(
             "INCREMENTAL SYNC: {} reparsed, {} reused",
             m.incremental_reparsed_files, m.incremental_reused_files
@@ -1289,12 +1301,13 @@ fn run_post_edit_hook() -> Result<()> {
                 .to_ascii_lowercase()
                 .starts_with(&prefix.to_ascii_lowercase())
         {
-            let _ = ensure_repo(
-                src_path,
-                &output_root,
-                false,
-                meta_file.metadata.vendor_mode,
-            );
+            let mut cfg = ConvertConfig::new(src_path.to_path_buf(), child.clone());
+            cfg.vendor_mode = meta_file.metadata.vendor_mode;
+            cfg.force = false;
+            cfg.single_file = child
+                .join(format!("{}.md", meta_file.metadata.repo_name))
+                .is_file();
+            let _ = convert_repo(&cfg);
         }
     }
     Ok(())

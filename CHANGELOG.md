@@ -43,6 +43,9 @@ All notable changes to this project are listed here. Versions follow
 
 ### Fixed
 
+- **Sub-Second `mtime_nanos` Freshness Stamps & Cache Schema `2.1.0` (`model.rs`, `scanner.rs`, `emitter.rs`, `query.rs`, `lib.rs`, `main.rs`)**:
+  - Added `#[serde(default)] mtime_nanos: u32` (`d.subsec_nanos()`) to `ScannedFile` and `FileStamp` and updated `scanner::stamp_check` to require `(size_bytes, mtime_secs, mtime_nanos)` equality so same-size edits within the same second are detected by `status --check`, `convert`, `ensure`, `hook post-edit`, and query auto-refresh.
+  - Bumped `CACHE_SCHEMA_VERSION` from `"2.0.0"` to `"2.1.0"` and invalidated legacy `2.0.0` manifests and `meta.json` stamps lacking `mtime_nanos` so existing bundles rebuild once and hit cache on subsequent runs.
 - **Round 2 Sharder, C/CMSIS Qualifier, Query Identity, Vendor Surface & Receiver Binding Fixes (`scanner.rs`, `parser.rs`, `mmio.rs`, `resolver.rs`, `graph.rs`, `sharder.rs`, `sanity.rs`, `emitter.rs`, `query.rs`)**:
   - Fixed `resolve_numbered` in `sharder.rs` to resolve by file path (`file_to_numbered`) before raw slug so split sub-shards never lose symbols or inherit wrong scopes, keyed `group_map` by `(scope, slug)`, disambiguated generic file stems (`main`, `mod`, `index`, `lib`), preserved canonical `module_path` on multi-file split chunks, and enforced global shard/TSV invariants in `sanity.rs`.
   - Replaced `brace_depth` with a `Vec<BraceFrame>` stack (`Transparent` for `extern "C" { ... }`, `Aggregate` for `struct`/`union`/`class` bodies) in `normalize_c_qualifier_macros` and added `__I`, `__O`, `__IO`, `__IM`, `__OM`, `__IOM`, `__IAR_FT`, `__ALIGNED` so CMSIS register structs (`GPIO_TypeDef`) extract clean field types.
