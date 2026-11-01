@@ -598,27 +598,44 @@ fn build_master_index_markdown(
     lines.join("\n")
 }
 
-/// Writes `cache/manifest.json` and per-file `cache/<blake3_hash>.json` shards, deleting
+/// Writes `cache/manifest.json` and per-file `cache/<shard_key>.json` shards, deleting
 /// orphaned shards and any legacy `cache.json` file.
 pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Result<()> {
     let cache_dir = output_dir.join("cache");
     create_dir(&cache_dir)?;
 
-    let schema_current = fs::read(cache_dir.join("manifest.json"))
+    let prev_manifest = fs::read(cache_dir.join("manifest.json"))
         .ok()
-        .and_then(|b| serde_json::from_slice::<CacheManifest>(&b).ok())
-        .is_some_and(|m| m.schema_version == cache.schema_version);
+        .and_then(|b| serde_json::from_slice::<CacheManifest>(&b).ok());
+    let schema_current = prev_manifest.as_ref().is_some_and(|m| {
+        m.schema_version == cache.schema_version
+            && m.blueprint_hash == cache.blueprint_hash
+            && m.vendor_mode == cache.vendor_mode
+    });
 
     let mut manifest_files: BTreeMap<String, CacheShardEntry> = BTreeMap::new();
     let mut expected_shard_names: FxHashSet<String> = FxHashSet::default();
 
     for (rel_path, unit) in &cache.files {
         let hash = &unit.scanned.blake3_hash;
-        let shard_fname = format!("{hash}.json");
+        let shard_key = CacheShardEntry::shard_key(rel_path, hash);
+        let shard_fname = format!("{shard_key}.json");
         let shard_rel = format!("cache/{shard_fname}");
         let shard_path = cache_dir.join(&shard_fname);
+        let structural_digest = unit.structural_digest();
 
-        if !schema_current || !shard_path.is_file() {
+        let reuse_existing_shard = schema_current
+            && shard_path.is_file()
+            && prev_manifest
+                .as_ref()
+                .and_then(|m| m.files.get(rel_path))
+                .is_some_and(|prev| {
+                    prev.blake3_hash == *hash
+                        && prev.shard == shard_rel
+                        && prev.structural_digest == structural_digest
+                });
+
+        if !reuse_existing_shard {
             let unit_json = serde_json::to_string(unit)?;
             fs::write(&shard_path, unit_json.as_bytes())
                 .map_err(|source| ChipsrcError::io(&shard_path, source))?;
@@ -630,7 +647,7 @@ pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Resu
             CacheShardEntry {
                 blake3_hash: hash.clone(),
                 shard: shard_rel,
-                structural_digest: unit.structural_digest(),
+                structural_digest,
             },
         );
     }

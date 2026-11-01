@@ -501,13 +501,30 @@ impl ParsedFileUnit {
     }
 }
 
-/// Entry in `cache/manifest.json` pointing to a per-file AST shard (`cache/<blake3_hash>.json`).
+/// Entry in `cache/manifest.json` pointing to a per-file AST shard (`cache/<shard_key>.json`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheShardEntry {
     pub blake3_hash: String,
     pub shard: String,
     #[serde(default)]
     pub structural_digest: String,
+}
+
+impl CacheShardEntry {
+    /// Computes a deterministic 16-hex-character BLAKE3 shard key from `rel_path` and `blake3_hash`
+    /// so byte-identical files at different paths never alias to the same shard file.
+    pub fn shard_key(rel_path: &str, blake3_hash: &str) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(rel_path.as_bytes());
+        h.update(b"\0");
+        h.update(blake3_hash.as_bytes());
+        h.finalize().to_hex()[..16].to_string()
+    }
+
+    /// Formats the relative bundle shard path (`cache/<shard_key>.json`) for `(rel_path, blake3_hash)`.
+    pub fn shard_rel_path(rel_path: &str, blake3_hash: &str) -> String {
+        format!("cache/{}.json", Self::shard_key(rel_path, blake3_hash))
+    }
 }
 
 /// Per-file cache manifest stored at `output/<stem>/cache/manifest.json` (schema `2.1.0`).

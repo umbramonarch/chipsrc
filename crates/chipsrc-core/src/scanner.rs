@@ -675,7 +675,9 @@ pub fn load_cache_file(bundle_dir: &Path) -> Option<IncrementalAstCache> {
         let loaded_units: Vec<Option<(String, ParsedFileUnit)>> = entries
             .into_par_iter()
             .map(|(rel_path, entry)| {
-                load_cache_shard(bundle_dir, &entry.shard).map(|u| (rel_path.clone(), u))
+                load_cache_shard(bundle_dir, &entry.shard)
+                    .filter(|u| u.scanned.rel_path == **rel_path)
+                    .map(|u| (rel_path.clone(), u))
             })
             .collect();
         let mut files = BTreeMap::new();
@@ -2085,5 +2087,25 @@ mod tests {
         assert_eq!(count_source_lines(b"b = 1\nb = 2\nb = 3"), 3);
         assert_eq!(count_source_lines(b"a = 1\r\na = 2\r\na = 3\r\n"), 3);
         assert_eq!(count_source_lines(b"b = 1\r\nb = 2\r\nb = 3"), 3);
+    }
+
+    #[test]
+    fn test_cache_shard_key_disambiguates_identical_content_across_paths() {
+        use crate::model::CacheShardEntry;
+
+        let content_hash = "b1fb471e4a2045ee";
+        let key_alpha = CacheShardEntry::shard_key("alpha/mod.py", content_hash);
+        let key_beta = CacheShardEntry::shard_key("beta/mod.py", content_hash);
+        assert_eq!(key_alpha.len(), 16);
+        assert_eq!(key_beta.len(), 16);
+        assert_ne!(key_alpha, key_beta);
+        assert_eq!(
+            CacheShardEntry::shard_rel_path("alpha/mod.py", content_hash),
+            format!("cache/{key_alpha}.json")
+        );
+        assert_eq!(
+            CacheShardEntry::shard_key("alpha/mod.py", content_hash),
+            key_alpha
+        );
     }
 }

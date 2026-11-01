@@ -43,6 +43,8 @@ All notable changes to this project are listed here. Versions follow
 
 ### Fixed
 
+- **Duplicate-Content Per-File Cache Shard Disambiguation (`model.rs`, `scanner.rs`, `emitter.rs`, `lib.rs`)**:
+  - Added `CacheShardEntry::shard_key(rel_path, blake3_hash)` and `CacheShardEntry::shard_rel_path(rel_path, blake3_hash)` keying per-file AST cache shards by `blake3(rel_path + "\0" + blake3_hash)` (`cache/<shard_key>.json`) and verifying `scanned.rel_path` on load so byte-identical files at different paths never alias or drop sibling sections/symbols across incremental refreshes.
 - **Unified Source Line Counting Across Full Scan & Incremental Sync (`scanner.rs`)**:
   - Added `scanner::count_source_lines(bytes)` (`\n` count plus `1` when non-empty and not ending with `\n`; `0` for empty buffers) and wired it into both `scan_repository` and `stamp_check` so incremental syncs, `--force` rebuilds, and `chipsrc inspect` report identical per-file `line_count` and `total_lines` values and emit byte-identical `index/*` and `sections/*` artifacts.
 - **Bundle Artifact Integrity Gate, Missing-Table Self-Heal & Explicit `--no-sync` Errors (`error.rs`, `model.rs`, `scanner.rs`, `query.rs`, `lib.rs`, `main.rs`)**:

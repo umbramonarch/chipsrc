@@ -279,209 +279,234 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         None
     };
 
-    let (units, incremental_reused_files, incremental_reparsed_files) = if let Some(mut manifest) =
-        prev_manifest_opt
-    {
-        let prev_stamp_map: BTreeMap<&str, &FileStamp> = existing_meta_opt
-            .as_ref()
-            .map(|m| {
-                m.metadata
-                    .file_stamps
-                    .iter()
-                    .map(|s| (s.rel_path.as_str(), s))
-                    .collect()
-            })
-            .unwrap_or_default();
+    let (units, incremental_reused_files, incremental_reparsed_files, digest_noop_coords_unchanged) =
+        if let Some(mut manifest) = prev_manifest_opt {
+            let prev_stamp_map: BTreeMap<&str, &FileStamp> = existing_meta_opt
+                .as_ref()
+                .map(|m| {
+                    m.metadata
+                        .file_stamps
+                        .iter()
+                        .map(|s| (s.rel_path.as_str(), s))
+                        .collect()
+                })
+                .unwrap_or_default();
 
-        let mut dirty_files = Vec::new();
-        let mut clean_files = Vec::new();
-        for f in &scanned_files {
-            let reusable = manifest.files.get(&f.rel_path).is_some_and(|entry| {
-                entry.blake3_hash == f.blake3_hash
-                    && prev_stamp_map
-                        .get(f.rel_path.as_str())
-                        .is_none_or(|s| s.scope == f.scope && s.arch_layer == f.arch_layer)
-            });
-            if reusable {
-                clean_files.push(f.clone());
-            } else {
-                dirty_files.push(f.clone());
-            }
-        }
-
-        let (dirty_units, _, reparsed_count) = parser::parse_files_incremental_with_blueprint(
-            &dirty_files,
-            None,
-            blueprint_opt.as_ref().map(|(bp, _)| bp),
-        )?;
-
-        // Check Structural Digest No-Op Short-Circuit when no files were added/deleted
-        let can_short_circuit = !dirty_units.is_empty()
-            && existing_meta_opt.is_some()
-            && scanned_files.len() == manifest.files.len()
-            && dirty_units.iter().all(|u| {
-                manifest
-                    .files
-                    .get(&u.scanned.rel_path)
-                    .is_some_and(|entry| {
-                        !entry.structural_digest.is_empty()
-                            && entry.structural_digest == u.structural_digest()
-                            && prev_stamp_map
-                                .get(u.scanned.rel_path.as_str())
-                                .is_some_and(|s| {
-                                    s.scope == u.scanned.scope
-                                        && s.arch_layer == u.scanned.arch_layer
-                                })
-                            && scanner::load_cache_shard(&config.output_dir, &entry.shard)
-                                .is_some_and(|old_u| units_have_identical_coordinates(&old_u, u))
-                    })
-            });
-
-        if can_short_circuit {
-            let parse_ms = t_parse.elapsed().as_millis() as u64;
-            let t_emit = Instant::now();
-            let mut existing_meta = existing_meta_opt.unwrap();
-            let cache_dir = config.output_dir.join("cache");
-            let _ = fs::create_dir_all(&cache_dir);
-
-            for u in &dirty_units {
-                let new_hash = &u.scanned.blake3_hash;
-                let new_shard_rel = format!("cache/{new_hash}.json");
-                let new_shard_path = cache_dir.join(format!("{new_hash}.json"));
-                if let Ok(bytes) = serde_json::to_vec(u) {
-                    let _ = fs::write(&new_shard_path, bytes);
+            let mut dirty_files = Vec::new();
+            let mut clean_files = Vec::new();
+            for f in &scanned_files {
+                let expected_shard = CacheShardEntry::shard_rel_path(&f.rel_path, &f.blake3_hash);
+                let reusable = manifest.files.get(&f.rel_path).is_some_and(|entry| {
+                    entry.blake3_hash == f.blake3_hash
+                        && entry.shard == expected_shard
+                        && prev_stamp_map
+                            .get(f.rel_path.as_str())
+                            .is_none_or(|s| s.scope == f.scope && s.arch_layer == f.arch_layer)
+                });
+                if reusable {
+                    clean_files.push(f.clone());
+                } else {
+                    dirty_files.push(f.clone());
                 }
-                if let Some(old_entry) = manifest.files.get_mut(&u.scanned.rel_path) {
-                    let old_hash = old_entry.blake3_hash.clone();
-                    old_entry.blake3_hash = new_hash.clone();
-                    old_entry.shard = new_shard_rel;
-                    old_entry.structural_digest = u.structural_digest();
-                    if old_hash != *new_hash
-                        && !manifest.files.values().any(|e| e.blake3_hash == old_hash)
-                    {
-                        let _ = fs::remove_file(cache_dir.join(format!("{old_hash}.json")));
+            }
+
+            let (dirty_units, _, reparsed_count) = parser::parse_files_incremental_with_blueprint(
+                &dirty_files,
+                None,
+                blueprint_opt.as_ref().map(|(bp, _)| bp),
+            )?;
+
+            // Check Structural Digest No-Op Short-Circuit when no files were added/deleted
+            let digest_and_coords_unchanged = !dirty_units.is_empty()
+                && existing_meta_opt.is_some()
+                && scanned_files.len() == manifest.files.len()
+                && dirty_units.iter().all(|u| {
+                    manifest
+                        .files
+                        .get(&u.scanned.rel_path)
+                        .is_some_and(|entry| {
+                            !entry.structural_digest.is_empty()
+                                && entry.structural_digest == u.structural_digest()
+                                && prev_stamp_map.get(u.scanned.rel_path.as_str()).is_some_and(
+                                    |s| {
+                                        s.scope == u.scanned.scope
+                                            && s.arch_layer == u.scanned.arch_layer
+                                    },
+                                )
+                                && scanner::load_cache_shard(&config.output_dir, &entry.shard)
+                                    .is_some_and(|old_u| {
+                                        old_u.scanned.rel_path == u.scanned.rel_path
+                                            && units_have_identical_coordinates(&old_u, u)
+                                    })
+                        })
+                });
+            let line_counts_unchanged = digest_and_coords_unchanged
+                && dirty_units.iter().all(|u| {
+                    prev_stamp_map
+                        .get(u.scanned.rel_path.as_str())
+                        .is_some_and(|s| s.line_count == u.scanned.line_count)
+                });
+            let can_short_circuit = digest_and_coords_unchanged && line_counts_unchanged;
+
+            if can_short_circuit {
+                let parse_ms = t_parse.elapsed().as_millis() as u64;
+                let t_emit = Instant::now();
+                let mut existing_meta = existing_meta_opt.unwrap();
+                let cache_dir = config.output_dir.join("cache");
+                let _ = fs::create_dir_all(&cache_dir);
+
+                for u in &dirty_units {
+                    let new_hash = &u.scanned.blake3_hash;
+                    let new_shard_key = CacheShardEntry::shard_key(&u.scanned.rel_path, new_hash);
+                    let new_shard_rel = format!("cache/{new_shard_key}.json");
+                    let new_shard_path = cache_dir.join(format!("{new_shard_key}.json"));
+                    if let Ok(bytes) = serde_json::to_vec(u) {
+                        let _ = fs::write(&new_shard_path, bytes);
+                    }
+                    if let Some(old_entry) = manifest.files.get_mut(&u.scanned.rel_path) {
+                        let old_shard = old_entry.shard.clone();
+                        old_entry.blake3_hash = new_hash.clone();
+                        old_entry.shard = new_shard_rel.clone();
+                        old_entry.structural_digest = u.structural_digest();
+                        if old_shard != new_shard_rel
+                            && !manifest.files.values().any(|e| e.shard == old_shard)
+                        {
+                            let _ = fs::remove_file(config.output_dir.join(&old_shard));
+                        }
                     }
                 }
-            }
-            manifest.fingerprint = fingerprint.clone();
-            if let Ok(m_bytes) = serde_json::to_vec(&manifest) {
-                let _ = fs::write(cache_dir.join("manifest.json"), m_bytes);
+                manifest.fingerprint = fingerprint.clone();
+                if let Ok(m_bytes) = serde_json::to_vec(&manifest) {
+                    let _ = fs::write(cache_dir.join("manifest.json"), m_bytes);
+                }
+
+                let total_lines: usize = scanned_files.iter().map(|f| f.line_count).sum();
+                let languages = compute_language_stats(&scanned_files);
+                let file_stamps: Vec<FileStamp> = scanned_files
+                    .iter()
+                    .map(|f| FileStamp {
+                        rel_path: f.rel_path.clone(),
+                        size_bytes: f.size_bytes,
+                        mtime_secs: f.mtime_secs,
+                        mtime_nanos: f.mtime_nanos,
+                        line_count: f.line_count,
+                        blake3_hash: f.blake3_hash.clone(),
+                        scope: f.scope,
+                        arch_layer: f.arch_layer,
+                    })
+                    .collect();
+
+                let claudeignore_updated =
+                    emitter::ensure_claudeignore_entry(&config.repo_path, &config.output_dir)
+                        .unwrap_or(false);
+                let emit_ms = t_emit.elapsed().as_millis() as u64;
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+
+                existing_meta.metadata.fingerprint = fingerprint;
+                existing_meta.metadata.total_lines = total_lines;
+                existing_meta.metadata.languages = languages;
+                existing_meta.metadata.file_stamps = file_stamps;
+                existing_meta.metadata.incremental_reused_files = clean_files.len();
+                existing_meta.metadata.incremental_reparsed_files = reparsed_count;
+                existing_meta.metadata.scan_ms = scan_ms;
+                existing_meta.metadata.parse_ms = parse_ms;
+                existing_meta.metadata.link_ms = 0;
+                existing_meta.metadata.graph_ms = 0;
+                existing_meta.metadata.shard_ms = 0;
+                existing_meta.metadata.emit_ms = emit_ms;
+                existing_meta.metadata.elapsed_ms = elapsed_ms;
+
+                if let Ok(json_str) = serde_json::to_string_pretty(&existing_meta) {
+                    let _ = fs::write(&meta_path, format!("{json_str}\n"));
+                }
+
+                return Ok(ConversionBundle {
+                    output_dir: config.output_dir.clone(),
+                    metadata: existing_meta.metadata,
+                    sanity: existing_meta.sanity,
+                    sections: Vec::new(),
+                    indexes: BundleIndexes::default(),
+                    cache_hit: false,
+                    claudeignore_updated,
+                });
             }
 
-            let total_lines: usize = scanned_files.iter().map(|f| f.line_count).sum();
-            let languages = compute_language_stats(&scanned_files);
-            let file_stamps: Vec<FileStamp> = scanned_files
-                .iter()
-                .map(|f| FileStamp {
-                    rel_path: f.rel_path.clone(),
-                    size_bytes: f.size_bytes,
-                    mtime_secs: f.mtime_secs,
-                    mtime_nanos: f.mtime_nanos,
-                    line_count: f.line_count,
-                    blake3_hash: f.blake3_hash.clone(),
-                    scope: f.scope,
-                    arch_layer: f.arch_layer,
+            // Load clean shards in parallel; re-parse any missing shard seamlessly
+            let bp_ref = blueprint_opt.as_ref().map(|(bp, _)| bp);
+            let clean_results: Vec<Result<(ParsedFileUnit, bool)>> = clean_files
+                .into_par_iter()
+                .map(|file| {
+                    if let Some(entry) = manifest.files.get(&file.rel_path) {
+                        if let Some(mut cached) =
+                            scanner::load_cache_shard(&config.output_dir, &entry.shard)
+                                .filter(|u| u.scanned.rel_path == file.rel_path)
+                        {
+                            cached.scanned = file;
+                            return Ok((cached, true));
+                        }
+                    }
+                    let (mut parsed, _, _) = parser::parse_files_incremental_with_blueprint(
+                        std::slice::from_ref(&file),
+                        None,
+                        bp_ref,
+                    )?;
+                    Ok((parsed.pop().unwrap(), false))
                 })
                 .collect();
 
-            let claudeignore_updated =
-                emitter::ensure_claudeignore_entry(&config.repo_path, &config.output_dir)
-                    .unwrap_or(false);
-            let emit_ms = t_emit.elapsed().as_millis() as u64;
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-
-            existing_meta.metadata.fingerprint = fingerprint;
-            existing_meta.metadata.total_lines = total_lines;
-            existing_meta.metadata.languages = languages;
-            existing_meta.metadata.file_stamps = file_stamps;
-            existing_meta.metadata.incremental_reused_files = clean_files.len();
-            existing_meta.metadata.incremental_reparsed_files = reparsed_count;
-            existing_meta.metadata.scan_ms = scan_ms;
-            existing_meta.metadata.parse_ms = parse_ms;
-            existing_meta.metadata.link_ms = 0;
-            existing_meta.metadata.graph_ms = 0;
-            existing_meta.metadata.shard_ms = 0;
-            existing_meta.metadata.emit_ms = emit_ms;
-            existing_meta.metadata.elapsed_ms = elapsed_ms;
-
-            if let Ok(json_str) = serde_json::to_string_pretty(&existing_meta) {
-                let _ = fs::write(&meta_path, format!("{json_str}\n"));
-            }
-
-            return Ok(ConversionBundle {
-                output_dir: config.output_dir.clone(),
-                metadata: existing_meta.metadata,
-                sanity: existing_meta.sanity,
-                sections: Vec::new(),
-                indexes: BundleIndexes::default(),
-                cache_hit: false,
-                claudeignore_updated,
-            });
-        }
-
-        // Load clean shards in parallel; re-parse any missing shard seamlessly
-        let bp_ref = blueprint_opt.as_ref().map(|(bp, _)| bp);
-        let clean_results: Vec<Result<(ParsedFileUnit, bool)>> = clean_files
-            .into_par_iter()
-            .map(|file| {
-                if let Some(entry) = manifest.files.get(&file.rel_path) {
-                    if let Some(mut cached) =
-                        scanner::load_cache_shard(&config.output_dir, &entry.shard)
-                    {
-                        cached.scanned = file;
-                        return Ok((cached, true));
-                    }
+            let mut all_units = Vec::with_capacity(scanned_files.len());
+            let mut reused_count = 0usize;
+            let mut actual_reparsed = reparsed_count;
+            for res in clean_results {
+                let (u, was_reused) = res?;
+                if was_reused {
+                    reused_count += 1;
+                } else {
+                    actual_reparsed += 1;
                 }
-                let (mut parsed, _, _) = parser::parse_files_incremental_with_blueprint(
-                    std::slice::from_ref(&file),
-                    None,
-                    bp_ref,
-                )?;
-                Ok((parsed.pop().unwrap(), false))
-            })
-            .collect();
-
-        let mut all_units = Vec::with_capacity(scanned_files.len());
-        let mut reused_count = 0usize;
-        let mut actual_reparsed = reparsed_count;
-        for res in clean_results {
-            let (u, was_reused) = res?;
-            if was_reused {
-                reused_count += 1;
-            } else {
-                actual_reparsed += 1;
+                all_units.push(u);
             }
-            all_units.push(u);
-        }
-        all_units.extend(dirty_units);
-        all_units.sort_by(|a, b| a.scanned.rel_path.cmp(&b.scanned.rel_path));
-        (all_units, reused_count, actual_reparsed)
-    } else {
-        let existing_cache =
-            if existing_meta_opt.is_some() && scanner::has_bundle_cache(&config.output_dir) {
-                scanner::load_cache_file(&config.output_dir).filter(|c| {
-                    c.blueprint_hash == blueprint_hash && c.vendor_mode == config.vendor_mode
-                })
-            } else {
-                None
-            };
-        parser::parse_files_incremental_with_blueprint(
-            &scanned_files,
-            existing_cache,
-            blueprint_opt.as_ref().map(|(bp, _)| bp),
-        )?
-    };
+            all_units.extend(dirty_units);
+            all_units.sort_by(|a, b| a.scanned.rel_path.cmp(&b.scanned.rel_path));
+            (
+                all_units,
+                reused_count,
+                actual_reparsed,
+                digest_and_coords_unchanged,
+            )
+        } else {
+            let existing_cache =
+                if existing_meta_opt.is_some() && scanner::has_bundle_cache(&config.output_dir) {
+                    scanner::load_cache_file(&config.output_dir).filter(|c| {
+                        c.blueprint_hash == blueprint_hash && c.vendor_mode == config.vendor_mode
+                    })
+                } else {
+                    None
+                };
+            let (units, reused, reparsed) = parser::parse_files_incremental_with_blueprint(
+                &scanned_files,
+                existing_cache,
+                blueprint_opt.as_ref().map(|(bp, _)| bp),
+            )?;
+            (units, reused, reparsed, false)
+        };
     let parse_ms = t_parse.elapsed().as_millis() as u64;
 
     let t_link = Instant::now();
     let (symbols, mut types, mut macros, mut calls, mut xrefs, mut vendor_surface) =
         resolver::resolve_and_link(&units);
-    let link_ms = t_link.elapsed().as_millis() as u64;
+    let raw_link_ms = t_link.elapsed().as_millis() as u64;
 
     let t_graph = Instant::now();
     let (mut ranked_symbols, mut god_nodes, mut entrypoints, layer_edges, cycles) =
         graph::analyze_graph(symbols, &calls, &units);
-    let graph_ms = t_graph.elapsed().as_millis() as u64;
+    let raw_graph_ms = t_graph.elapsed().as_millis() as u64;
+
+    let (link_ms, graph_ms) = if digest_noop_coords_unchanged {
+        (0, 0)
+    } else {
+        (raw_link_ms, raw_graph_ms)
+    };
 
     let t_shard = Instant::now();
     let (section_summaries, sections) = sharder::build_section_shards(

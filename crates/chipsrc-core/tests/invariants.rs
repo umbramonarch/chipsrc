@@ -1045,3 +1045,275 @@ fn test_unified_count_source_lines_incremental_matches_force_end_to_end() {
         b_append.metadata.total_lines
     );
 }
+
+#[test]
+fn test_duplicate_content_shards_do_not_alias_across_paths() {
+    let tmp = TestTempDir::new("dup_content");
+    let dup_src = tmp.path().join("dup");
+    let dup_out = tmp.path().join("dup_b1");
+    fs::create_dir_all(dup_src.join("alpha")).unwrap();
+    fs::create_dir_all(dup_src.join("beta")).unwrap();
+
+    let identical_py = "\
+class DuplicateShape:
+    value: int
+
+def duplicate_probe(value: int) -> int:
+    return value + 1
+";
+    let alpha_path = dup_src.join("alpha/mod.py");
+    let beta_path = dup_src.join("beta/mod.py");
+    fs::write(&alpha_path, identical_py).unwrap();
+    fs::write(&beta_path, identical_py).unwrap();
+
+    let cfg = ConvertConfig::new(dup_src.clone(), dup_out.clone());
+    let b_cold = convert_repo(&cfg).unwrap();
+    assert_global_bundle_invariants(&b_cold);
+
+    // VAL-DUP-001: Both identical files indexed with distinct per-path cache shards
+    let manifest = load_cache_manifest(&dup_out).expect("cache/manifest.json");
+    let alpha_entry = manifest.files.get("alpha/mod.py").expect("alpha entry");
+    let beta_entry = manifest.files.get("beta/mod.py").expect("beta entry");
+    assert_eq!(alpha_entry.blake3_hash, beta_entry.blake3_hash);
+    assert_ne!(
+        alpha_entry.shard, beta_entry.shard,
+        "Byte-identical files at different paths must have distinct shard paths"
+    );
+    assert!(dup_out.join(&alpha_entry.shard).is_file());
+    assert!(dup_out.join(&beta_entry.shard).is_file());
+
+    let syms_tsv = fs::read_to_string(dup_out.join("index/symbols.tsv")).unwrap();
+    assert!(syms_tsv.contains("alpha/mod.py::duplicate_probe\tduplicate_probe\t"));
+    assert!(syms_tsv.contains("beta/mod.py::duplicate_probe\tduplicate_probe\t"));
+
+    let types_tsv = fs::read_to_string(dup_out.join("index/types.tsv")).unwrap();
+    assert!(types_tsv.contains("alpha/mod.py::DuplicateShape\tDuplicateShape\t"));
+    assert!(types_tsv.contains("beta/mod.py::DuplicateShape\tDuplicateShape\t"));
+
+    let secs_tsv = fs::read_to_string(dup_out.join("index/sections.tsv")).unwrap();
+    assert!(secs_tsv.contains("\talpha\t"));
+    assert!(secs_tsv.contains("\tbeta\t"));
+
+    // VAL-DUP-002: Editing only alpha/mod.py on incremental refresh preserves beta/mod.py
+    let alpha_edited = identical_py.replace("duplicate_probe", "alpha_only_probe");
+    fs::write(&alpha_path, &alpha_edited).unwrap();
+    let b_edit = convert_repo(&cfg).unwrap();
+    assert!(!b_edit.cache_hit);
+    assert_eq!(b_edit.metadata.incremental_reparsed_files, 1);
+    assert_eq!(b_edit.metadata.incremental_reused_files, 1);
+    assert_global_bundle_invariants(&b_edit);
+
+    let dup_sym_json: serde_json::Value = serde_json::from_str(
+        &query_subcommand_json(
+            "sym",
+            std::slice::from_ref(&dup_out),
+            "duplicate_probe",
+            None,
+            None,
+            3,
+            10,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let dup_rows = dup_sym_json.as_array().unwrap();
+    assert_eq!(dup_rows.len(), 1, "got: {dup_rows:?}");
+    assert_eq!(dup_rows[0]["file"].as_str(), Some("beta/mod.py"));
+
+    let alpha_sym_json: serde_json::Value = serde_json::from_str(
+        &query_subcommand_json(
+            "sym",
+            std::slice::from_ref(&dup_out),
+            "alpha_only_probe",
+            None,
+            None,
+            3,
+            10,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let alpha_rows = alpha_sym_json.as_array().unwrap();
+    assert_eq!(alpha_rows.len(), 1, "got: {alpha_rows:?}");
+    assert_eq!(alpha_rows[0]["file"].as_str(), Some("alpha/mod.py"));
+
+    let section_bodies: Vec<String> = fs::read_dir(dup_out.join("sections"))
+        .unwrap()
+        .flatten()
+        .map(|e| fs::read_to_string(e.path()).unwrap())
+        .collect();
+    assert!(section_bodies
+        .iter()
+        .any(|b| b.contains("beta/mod.py") && b.contains("def duplicate_probe(")));
+    assert!(section_bodies
+        .iter()
+        .any(|b| b.contains("alpha/mod.py") && b.contains("def alpha_only_probe(")));
+
+    // VAL-DUP-003: Incremental refresh matches --force counts and index/* + sections/* hashes
+    let inc_hashes = collect_bundle_artifact_hashes(&dup_out);
+    let inc_counts = (
+        b_edit.metadata.symbol_count,
+        b_edit.metadata.type_count,
+        b_edit.metadata.section_count,
+        b_edit.metadata.total_lines,
+    );
+    let mut force_cfg = cfg.clone();
+    force_cfg.force = true;
+    let b_force = convert_repo(&force_cfg).unwrap();
+    let force_hashes = collect_bundle_artifact_hashes(&dup_out);
+    let force_counts = (
+        b_force.metadata.symbol_count,
+        b_force.metadata.type_count,
+        b_force.metadata.section_count,
+        b_force.metadata.total_lines,
+    );
+    assert_eq!(inc_counts, force_counts);
+    assert_eq!(inc_hashes, force_hashes);
+
+    // VAL-DUP-004: Add gamma/mod.py and delta/mod.py identical to beta/mod.py incrementally
+    fs::create_dir_all(dup_src.join("gamma")).unwrap();
+    fs::create_dir_all(dup_src.join("delta")).unwrap();
+    let gamma_path = dup_src.join("gamma/mod.py");
+    let delta_path = dup_src.join("delta/mod.py");
+    fs::write(&gamma_path, identical_py).unwrap();
+    fs::write(&delta_path, identical_py).unwrap();
+
+    let b_add = convert_repo(&cfg).unwrap();
+    assert!(!b_add.cache_hit);
+    assert_global_bundle_invariants(&b_add);
+    let manifest_add = load_cache_manifest(&dup_out).expect("manifest after add");
+    assert_eq!(manifest_add.files.len(), 4);
+    let unique_shards: BTreeSet<&str> = manifest_add
+        .files
+        .values()
+        .map(|e| e.shard.as_str())
+        .collect();
+    assert_eq!(unique_shards.len(), 4);
+    for entry in manifest_add.files.values() {
+        assert!(dup_out.join(&entry.shard).is_file());
+    }
+
+    let dup_after_add: serde_json::Value = serde_json::from_str(
+        &query_subcommand_json(
+            "sym",
+            std::slice::from_ref(&dup_out),
+            "duplicate_probe",
+            None,
+            None,
+            3,
+            10,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let files_after_add: BTreeSet<&str> = dup_after_add
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["file"].as_str())
+        .collect();
+    assert_eq!(
+        files_after_add,
+        BTreeSet::from(["beta/mod.py", "gamma/mod.py", "delta/mod.py"])
+    );
+
+    let add_inc_hashes = collect_bundle_artifact_hashes(&dup_out);
+    let add_inc_counts = (
+        b_add.metadata.symbol_count,
+        b_add.metadata.type_count,
+        b_add.metadata.section_count,
+        b_add.metadata.total_lines,
+    );
+    let b_add_force = convert_repo(&force_cfg).unwrap();
+    assert_eq!(
+        add_inc_counts,
+        (
+            b_add_force.metadata.symbol_count,
+            b_add_force.metadata.type_count,
+            b_add_force.metadata.section_count,
+            b_add_force.metadata.total_lines,
+        )
+    );
+    assert_eq!(add_inc_hashes, collect_bundle_artifact_hashes(&dup_out));
+
+    // Delete gamma/mod.py incrementally
+    fs::remove_file(&gamma_path).unwrap();
+    let _ = fs::remove_dir(dup_src.join("gamma"));
+    let b_del = convert_repo(&cfg).unwrap();
+    assert!(!b_del.cache_hit);
+    assert_global_bundle_invariants(&b_del);
+
+    let dup_after_del: serde_json::Value = serde_json::from_str(
+        &query_subcommand_json(
+            "sym",
+            std::slice::from_ref(&dup_out),
+            "duplicate_probe",
+            None,
+            None,
+            3,
+            10,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let files_after_del: BTreeSet<&str> = dup_after_del
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["file"].as_str())
+        .collect();
+    assert_eq!(
+        files_after_del,
+        BTreeSet::from(["beta/mod.py", "delta/mod.py"])
+    );
+    let secs_after_del = fs::read_to_string(dup_out.join("index/sections.tsv")).unwrap();
+    assert!(!secs_after_del.contains("\tgamma\t"));
+
+    let del_inc_hashes = collect_bundle_artifact_hashes(&dup_out);
+    let del_inc_counts = (
+        b_del.metadata.symbol_count,
+        b_del.metadata.type_count,
+        b_del.metadata.section_count,
+        b_del.metadata.total_lines,
+    );
+    let b_del_force = convert_repo(&force_cfg).unwrap();
+    assert_eq!(
+        del_inc_counts,
+        (
+            b_del_force.metadata.symbol_count,
+            b_del_force.metadata.type_count,
+            b_del_force.metadata.section_count,
+            b_del_force.metadata.total_lines,
+        )
+    );
+    assert_eq!(del_inc_hashes, collect_bundle_artifact_hashes(&dup_out));
+
+    // Also verify comment-only edit on one of two identical copies matches --force
+    fs::write(&alpha_path, identical_py).unwrap();
+    let _ = convert_repo(&force_cfg).unwrap();
+    fs::write(
+        &beta_path,
+        format!("{identical_py}# comment in beta only\n"),
+    )
+    .unwrap();
+    let b_comment_inc = convert_repo(&cfg).unwrap();
+    assert!(!b_comment_inc.cache_hit);
+    let comment_inc_hashes = collect_bundle_artifact_hashes(&dup_out);
+    let comment_inc_counts = (
+        b_comment_inc.metadata.symbol_count,
+        b_comment_inc.metadata.type_count,
+        b_comment_inc.metadata.section_count,
+        b_comment_inc.metadata.total_lines,
+    );
+    let b_comment_force = convert_repo(&force_cfg).unwrap();
+    assert_eq!(
+        comment_inc_counts,
+        (
+            b_comment_force.metadata.symbol_count,
+            b_comment_force.metadata.type_count,
+            b_comment_force.metadata.section_count,
+            b_comment_force.metadata.total_lines,
+        )
+    );
+    assert_eq!(comment_inc_hashes, collect_bundle_artifact_hashes(&dup_out));
+}
