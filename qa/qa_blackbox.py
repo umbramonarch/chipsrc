@@ -11,7 +11,7 @@ if str(QA_ROOT) not in sys.path:
     sys.path.insert(0, str(QA_ROOT))
 
 from lib import mutate, runner  # noqa: E402
-from suites import boundary, focused, hooks, real, sync  # noqa: E402
+from suites import boundary, dup_content, focused, hooks, real, sync  # noqa: E402
 
 SUITE_REGISTRY: dict[str, object] = {
     "real": real.run_suite,
@@ -19,11 +19,11 @@ SUITE_REGISTRY: dict[str, object] = {
     "boundary": boundary.run_suite,
     "focused": focused.run_suite,
     "hooks": hooks.run_suite,
+    "dup-content": dup_content.run_suite,
 }
 
 # Dynamically load optional suites added by later milestones if present
 for _mod_name, _suite_key in [
-    ("dup_content", "dup-content"),
     ("perf", "perf"),
     ("concurrency", "concurrency"),
     ("scale", "scale"),
@@ -47,7 +47,7 @@ SUITE_HELP_TEXT = "\n".join(
         "  boundary     Cache/option boundaries, missing-table self-heal, vendor modes, hex/spaces (26 assertions)",
         "  focused      Unified source line counting and incremental edit timings (2 assertions + 1 observational)",
         "  hooks        Native Claude Code session-start and post-edit hooks (5 assertions)",
-        "  dup-content  Duplicate-content per-file cache shard disambiguation on checked-in fixtures",
+        "  dup-content  Duplicate-content per-file cache shard disambiguation on checked-in fixtures (7 assertions)",
         "  perf         Incremental emit and coordinate-shift tier latency budgets",
         "  concurrency  Atomic bundle writes and advisory cache/.lock contention",
         "  scale        Large-corpus (STM32CubeF4 / ETL) warm and cold performance budgets",
