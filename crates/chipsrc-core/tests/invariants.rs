@@ -871,3 +871,177 @@ fn test_dogfood_chipsrc_bundle_acceptance() {
     .unwrap();
     assert!(macros_out.contains("DEFAULT_MAX_FILE_BYTES"));
 }
+
+fn collect_bundle_artifact_hashes(bundle_dir: &Path) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for sub in ["index", "sections"] {
+        let dir = bundle_dir.join(sub);
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() {
+                    let rel = format!(
+                        "{sub}/{}",
+                        p.file_name().and_then(|n| n.to_str()).unwrap_or_default()
+                    );
+                    let bytes = fs::read(&p).expect("read artifact");
+                    map.insert(rel, blake3::hash(&bytes).to_hex().to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+#[test]
+fn test_unified_count_source_lines_incremental_matches_force_end_to_end() {
+    let tmp = TestTempDir::new("unified_lines");
+
+    // 1. Trailing-newline, no-trailing-newline, and empty-file line-count conventions
+    let conv_src = tmp.path().join("conv_src");
+    let conv_out = tmp.path().join("conv_bundle");
+    fs::create_dir_all(&conv_src).unwrap();
+    fs::write(conv_src.join("empty.py"), b"").unwrap();
+    fs::write(conv_src.join("tnl.py"), b"a = 1\na = 2\na = 3\n").unwrap();
+    fs::write(conv_src.join("nonl.py"), b"b = 1\nb = 2\nb = 3").unwrap();
+
+    let conv_bundle = convert_repo(&ConvertConfig::new(conv_src.clone(), conv_out)).unwrap();
+    assert_eq!(conv_bundle.metadata.total_lines, 6);
+    assert_eq!(
+        inspect_repo(&conv_src, VendorMode::Active)
+            .unwrap()
+            .total_lines,
+        6
+    );
+    for stamp in &conv_bundle.metadata.file_stamps {
+        match stamp.rel_path.as_str() {
+            "tnl.py" | "nonl.py" => assert_eq!(stamp.line_count, 3, "for {}", stamp.rel_path),
+            "empty.py" => assert_eq!(stamp.line_count, 0),
+            other => panic!("unexpected stamp {other}"),
+        }
+    }
+
+    // 2. Multi-file edits (comment insertion, replacement, addition, deletion):
+    // incremental convert vs --force convert must produce byte-identical index/* and sections/*
+    // and identical total_lines / file_stamps[].line_count / inspect total_lines.
+    let mx_src = tmp.path().join("mx");
+    let mx_out = tmp.path().join("mx_bundle");
+    fs::create_dir_all(mx_src.join("src")).unwrap();
+
+    let ident_path = mx_src.join("src/identifiers.py");
+    let helper_path = mx_src.join("src/helper.py");
+    fs::write(
+        &ident_path,
+        "def pm_match_key(value: str) -> str:\n    return value.strip().lower()\n",
+    )
+    .unwrap();
+    fs::write(
+        &helper_path,
+        "def compute_checksum(data: str) -> int:\n    return len(data)\n",
+    )
+    .unwrap();
+
+    let cfg = ConvertConfig::new(mx_src.clone(), mx_out.clone());
+    let b0 = convert_repo(&cfg).unwrap();
+    assert_eq!(b0.metadata.total_lines, 4);
+
+    let assert_incremental_matches_force = |expected_lines: usize, stage: &str| {
+        let mut inc_cfg = cfg.clone();
+        inc_cfg.force = false;
+        let inc_bundle = convert_repo(&inc_cfg).unwrap();
+        assert!(
+            !inc_bundle.cache_hit,
+            "stage {stage}: expected incremental sync, got cache hit"
+        );
+        let inc_hashes = collect_bundle_artifact_hashes(&mx_out);
+        let inc_stamps: Vec<(String, usize)> = inc_bundle
+            .metadata
+            .file_stamps
+            .iter()
+            .map(|s| (s.rel_path.clone(), s.line_count))
+            .collect();
+        let inspect_lines = inspect_repo(&mx_src, VendorMode::Active)
+            .unwrap()
+            .total_lines;
+
+        let mut force_cfg = cfg.clone();
+        force_cfg.force = true;
+        let force_bundle = convert_repo(&force_cfg).unwrap();
+        let force_hashes = collect_bundle_artifact_hashes(&mx_out);
+        let force_stamps: Vec<(String, usize)> = force_bundle
+            .metadata
+            .file_stamps
+            .iter()
+            .map(|s| (s.rel_path.clone(), s.line_count))
+            .collect();
+
+        assert_eq!(
+            inc_bundle.metadata.total_lines, expected_lines,
+            "stage {stage}: incremental total_lines"
+        );
+        assert_eq!(
+            force_bundle.metadata.total_lines, expected_lines,
+            "stage {stage}: force total_lines"
+        );
+        assert_eq!(
+            inspect_lines, expected_lines,
+            "stage {stage}: inspect total_lines"
+        );
+        assert_eq!(
+            inc_stamps, force_stamps,
+            "stage {stage}: file_stamps line_count mismatch"
+        );
+        assert_eq!(
+            inc_hashes, force_hashes,
+            "stage {stage}: index/ or sections/ bytes differed between incremental and --force"
+        );
+    };
+
+    // Stage A: Prepend 1 comment line to identifiers.py and append 3 comment lines to helper.py
+    let ident_v1 = fs::read_to_string(&ident_path).unwrap();
+    fs::write(&ident_path, format!("# QA top comment\n{ident_v1}")).unwrap();
+    let helper_v1 = fs::read_to_string(&helper_path).unwrap();
+    fs::write(&helper_path, format!("{helper_v1}# c1\n# c2\n# c3\n")).unwrap();
+    assert_incremental_matches_force(8, "prepend-1-append-3");
+
+    // Stage B: Add extra.py with 7 newline-terminated lines
+    let extra_path = mx_src.join("src/extra.py");
+    fs::write(
+        &extra_path,
+        "# l1\n# l2\n# l3\ndef extra_fn(x: int) -> int:\n    return x + 1\n# l6\n# l7\n",
+    )
+    .unwrap();
+    assert_incremental_matches_force(15, "add-7-lines");
+
+    // Stage C: Delete extra.py
+    fs::remove_file(&extra_path).unwrap();
+    assert_incremental_matches_force(8, "delete-7-lines");
+
+    // Stage D: Replace one line without changing line count, then append 2 lines;
+    // verify incremental meta.total_lines agrees with inspect_repo in both states.
+    let ident_v2 = fs::read_to_string(&ident_path).unwrap();
+    fs::write(
+        &ident_path,
+        ident_v2.replace("# QA top comment\n", "# QA replaced comment\n"),
+    )
+    .unwrap();
+    let b_replace = convert_repo(&cfg).unwrap();
+    assert_eq!(b_replace.metadata.total_lines, 8);
+    assert_eq!(
+        inspect_repo(&mx_src, VendorMode::Active)
+            .unwrap()
+            .total_lines,
+        b_replace.metadata.total_lines
+    );
+
+    let ident_v3 = fs::read_to_string(&ident_path).unwrap();
+    fs::write(&ident_path, format!("{ident_v3}# tail 1\n# tail 2\n")).unwrap();
+    let b_append = convert_repo(&cfg).unwrap();
+    assert_eq!(b_append.metadata.total_lines, 10);
+    assert_eq!(
+        inspect_repo(&mx_src, VendorMode::Active)
+            .unwrap()
+            .total_lines,
+        b_append.metadata.total_lines
+    );
+}

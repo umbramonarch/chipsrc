@@ -264,6 +264,13 @@ fn path_matches_ignore_dirs(rel_path: &str, ignore_dirs: &[String]) -> bool {
     false
 }
 
+/// Counts logical source lines in `bytes`: the number of `\n` bytes plus `1` when `bytes` is
+/// non-empty and does not end with `\n` (an empty buffer has `0` lines).
+pub fn count_source_lines(bytes: &[u8]) -> usize {
+    memchr::memchr_iter(b'\n', bytes).count()
+        + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"))
+}
+
 /// Walks `repo_path` respecting `.gitignore`, `.claudeignore`, and `.chipsrc.json`, skips generated
 /// documentation assets and minified/bundled third-party JavaScript, classifies each
 /// supported source file by language, ownership scope, and architectural layer, and returns the
@@ -425,7 +432,7 @@ pub fn scan_repository(
                 }
 
                 let arch_layer = classify_arch_layer_with_blueprint(&rel_path, scope, bp_ref);
-                let line_count = memchr::memchr_iter(b'\n', &bytes).count() + 1;
+                let line_count = count_source_lines(&bytes);
                 let full_hash = blake3::hash(&bytes).to_hex();
                 let blake3_hash = full_hash[..16].to_string();
 
@@ -884,8 +891,7 @@ pub fn stamp_check(
             let blake3_hash = full_hash[..16].to_string();
             let scope = classify_file_scope_with_blueprint(&rel_path, size_bytes, &bytes, bp_ref);
             let arch_layer = classify_arch_layer_with_blueprint(&rel_path, scope, bp_ref);
-            let line_count =
-                memchr::memchr_iter(b'\n', &bytes).count() + usize::from(!bytes.ends_with(b"\n"));
+            let line_count = count_source_lines(&bytes);
             if stamp.size_bytes == size_bytes
                 && stamp.blake3_hash == blake3_hash
                 && stamp.scope == scope
@@ -2068,5 +2074,16 @@ mod tests {
             std::fs::write(&p, saved).unwrap();
             assert!(bundle_artifacts_complete(&bundle_dir));
         }
+    }
+
+    #[test]
+    fn test_count_source_lines_empty_trailing_and_no_trailing_newline() {
+        assert_eq!(count_source_lines(b""), 0);
+        assert_eq!(count_source_lines(b"a = 1\n"), 1);
+        assert_eq!(count_source_lines(b"a = 1"), 1);
+        assert_eq!(count_source_lines(b"a = 1\na = 2\na = 3\n"), 3);
+        assert_eq!(count_source_lines(b"b = 1\nb = 2\nb = 3"), 3);
+        assert_eq!(count_source_lines(b"a = 1\r\na = 2\r\na = 3\r\n"), 3);
+        assert_eq!(count_source_lines(b"b = 1\r\nb = 2\r\nb = 3"), 3);
     }
 }

@@ -43,6 +43,8 @@ All notable changes to this project are listed here. Versions follow
 
 ### Fixed
 
+- **Unified Source Line Counting Across Full Scan & Incremental Sync (`scanner.rs`)**:
+  - Added `scanner::count_source_lines(bytes)` (`\n` count plus `1` when non-empty and not ending with `\n`; `0` for empty buffers) and wired it into both `scan_repository` and `stamp_check` so incremental syncs, `--force` rebuilds, and `chipsrc inspect` report identical per-file `line_count` and `total_lines` values and emit byte-identical `index/*` and `sections/*` artifacts.
 - **Bundle Artifact Integrity Gate, Missing-Table Self-Heal & Explicit `--no-sync` Errors (`error.rs`, `model.rs`, `scanner.rs`, `query.rs`, `lib.rs`, `main.rs`)**:
   - Added `scanner::bundle_artifacts_complete` and `scanner::first_missing_bundle_artifact` verifying `meta.json`, `INDEX.md`, all six `index/*.tsv` tables, every `sections/*.md` referenced in column 11 of `index/sections.tsv`, `cache/manifest.json`, and every listed per-file cache shard.
   - Wired artifact completeness into `convert_repo`, `auto_refresh_bundles`, `workspace_status` (`is_fresh = false` with a `reason` naming the missing artifact in both JSON and human output), and both hooks so incomplete bundles self-heal automatically.
