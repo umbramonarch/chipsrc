@@ -17,6 +17,11 @@ All notable changes to this project are listed here. Versions follow
 
 ### Added
 
+- **Atomic Bundle Writes (`write_bytes_atomic`) & Advisory Bundle Lock (`BundleLock`, `error.rs`, `model.rs`, `emitter.rs`, `lib.rs`, `main.rs`)**:
+  - Added `emitter::write_bytes_atomic(path, bytes)` with identical-content skip, sibling `.<name>.<pid>.<seq>.tmp` staging, 5-attempt `fs::rename` with Windows `5/10/20/40 ms` backoff on `PermissionDenied`/sharing violations, and guaranteed `.tmp` cleanup on failure.
+  - Routed all bundle writers (`emitter::write_file`, `emit_cache_shards`, and all five `meta.json` / `manifest.json` / cache-shard writes in `lib.rs`) through `write_bytes_atomic`, and updated bundle pruners (`prune_stale_tmp_files_in_dir`, `emit_bundle`, `emit_cache_shards`) to ignore fresh `*.tmp` files and remove stale `*.tmp` files (`> 60 s`).
+  - Added `emitter::BundleLock` (`<out>/cache/.lock`, `File::options().write(true).create_new(true)`, `<pid>:<unix_ms>\n`, automatic reclamation of locks `> 10 s` old or with garbage contents via mtime, and `Drop` cleanup) and `ChipsrcError::BundleLocked`.
+  - Configured `ConvertConfig.auto_sync` so `auto_refresh_bundles` and `chipsrc hook post-edit` wait up to `150 ms` (`LOCK_WAIT_AUTO_SYNC`) and skip refresh on contention (queries answer from the consistent on-disk bundle; hooks exit `0`), while explicit `chipsrc convert` / `chipsrc ensure` wait up to `5 s` (`LOCK_WAIT_EXPLICIT`) before failing with `ChipsrcError::BundleLocked`.
 - **Parameterized In-Repo Black-Box QA Harness (`qa/qa_blackbox.py`, `qa/lib/`, `qa/suites/`, `qa/oracles/`, `qa/fixtures/`, `qa/README.md`)**:
   - Ported the 123-assertion black-box regression suites (`real`, `sync`, `boundary`, `focused`, `hooks`) into the repository as a Python 3.13 standard-library-only harness (`python -I` compatible) with `--bin`, `--repos-root`, `--corpus-root`, `--out`, repeatable `--suite` (`core` alias), `--only`, `--skip`, `--timeout`, and `--fixtures-mode build|require`.
   - Added the 7-assertion `dup-content` suite (`qa/suites/dup_content.py`), checked-in duplicate-content fixtures (`qa/fixtures/dup-content/{alpha,beta}/mod.py`), and oracle (`qa/oracles/dup-content.json`) verifying per-file cache shard disambiguation across cold builds, single-copy edits, `--force` count/hash equivalence, and incremental additions/deletions without external repositories, finalizing the 6-suite `core` alias (130 assertions).
@@ -56,6 +61,8 @@ All notable changes to this project are listed here. Versions follow
 
 ### Fixed
 
+- **Accurate `ClaudeIgnore` Status Message for Out-of-Tree Bundles (`emitter.rs`, `main.rs`)**:
+  - Added `emitter::is_output_inside_repo` and updated `print_conversion_summary` in `chipsrc-cli` to print `[ok] ClaudeIgnore: not needed (bundle outside repo)` when the output directory is outside the target repository instead of misleadingly printing `already configured`.
 - **QA Harness Rerun Idempotency, Fixture-Bundle Separation, Build-Failure Recording & Sandbox Cleanup (`qa/qa_blackbox.py`, `qa/lib/runner.py`, `qa/suites/real.py`, `qa/suites/dup_content.py`, `qa/README.md`)**:
   - Separated checked-in fixture bundles (`<out>/fixture-bundles/<fixture>` via `ensure_fixture_bundle`) from real-repository baseline bundles (`<out>/bundles/<repo>` via `ensure_repo_bundle`), automatically migrating any stray `<out>/bundles/<fixture>` directories and filtering `real` multi-bundle freshness checks to named repository bundles so repeated `--suite core` runs into the same `--out` directory are idempotent.
   - Recorded `<name>: fixture bundle ready` as a failed check with the command's `args`, `exit`, and `wall_ms` when a fixture or baseline bundle build fails under `--fixtures-mode build`.

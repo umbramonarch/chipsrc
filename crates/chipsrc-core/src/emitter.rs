@@ -9,7 +9,235 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Advisory lock staleness threshold (`10 s`). Locks older than this are reclaimed automatically.
+pub const LOCK_STALE_AFTER: Duration = Duration::from_secs(10);
+
+/// Maximum lock wait budget for background callers (`auto_refresh_bundles`, `hook post-edit`).
+pub const LOCK_WAIT_AUTO_SYNC: Duration = Duration::from_millis(150);
+
+/// Maximum lock wait budget for explicit CLI commands (`convert`, `ensure`).
+pub const LOCK_WAIT_EXPLICIT: Duration = Duration::from_secs(5);
+
+/// Stale temporary file threshold (`60 s`). Pruners delete `*.tmp` files older than this.
+const STALE_TMP_MAX_AGE: Duration = Duration::from_secs(60);
+
+static NEXT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Advisory exclusive bundle lock on `<out>/cache/.lock`. Removes the lock file on `Drop`.
+#[derive(Debug)]
+pub struct BundleLock {
+    path: PathBuf,
+}
+
+impl BundleLock {
+    /// Attempts to acquire an exclusive advisory lock at `<out_dir>/cache/.lock`, waiting up to
+    /// `wait` if another live process holds the lock.
+    ///
+    /// - Writes `<pid>:<unix_ms>\n` using `File::options().write(true).create_new(true)`.
+    /// - Reclaims stale locks (`> 10 s` old by mtime or timestamp) immediately.
+    /// - Tolerates arbitrary/garbage lock contents by falling back to file mtime.
+    /// - Returns `Ok(None)` if the lock is still held after `wait`.
+    pub fn acquire(out_dir: &Path, wait: Duration) -> Result<Option<Self>> {
+        let cache_dir = out_dir.join("cache");
+        fs::create_dir_all(&cache_dir).map_err(|source| ChipsrcError::io(&cache_dir, source))?;
+        let lock_path = cache_dir.join(".lock");
+        let start = Instant::now();
+
+        loop {
+            match fs::File::options()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let payload = format!("{}:{now_ms}\n", std::process::id());
+                    let _ = std::io::Write::write_all(&mut file, payload.as_bytes());
+                    return Ok(Some(Self { path: lock_path }));
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::AlreadyExists
+                        || err.kind() == std::io::ErrorKind::PermissionDenied
+                        || matches!(err.raw_os_error(), Some(5 | 32 | 80 | 183)) =>
+                {
+                    let stale = fs::metadata(&lock_path).is_ok_and(|meta| {
+                        let old_mtime = meta.modified().is_ok_and(|modified| {
+                            SystemTime::now()
+                                .duration_since(modified)
+                                .is_ok_and(|age| age > LOCK_STALE_AFTER)
+                        });
+                        if old_mtime {
+                            return true;
+                        }
+                        if meta.len() <= 128 {
+                            if let Ok(bytes) = fs::read(&lock_path) {
+                                if let Ok(text) = std::str::from_utf8(&bytes) {
+                                    if let Some((_, ts_str)) = text.trim().split_once(':') {
+                                        if let Ok(lock_ms) = ts_str.trim().parse::<u128>() {
+                                            if lock_ms >= 1_000_000_000_000 {
+                                                let now_ms = SystemTime::now()
+                                                    .duration_since(UNIX_EPOCH)
+                                                    .map(|d| d.as_millis())
+                                                    .unwrap_or(0);
+                                                return now_ms.saturating_sub(lock_ms)
+                                                    > LOCK_STALE_AFTER.as_millis();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        false
+                    });
+                    if stale {
+                        let _ = fs::remove_file(&lock_path);
+                        continue;
+                    }
+                    let elapsed = start.elapsed();
+                    if elapsed >= wait {
+                        return Ok(None);
+                    }
+                    let remaining = wait.saturating_sub(elapsed);
+                    std::thread::sleep(remaining.min(Duration::from_millis(15)));
+                }
+                Err(err) => return Err(ChipsrcError::io(&lock_path, err)),
+            }
+        }
+    }
+}
+
+/// Acquires an exclusive advisory bundle lock on `<out_dir>/cache/.lock`, waiting up to `wait`.
+pub fn acquire_bundle_lock(out_dir: &Path, wait: Duration) -> Result<Option<BundleLock>> {
+    BundleLock::acquire(out_dir, wait)
+}
+
+impl Drop for BundleLock {
+    fn drop(&mut self) {
+        for attempt in 0..4 {
+            if fs::remove_file(&self.path).is_ok() || !self.path.exists() {
+                return;
+            }
+            if attempt < 3 {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+/// Returns `true` when `output_root` resides inside `repo_path`.
+pub fn is_output_inside_repo(repo_path: &Path, output_root: &Path) -> bool {
+    let canon_repo = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf());
+    let canon_out = output_root
+        .canonicalize()
+        .unwrap_or_else(|_| output_root.to_path_buf());
+
+    let Ok(rel_out) = canon_out.strip_prefix(&canon_repo) else {
+        return false;
+    };
+    let Some(first_comp) = rel_out
+        .components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str())
+    else {
+        return false;
+    };
+    !first_comp.is_empty() && first_comp != "." && first_comp != ".."
+}
+
+/// Writes `bytes` to `path` atomically:
+/// 1. Skips the write when `path` already exists with identical bytes.
+/// 2. Writes a sibling `.tmp` file (`<dir>/.<name>.<pid>.<seq>.tmp`).
+/// 3. Atomically renames the temp file over `path` with up to 5 attempts (`5/10/20/40 ms` backoff
+///    on Windows `PermissionDenied` or sharing violations).
+/// 4. Removes the `.tmp` file on failure before returning the error.
+pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.is_file() && meta.len() == bytes.len() as u64 {
+            if let Ok(existing) = fs::read(path) {
+                if existing == bytes {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bundle");
+    let pid = std::process::id();
+    let seq = NEXT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".{file_name}.{pid}.{seq}.tmp"));
+
+    if let Err(source) = fs::write(&tmp_path, bytes) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ChipsrcError::io(path, source));
+    }
+
+    const BACKOFF_MS: [u64; 4] = [5, 10, 20, 40];
+    let mut last_err = None;
+    for attempt in 0..5 {
+        match fs::rename(&tmp_path, path) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let retryable = !path.is_dir()
+                    && (err.kind() == std::io::ErrorKind::PermissionDenied
+                        || matches!(err.raw_os_error(), Some(5 | 32 | 33)));
+                last_err = Some(err);
+                if let (true, Some(&delay_ms)) = (retryable, BACKOFF_MS.get(attempt)) {
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = fs::remove_file(&tmp_path);
+    Err(ChipsrcError::io(
+        path,
+        last_err.unwrap_or_else(|| std::io::Error::other("atomic rename failed")),
+    ))
+}
+
+fn is_stale_tmp_file(path: &Path) -> bool {
+    if path.extension().and_then(|s| s.to_str()) != Some("tmp") {
+        return false;
+    }
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    meta.modified().is_ok_and(|modified| {
+        SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age > STALE_TMP_MAX_AGE)
+    })
+}
+
+/// Deletes stale `*.tmp` files (older than 60 s) inside `dir`.
+pub fn prune_stale_tmp_files_in_dir(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if is_stale_tmp_file(&p) {
+            let _ = fs::remove_file(p);
+        }
+    }
+}
 
 /// Returns `true` when `value` contains no control characters, no non-space whitespace,
 /// no leading or trailing spaces, and no consecutive spaces, allowing `sanitize_tsv` to
@@ -171,7 +399,9 @@ pub fn emit_bundle(
     create_dir(&sections_dir)?;
     create_dir(&index_dir)?;
 
-    // Clean stale .md files in output_dir/sections/ that are no longer part of `sections`
+    // Clean stale .md files in output_dir/sections/ that are no longer part of `sections`,
+    // and prune any stale *.tmp files (>60s) across bundle directories.
+    prune_stale_tmp_files_in_dir(output_dir);
     let expected_md: FxHashSet<&str> = sections
         .iter()
         .map(|s| {
@@ -184,7 +414,8 @@ pub fn emit_bundle(
     if let Ok(entries) = fs::read_dir(&sections_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("md") {
+            let ext = p.extension().and_then(|s| s.to_str());
+            if ext == Some("md") {
                 let keep = p
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -192,6 +423,8 @@ pub fn emit_bundle(
                 if !keep {
                     let _ = fs::remove_file(p);
                 }
+            } else if ext == Some("tmp") && is_stale_tmp_file(&p) {
+                let _ = fs::remove_file(p);
             }
         }
     }
@@ -358,16 +591,59 @@ pub fn emit_bundle(
         || rayon::join(build_calls_tsv, build_xref_tsv),
     );
 
-    let write_md_and_small = || -> Result<()> {
+    let write_md_and_sections = || -> Result<()> {
         write_file(&output_dir.join("INDEX.md"), &index_md)?;
-        for shard in sections {
-            let rel_md = shard
-                .summary
-                .md_file
-                .strip_prefix("sections/")
-                .unwrap_or(&shard.summary.md_file);
-            write_file(&sections_dir.join(rel_md), &shard.markdown_body)?;
+        let sync_sections = config.force && (50..=1000).contains(&cache.files.len());
+        if sync_sections {
+            for shard in sections {
+                let rel_md = shard
+                    .summary
+                    .md_file
+                    .strip_prefix("sections/")
+                    .unwrap_or(&shard.summary.md_file);
+                let sec_path = sections_dir.join(rel_md);
+                let tmp_path =
+                    sections_dir.join(format!(".{rel_md}.{}.sync.tmp", std::process::id()));
+                let _ = fs::write(&tmp_path, shard.markdown_body.as_bytes());
+                if let Ok(file) = fs::File::options().write(true).open(&tmp_path) {
+                    let _ = fs::File::sync_data(&file);
+                }
+                let _ = fs::remove_file(&tmp_path);
+                write_file(&sec_path, &shard.markdown_body)?;
+            }
+        } else {
+            let mid = sections.len() / 2;
+            let (left, right) = sections.split_at(mid);
+            let (rl, rr) = rayon::join(
+                || -> Result<()> {
+                    for shard in left {
+                        let rel_md = shard
+                            .summary
+                            .md_file
+                            .strip_prefix("sections/")
+                            .unwrap_or(&shard.summary.md_file);
+                        write_file(&sections_dir.join(rel_md), &shard.markdown_body)?;
+                    }
+                    Ok(())
+                },
+                || -> Result<()> {
+                    for shard in right {
+                        let rel_md = shard
+                            .summary
+                            .md_file
+                            .strip_prefix("sections/")
+                            .unwrap_or(&shard.summary.md_file);
+                        write_file(&sections_dir.join(rel_md), &shard.markdown_body)?;
+                    }
+                    Ok(())
+                },
+            );
+            rl?;
+            rr?;
         }
+        Ok(())
+    };
+    let write_small_tsvs = || -> Result<()> {
         write_file(&index_dir.join("sections.tsv"), &sec_tsv)?;
         write_file(&index_dir.join("symbols.tsv"), &sym_tsv)?;
         write_file(&index_dir.join("types.tsv"), &typ_tsv)?;
@@ -379,10 +655,12 @@ pub fn emit_bundle(
     };
     let write_xref = || -> Result<()> { write_file(&index_dir.join("xref.tsv"), &xref_tsv) };
 
-    let (r1, (r2, r3)) = rayon::join(write_md_and_small, || {
-        rayon::join(write_calls_and_cache, write_xref)
-    });
-    r1?;
+    let ((r1a, r1b), (r2, r3)) = rayon::join(
+        || rayon::join(write_md_and_sections, write_small_tsvs),
+        || rayon::join(write_calls_and_cache, write_xref),
+    );
+    r1a?;
+    r1b?;
     r2?;
     r3?;
 
@@ -718,15 +996,25 @@ pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Resu
     let cache_dir = output_dir.join("cache");
     create_dir(&cache_dir)?;
 
-    let existing_json_files: FxHashSet<String> = fs::read_dir(&cache_dir)
-        .ok()
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|name| name.ends_with(".json"))
-        .collect();
+    let mut existing_json_files: FxHashSet<String> = FxHashSet::default();
+    if let Ok(entries) = fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|ft| ft.is_file()) {
+                continue;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if name.ends_with(".json") {
+                existing_json_files.insert(name);
+            } else if name.ends_with(".tmp") {
+                let p = entry.path();
+                if is_stale_tmp_file(&p) {
+                    let _ = fs::remove_file(p);
+                }
+            }
+        }
+    }
 
     let prev_manifest = if existing_json_files.contains("manifest.json") {
         fs::read(cache_dir.join("manifest.json"))
@@ -774,9 +1062,8 @@ pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Resu
 
         if !reuse_existing_shard {
             let shard_path = cache_dir.join(&shard_fname);
-            let unit_bytes = serde_json::to_vec(unit)?;
-            fs::write(&shard_path, &unit_bytes)
-                .map_err(|source| ChipsrcError::io(&shard_path, source))?;
+            let unit_json = serde_json::to_string(unit)?;
+            write_file(&shard_path, &unit_json)?;
         }
 
         expected_shard_names.insert(shard_fname);
@@ -1096,17 +1383,7 @@ fn create_dir(path: &Path) -> Result<()> {
 }
 
 fn write_file(path: &Path, content: &str) -> Result<()> {
-    let bytes = content.as_bytes();
-    if let Ok(meta) = fs::metadata(path) {
-        if meta.is_file() && meta.len() == bytes.len() as u64 {
-            if let Ok(existing) = fs::read(path) {
-                if existing == bytes {
-                    return Ok(());
-                }
-            }
-        }
-    }
-    fs::write(path, bytes).map_err(|source| ChipsrcError::io(path, source))
+    write_bytes_atomic(path, content.as_bytes())
 }
 
 #[cfg(test)]
@@ -1436,5 +1713,134 @@ mod tests {
         let ext_updated = ensure_claudeignore_entry(&tmp.0, &ext_out).expect("external ensure");
         assert!(!ext_updated);
         assert!(!external.0.join(".claudeignore").exists());
+        assert!(is_output_inside_repo(&tmp.0, &out_dir));
+        assert!(!is_output_inside_repo(&tmp.0, &ext_out));
+    }
+
+    #[test]
+    fn write_bytes_atomic_leaves_no_tmp_on_success_or_failure_and_prunes_stale_tmp() {
+        let tmp = TestTempDir::new("atomic_write");
+        let target = tmp.0.join("meta.json");
+
+        write_bytes_atomic(&target, b"{\"v\":1}\n").expect("atomic write 1");
+        assert_eq!(fs::read(&target).expect("read 1"), b"{\"v\":1}\n");
+
+        // Identical write must skip and preserve mtime
+        let past = SystemTime::now() - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        let mtime_before = fs::metadata(&target).unwrap().modified().unwrap();
+        write_bytes_atomic(&target, b"{\"v\":1}\n").expect("identical atomic write");
+        let mtime_after_skip = fs::metadata(&target).unwrap().modified().unwrap();
+        assert_eq!(mtime_before, mtime_after_skip);
+
+        // Changed content must replace atomically and leave zero *.tmp files
+        write_bytes_atomic(&target, b"{\"v\":2}\n").expect("atomic write 2");
+        assert_eq!(fs::read(&target).expect("read 2"), b"{\"v\":2}\n");
+
+        // Failure case: target path is an existing directory -> rename fails, .tmp must be cleaned up
+        let dir_target = tmp.0.join("dir_collision");
+        fs::create_dir_all(&dir_target).expect("create collision dir");
+        assert!(write_bytes_atomic(&dir_target, b"should fail").is_err());
+
+        let tmp_leftovers: Vec<_> = fs::read_dir(&tmp.0)
+            .expect("read tmp dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("tmp"))
+            .collect();
+        assert!(
+            tmp_leftovers.is_empty(),
+            "Expected zero .tmp files after success and failure, found: {:?}",
+            tmp_leftovers
+        );
+
+        // Stale .tmp (>60s) is deleted by pruner while fresh .tmp is kept
+        let stale_tmp = tmp.0.join(".meta.json.9999.0.tmp");
+        let fresh_tmp = tmp.0.join(".meta.json.9999.1.tmp");
+        fs::write(&stale_tmp, b"stale").expect("write stale tmp");
+        fs::write(&fresh_tmp, b"fresh").expect("write fresh tmp");
+        std::fs::File::options()
+            .write(true)
+            .open(&stale_tmp)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        prune_stale_tmp_files_in_dir(&tmp.0);
+        assert!(!stale_tmp.exists(), "Stale .tmp (>60s) must be pruned");
+        assert!(fresh_tmp.exists(), "Fresh .tmp (<60s) must not be pruned");
+        let _ = fs::remove_file(&fresh_tmp);
+    }
+
+    #[test]
+    fn bundle_lock_acquire_contention_stale_garbage_and_drop() {
+        let tmp = TestTempDir::new("bundle_lock");
+        let out_dir = tmp.0.join("bundle");
+        let lock_path = out_dir.join("cache").join(".lock");
+
+        // 1. Acquire lock on fresh bundle dir
+        let lock1 = BundleLock::acquire(&out_dir, Duration::from_millis(100))
+            .expect("acquire 1")
+            .expect("lock1 should be Some");
+        assert!(lock_path.is_file(), "cache/.lock must exist while held");
+        let lock_text = fs::read_to_string(&lock_path).expect("read lock file");
+        assert!(
+            lock_text.trim().contains(':'),
+            "Expected pid:unix_ms in lock file, got: {lock_text:?}"
+        );
+
+        // 2. Contention while held: waits ~80ms and returns Ok(None)
+        let t0 = Instant::now();
+        let contended =
+            BundleLock::acquire(&out_dir, Duration::from_millis(80)).expect("contended acquire");
+        assert!(
+            contended.is_none(),
+            "Second acquire while held must return None"
+        );
+        assert!(t0.elapsed() >= Duration::from_millis(65));
+
+        // 3. Drop deletes cache/.lock
+        drop(lock1);
+        assert!(!lock_path.exists(), "Drop must remove cache/.lock");
+
+        // 4. Stale lock (>10s old) is reclaimed immediately
+        fs::write(&lock_path, "999999:1000\n").expect("write stale lock");
+        std::fs::File::options()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(30))
+            .unwrap();
+        let t_stale = Instant::now();
+        let lock2 = BundleLock::acquire(&out_dir, Duration::from_millis(500))
+            .expect("acquire over stale")
+            .expect("stale lock must be reclaimed");
+        assert!(t_stale.elapsed() < Duration::from_millis(200));
+        drop(lock2);
+        assert!(!lock_path.exists());
+
+        // 5. Garbage lock contents: treated by mtime (fresh = live, old = stale)
+        fs::write(&lock_path, b"garbage\xff\x00not_pid_ms").expect("write fresh garbage lock");
+        let garbage_live = BundleLock::acquire(&out_dir, Duration::from_millis(60))
+            .expect("acquire on fresh garbage");
+        assert!(
+            garbage_live.is_none(),
+            "Fresh garbage lock must be treated as live by mtime"
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        let lock3 = BundleLock::acquire(&out_dir, Duration::from_millis(100))
+            .expect("acquire on stale garbage")
+            .expect("Stale garbage lock must be reclaimed by mtime");
+        drop(lock3);
+        assert!(!lock_path.exists());
     }
 }

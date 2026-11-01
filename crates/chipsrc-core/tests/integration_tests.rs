@@ -7,10 +7,11 @@ use chipsrc_core::query::{
 };
 use chipsrc_core::{
     auto_refresh_bundles, convert_repo, ensure_repo, inspect_repo, ArchLayer, BundleMetaFile,
-    ConvertConfig, FileScope, MacroKind, ResolutionTier, SymbolKind, VendorMode,
+    ChipsrcError, ConvertConfig, FileScope, MacroKind, ResolutionTier, SymbolKind, VendorMode,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct TestTempDir(PathBuf);
 
@@ -1080,4 +1081,76 @@ fn incomplete_bundle_self_heals_and_no_sync_queries_error() {
     let sym_out = query_symbols(&bundles, "motor_set_duty", None, false, 10)
         .expect("query after auto_refresh");
     assert!(sym_out.contains("motor_set_duty"));
+}
+
+#[test]
+fn bundle_lock_and_atomic_writes_end_to_end() {
+    let tmp = TestTempDir::new("lock_atomic_e2e");
+    let repo_dir = tmp.0.join("repo");
+    let out_root = tmp.0.join("out");
+    create_synthetic_repo(&repo_dir);
+
+    let b1 = ensure_repo(&repo_dir, &out_root, false, VendorMode::Active).expect("initial ensure");
+    let bundle_dir = b1.output_dir.clone();
+    let bundles = [bundle_dir.clone()];
+    let lock_path = bundle_dir.join("cache/.lock");
+    assert!(
+        !lock_path.exists(),
+        "No lock file should remain after ensure_repo"
+    );
+
+    // Edit src/app/main.c so the bundle becomes stale
+    let main_c = repo_dir.join("src/app/main.c");
+    let orig_main = fs::read_to_string(&main_c).unwrap();
+    fs::write(
+        &main_c,
+        format!("{orig_main}\nvoid locked_probe_fn(void) {{ motor_set_duty(1); }}\n"),
+    )
+    .unwrap();
+    set_file_mtime(&main_c, 1_800_000_000, 0);
+
+    // Hold a live foreign lock on cache/.lock
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    fs::write(&lock_path, format!("999999:{now_ms}\n")).unwrap();
+
+    // 1. auto_refresh_bundles waits <=150ms, skips refresh, leaves lock intact
+    let t_auto = Instant::now();
+    let refreshed = auto_refresh_bundles(&bundles).expect("auto_refresh_bundles under held lock");
+    assert_eq!(
+        refreshed, 0,
+        "auto_refresh_bundles must skip refresh when cache/.lock is held"
+    );
+    assert!(t_auto.elapsed() < Duration::from_millis(1500));
+    assert!(
+        lock_path.is_file(),
+        "Foreign cache/.lock must remain untouched"
+    );
+
+    // 2. convert_repo with auto_sync=true (used by hook post-edit) also returns BundleLocked within <=150ms
+    let mut cfg = ConvertConfig::new(repo_dir.clone(), bundle_dir.clone());
+    cfg.auto_sync = true;
+    let hook_res = convert_repo(&cfg);
+    assert!(
+        matches!(hook_res, Err(ChipsrcError::BundleLocked { .. })),
+        "convert_repo(auto_sync=true) must return BundleLocked when cache/.lock is held"
+    );
+    let status_locked = workspace_status(&bundle_dir).expect("status while locked");
+    assert!(
+        !status_locked[0].is_fresh,
+        "Bundle must still be stale while locked"
+    );
+
+    // 3. Stale lock (>10s old) is removed and ensure_repo succeeds immediately
+    set_file_mtime(&lock_path, 1_700_000_000, 0);
+    let b2 = ensure_repo(&repo_dir, &out_root, false, VendorMode::Active)
+        .expect("ensure_repo reclaims stale lock");
+    assert!(!b2.cache_hit);
+    assert!(!lock_path.exists(), "cache/.lock must be removed on Drop");
+
+    let sym_out =
+        query_symbols(&bundles, "locked_probe_fn", None, false, 10).expect("query locked_probe_fn");
+    assert!(sym_out.contains("locked_probe_fn"));
 }

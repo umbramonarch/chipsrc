@@ -23,6 +23,13 @@ pub enum ChipsrcError {
     #[error("Incomplete bundle at {}: missing required artifact '{missing}' (run `chipsrc ensure` or omit `--no-sync` to repair)", bundle.display())]
     IncompleteBundle { bundle: PathBuf, missing: String },
 
+    #[error("Bundle at {} is locked by another chipsrc process ({}, waited {waited_ms}ms)", bundle.display(), lock_path.display())]
+    BundleLocked {
+        bundle: PathBuf,
+        lock_path: PathBuf,
+        waited_ms: u64,
+    },
+
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 

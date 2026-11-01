@@ -475,7 +475,7 @@ fn main() -> Result<()> {
 
             let bundle = convert_repo(&cfg)
                 .with_context(|| format!("Failed to index repository '{}'", repo.display()))?;
-            print_conversion_summary(&bundle, timings, had_existing_bundle);
+            print_conversion_summary(&repo, &bundle, timings, had_existing_bundle);
         }
 
         Commands::Ensure {
@@ -1037,7 +1037,12 @@ fn resolve_cli_target_and_query(
     Ok((bundles, resolved_query))
 }
 
-fn print_conversion_summary(bundle: &ConversionBundle, timings: bool, incremental_sync: bool) {
+fn print_conversion_summary(
+    repo: &Path,
+    bundle: &ConversionBundle,
+    timings: bool,
+    incremental_sync: bool,
+) {
     let m = &bundle.metadata;
     let s = &bundle.sanity;
     let mode_tag = if bundle.cache_hit {
@@ -1096,14 +1101,14 @@ fn print_conversion_summary(bundle: &ConversionBundle, timings: bool, incrementa
             m.scan_ms, m.parse_ms, m.link_ms, m.graph_ms, m.shard_ms, m.emit_ms, m.elapsed_ms
         );
     }
-    println!(
-        "    [ok] ClaudeIgnore: {}",
-        if bundle.claudeignore_updated {
-            "updated (.claudeignore)"
-        } else {
-            "already configured"
-        }
-    );
+    let claudeignore_status = if bundle.claudeignore_updated {
+        "updated (.claudeignore)"
+    } else if chipsrc_core::emitter::is_output_inside_repo(repo, &bundle.output_dir) {
+        "already configured"
+    } else {
+        "not needed (bundle outside repo)"
+    };
+    println!("    [ok] ClaudeIgnore: {claudeignore_status}");
     for warn in &s.warnings {
         println!("    [warn] {warn}");
     }
@@ -1318,6 +1323,7 @@ fn run_post_edit_hook() -> Result<()> {
             let mut cfg = ConvertConfig::new(src_path.to_path_buf(), child.clone());
             cfg.vendor_mode = vendor_mode;
             cfg.force = false;
+            cfg.auto_sync = true;
             cfg.single_file = child.join(format!("{repo_name}.md")).is_file();
             let _ = convert_repo(&cfg);
         }

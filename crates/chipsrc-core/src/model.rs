@@ -815,6 +815,7 @@ pub struct ConvertConfig {
     pub output_dir: PathBuf,
     pub single_file: bool,
     pub force: bool,
+    pub auto_sync: bool,
     pub vendor_mode: VendorMode,
     pub max_file_bytes: u64,
 }
@@ -826,6 +827,7 @@ impl ConvertConfig {
             output_dir,
             single_file: false,
             force: false,
+            auto_sync: false,
             vendor_mode: VendorMode::Active,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
         }
