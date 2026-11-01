@@ -2,7 +2,8 @@
 
 use chipsrc_core::query::{
     parallel_bundle_search, query_call_path, query_callees, query_callers, query_impact,
-    query_macros, query_sections, query_symbols, query_types, query_xref, workspace_status,
+    query_macros, query_sections, query_subcommand_json, query_symbols, query_types, query_xref,
+    workspace_status,
 };
 use chipsrc_core::{
     auto_refresh_bundles, convert_repo, ensure_repo, inspect_repo, ArchLayer, BundleMetaFile,
@@ -939,6 +940,7 @@ fn incomplete_bundle_self_heals_and_no_sync_queries_error() {
     let b1 = ensure_repo(&repo_dir, &out_root, false, VendorMode::Active).expect("initial ensure");
     assert!(!b1.cache_hit);
     let bundle_dir = b1.output_dir.clone();
+    let bundles = [bundle_dir.clone()];
     assert!(chipsrc_core::scanner::bundle_artifacts_complete(
         &bundle_dir
     ));
@@ -964,17 +966,37 @@ fn incomplete_bundle_self_heals_and_no_sync_queries_error() {
     );
 
     // 2. Direct query (simulating --no-sync) fails with IncompleteBundle naming symbols.tsv
-    let err = query_symbols(
-        std::slice::from_ref(&bundle_dir),
-        "motor_set_duty",
-        None,
-        false,
-        10,
-    )
-    .expect_err("Expected query_symbols on missing symbols.tsv to fail");
+    let Err(err) = query_symbols(&bundles, "motor_set_duty", None, false, 10) else {
+        panic!("Expected query_symbols on missing symbols.tsv to fail");
+    };
     assert!(
         err.to_string().contains("symbols.tsv"),
         "Expected error message to name symbols.tsv, got: {err}"
+    );
+
+    // 2b. callers and callees (and JSON variants) on missing symbols.tsv must also fail with IncompleteBundle naming symbols.tsv
+    let Err(callers_err) = query_callers(&bundles, "motor_set_duty", false, 10) else {
+        panic!("Expected query_callers on missing symbols.tsv to fail");
+    };
+    assert!(
+        callers_err.to_string().contains("symbols.tsv"),
+        "Expected callers error to name symbols.tsv, got: {callers_err}"
+    );
+    let Err(callees_err) = query_callees(&bundles, "motor_set_duty", false, 10) else {
+        panic!("Expected query_callees on missing symbols.tsv to fail");
+    };
+    assert!(
+        callees_err.to_string().contains("symbols.tsv"),
+        "Expected callees error to name symbols.tsv, got: {callees_err}"
+    );
+    let Err(callers_json_err) =
+        query_subcommand_json("callers", &bundles, "motor_set_duty", None, None, 3, 10)
+    else {
+        panic!("Expected query_subcommand_json callers on missing symbols.tsv to fail");
+    };
+    assert!(
+        callers_json_err.to_string().contains("symbols.tsv"),
+        "Expected callers JSON error to name symbols.tsv, got: {callers_json_err}"
     );
 
     // 3. ensure_repo repairs the missing TSV identically and next ensure_repo is CACHE HIT
@@ -995,6 +1017,45 @@ fn incomplete_bundle_self_heals_and_no_sync_queries_error() {
         "Run following repair must be a CACHE HIT (no permanent rebuild loop)"
     );
 
+    // 3b. Truncate index/symbols.tsv to 0 bytes -> status reports stale, queries fail, ensure regenerates, next run CACHE HIT
+    fs::write(&sym_tsv_path, b"").unwrap();
+    let status_zero = workspace_status(&bundle_dir).expect("workspace_status 0-byte TSV");
+    assert_eq!(status_zero.len(), 1);
+    assert!(
+        !status_zero[0].is_fresh,
+        "Expected bundle with 0-byte symbols.tsv to be stale"
+    );
+    assert!(
+        status_zero[0]
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("symbols.tsv"),
+        "Expected reason to name symbols.tsv, got: {:?}",
+        status_zero[0].reason
+    );
+    let Err(callers_zero_err) = query_callers(&bundles, "motor_set_duty", false, 10) else {
+        panic!("Expected query_callers on 0-byte symbols.tsv to fail");
+    };
+    assert!(callers_zero_err.to_string().contains("symbols.tsv"));
+
+    let b_zero_repaired = ensure_repo(&repo_dir, &out_root, false, VendorMode::Active)
+        .expect("repair 0-byte symbols.tsv");
+    assert!(
+        !b_zero_repaired.cache_hit,
+        "0-byte symbols.tsv must be regenerated, not CACHE HIT"
+    );
+    assert_eq!(
+        fs::read(&sym_tsv_path).expect("restored symbols.tsv after 0-byte"),
+        saved_sym_tsv
+    );
+    let b_zero_warm = ensure_repo(&repo_dir, &out_root, false, VendorMode::Active)
+        .expect("warm ensure after 0-byte repair");
+    assert!(
+        b_zero_warm.cache_hit,
+        "Run following 0-byte TSV repair must be CACHE HIT"
+    );
+
     // 4. Delete a cache/<hash>.json shard -> ensure repairs and next run is CACHE HIT
     let manifest = chipsrc_core::scanner::load_cache_manifest(&bundle_dir).expect("manifest");
     let shard_rel = manifest.files.values().next().unwrap().shard.clone();
@@ -1013,17 +1074,10 @@ fn incomplete_bundle_self_heals_and_no_sync_queries_error() {
 
     // 5. Delete index/symbols.tsv -> auto_refresh_bundles repairs it before querying
     fs::remove_file(&sym_tsv_path).unwrap();
-    let refreshed =
-        auto_refresh_bundles(std::slice::from_ref(&bundle_dir)).expect("auto_refresh_bundles");
+    let refreshed = auto_refresh_bundles(&bundles).expect("auto_refresh_bundles");
     assert_eq!(refreshed, 1);
     assert!(sym_tsv_path.is_file());
-    let sym_out = query_symbols(
-        std::slice::from_ref(&bundle_dir),
-        "motor_set_duty",
-        None,
-        false,
-        10,
-    )
-    .expect("query after auto_refresh");
+    let sym_out = query_symbols(&bundles, "motor_set_duty", None, false, 10)
+        .expect("query after auto_refresh");
     assert!(sym_out.contains("motor_set_duty"));
 }

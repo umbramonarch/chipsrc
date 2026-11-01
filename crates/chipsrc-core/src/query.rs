@@ -3,7 +3,7 @@ use crate::mmio::{normalize_hex_literal, normalize_query_hex_literal};
 use crate::model::{BundleStatusEntry, LanguageKind, SearchHit, DEFAULT_MAX_FILE_BYTES};
 use crate::scanner::{
     canonical_repo_root_and_name, check_files_changed, check_meta_files_changed,
-    first_missing_bundle_artifact, has_bundle_cache, load_cache_file,
+    first_missing_bundle_artifact, has_bundle_cache, has_valid_tsv_header, load_cache_file,
     load_cache_manifest_any_version, load_meta_file, scan_repository,
 };
 use memchr::memmem;
@@ -285,7 +285,7 @@ pub fn workspace_status(workspace: &Path) -> Result<Vec<BundleStatusEntry>> {
 }
 
 /// Loads a required `index/<name>` TSV table from `bundle_dir`, returning
-/// [`ChipsrcError::IncompleteBundle`] if the table is missing or empty.
+/// [`ChipsrcError::IncompleteBundle`] if the table is missing, empty, or lacks its header line.
 pub fn load_index_table(bundle_dir: &Path, name: &str) -> Result<String> {
     let rel = if name.starts_with("index/") {
         name.to_string()
@@ -294,7 +294,7 @@ pub fn load_index_table(bundle_dir: &Path, name: &str) -> Result<String> {
     };
     let path = bundle_dir.join(&rel);
     match fs::read_to_string(&path) {
-        Ok(content) if !content.is_empty() => Ok(content),
+        Ok(content) if has_valid_tsv_header(&rel, &content) => Ok(content),
         _ => Err(ChipsrcError::IncompleteBundle {
             bundle: bundle_dir.to_path_buf(),
             missing: rel,
@@ -510,7 +510,7 @@ pub fn query_callers(
     }
 
     let mut hits = Vec::new();
-    let has_exact_sym = bundles_have_exact_symbol(bundles, q_trim, &q_lower);
+    let has_exact_sym = bundles_have_exact_symbol(bundles, q_trim, &q_lower)?;
     let suffix = format!("::{q_lower}");
 
     for bundle_dir in bundles {
@@ -655,7 +655,7 @@ pub fn query_callees(
     }
 
     let mut hits = Vec::new();
-    let has_exact_sym = bundles_have_exact_symbol(bundles, q_trim, &q_lower);
+    let has_exact_sym = bundles_have_exact_symbol(bundles, q_trim, &q_lower)?;
     let suffix = format!("::{q_lower}");
 
     for bundle_dir in bundles {
@@ -2204,16 +2204,14 @@ pub fn parallel_bundle_search(
     Ok(all_hits)
 }
 
-fn bundles_have_exact_symbol(bundles: &[PathBuf], q_trim: &str, q_lower: &str) -> bool {
-    if q_trim.is_empty() {
-        return false;
-    }
+fn bundles_have_exact_symbol(bundles: &[PathBuf], q_trim: &str, q_lower: &str) -> Result<bool> {
     let suffix = format!("::{q_lower}");
+    let mut found = false;
     for bundle_dir in bundles {
-        let sym_tsv = bundle_dir.join("index").join("symbols.tsv");
-        let Ok(content) = fs::read_to_string(&sym_tsv) else {
+        let content = load_index_table(bundle_dir, "symbols.tsv")?;
+        if found || q_trim.is_empty() {
             continue;
-        };
+        }
         for line in content.lines().skip(1) {
             let mut cols = line.split('\t');
             let Some(symbol_id) = cols.next() else {
@@ -2226,11 +2224,12 @@ fn bundles_have_exact_symbol(bundles: &[PathBuf], q_trim: &str, q_lower: &str) -
                 || symbol_id.eq_ignore_ascii_case(q_trim)
                 || symbol_id.to_ascii_lowercase().ends_with(&suffix)
             {
-                return true;
+                found = true;
+                break;
             }
         }
     }
-    false
+    Ok(found)
 }
 
 /// Pre-parsed query representation for zero-allocation hardware/code identifier scoring.
@@ -2643,7 +2642,7 @@ pub fn query_subcommand_json(
         }
         "callers" | "callees" => {
             let is_callers = subcommand == "callers";
-            let has_exact_sym = bundles_have_exact_symbol(bundles, q_trim, &q_lower);
+            let has_exact_sym = bundles_have_exact_symbol(bundles, q_trim, &q_lower)?;
             let suffix = format!("::{q_lower}");
             let mut items = Vec::new();
             for bundle_dir in bundles {

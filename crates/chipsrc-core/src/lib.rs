@@ -279,7 +279,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         None
     };
 
-    let (units, incremental_reused_files, incremental_reparsed_files, digest_noop_coords_unchanged) =
+    let (units, incremental_reused_files, incremental_reparsed_files) =
         if let Some(mut manifest) = prev_manifest_opt {
             let prev_stamp_map: BTreeMap<&str, &FileStamp> = existing_meta_opt
                 .as_ref()
@@ -468,12 +468,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
             }
             all_units.extend(dirty_units);
             all_units.sort_by(|a, b| a.scanned.rel_path.cmp(&b.scanned.rel_path));
-            (
-                all_units,
-                reused_count,
-                actual_reparsed,
-                digest_and_coords_unchanged,
-            )
+            (all_units, reused_count, actual_reparsed)
         } else {
             let existing_cache =
                 if existing_meta_opt.is_some() && scanner::has_bundle_cache(&config.output_dir) {
@@ -483,30 +478,23 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                 } else {
                     None
                 };
-            let (units, reused, reparsed) = parser::parse_files_incremental_with_blueprint(
+            parser::parse_files_incremental_with_blueprint(
                 &scanned_files,
                 existing_cache,
                 blueprint_opt.as_ref().map(|(bp, _)| bp),
-            )?;
-            (units, reused, reparsed, false)
+            )?
         };
     let parse_ms = t_parse.elapsed().as_millis() as u64;
 
     let t_link = Instant::now();
     let (symbols, mut types, mut macros, mut calls, mut xrefs, mut vendor_surface) =
         resolver::resolve_and_link(&units);
-    let raw_link_ms = t_link.elapsed().as_millis() as u64;
+    let link_ms = t_link.elapsed().as_millis() as u64;
 
     let t_graph = Instant::now();
     let (mut ranked_symbols, mut god_nodes, mut entrypoints, layer_edges, cycles) =
         graph::analyze_graph(symbols, &calls, &units);
-    let raw_graph_ms = t_graph.elapsed().as_millis() as u64;
-
-    let (link_ms, graph_ms) = if digest_noop_coords_unchanged {
-        (0, 0)
-    } else {
-        (raw_link_ms, raw_graph_ms)
-    };
+    let graph_ms = t_graph.elapsed().as_millis() as u64;
 
     let t_shard = Instant::now();
     let (section_summaries, sections) = sharder::build_section_shards(

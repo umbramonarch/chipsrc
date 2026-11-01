@@ -10,7 +10,9 @@ use chipsrc_core::query::{
     query_impact, query_macros, query_sections, query_subcommand_json, query_symbols,
     query_targets_file, query_types, query_xref, workspace_status,
 };
-use chipsrc_core::scanner::{has_bundle_cache, load_cache_manifest, stamp_check};
+use chipsrc_core::scanner::{
+    count_source_lines, has_bundle_cache, load_cache_manifest, stamp_check,
+};
 use chipsrc_core::{
     convert_repo, inspect_repo, ArchLayer, ConversionBundle, ConvertConfig, FileScope, MacroKind,
     ResolutionTier, SymbolKind, VendorMode,
@@ -605,21 +607,53 @@ pub fn main() {
     assert!(sc.unchanged);
     assert_eq!(sc.changed_count, 0);
 
-    // Bug 7: Comment-only edit at EOF must trigger Structural Digest No-Op Short-Circuit (`Reparsed == 1`, `Reused == 2`)
+    // Bug 7a: Comment-only edit preserving line count and coordinates triggers the real
+    // Structural Digest No-Op Short-Circuit (`sections` empty because link/graph/shard were skipped)
     let model_path = rs_dir.join("crates/core/src/model.rs");
     let orig_model = fs::read_to_string(&model_path).unwrap();
+    fs::write(
+        &model_path,
+        format!("{} // inline trailing comment\n", orig_model.trim_end()),
+    )
+    .unwrap();
+
+    let rs_bundle_noop = convert_repo(&rs_cfg).unwrap();
+    assert!(!rs_bundle_noop.cache_hit);
+    assert!(
+        rs_bundle_noop.sections.is_empty(),
+        "Expected line-preserving comment edit to take the real short-circuit path"
+    );
+    assert_eq!(rs_bundle_noop.metadata.incremental_reparsed_files, 1);
+    assert_eq!(rs_bundle_noop.metadata.incremental_reused_files, 2);
+    assert_eq!(rs_bundle_noop.metadata.link_ms, 0);
+    assert_eq!(rs_bundle_noop.metadata.graph_ms, 0);
+    assert_eq!(rs_bundle_noop.metadata.shard_ms, 0);
+
+    // Bug 7b: Appending comment lines at EOF changes line_count, so convert_repo runs the full
+    // link/graph/shard/emit pipeline to keep line totals accurate and matches a --force rebuild
     fs::write(
         &model_path,
         format!("{orig_model}\n// trailing comment edit\n"),
     )
     .unwrap();
 
-    let rs_bundle_noop = convert_repo(&rs_cfg).unwrap();
-    assert!(!rs_bundle_noop.cache_hit);
-    assert_eq!(rs_bundle_noop.metadata.incremental_reparsed_files, 1);
-    assert_eq!(rs_bundle_noop.metadata.incremental_reused_files, 2);
-    assert_eq!(rs_bundle_noop.metadata.link_ms, 0);
-    assert_eq!(rs_bundle_noop.metadata.graph_ms, 0);
+    let rs_bundle_eof = convert_repo(&rs_cfg).unwrap();
+    assert!(!rs_bundle_eof.cache_hit);
+    assert!(
+        !rs_bundle_eof.sections.is_empty(),
+        "Expected line-count-changing comment edit to run full shard/emit rebuild"
+    );
+    assert_eq!(rs_bundle_eof.metadata.incremental_reparsed_files, 1);
+    assert_eq!(rs_bundle_eof.metadata.incremental_reused_files, 2);
+    let eof_inc_hashes = collect_bundle_artifact_hashes(&rs_out);
+    let mut rs_force_cfg = rs_cfg.clone();
+    rs_force_cfg.force = true;
+    let rs_bundle_eof_force = convert_repo(&rs_force_cfg).unwrap();
+    assert_eq!(
+        rs_bundle_eof.metadata.total_lines,
+        rs_bundle_eof_force.metadata.total_lines
+    );
+    assert_eq!(eof_inc_hashes, collect_bundle_artifact_hashes(&rs_out));
 
     // 3. Test `web_monorepo` (Bug #19: Web / SFC layer classification)
     let web_dir = tmp.path().join("web_monorepo");
@@ -917,10 +951,22 @@ fn test_unified_count_source_lines_incremental_matches_force_end_to_end() {
             .total_lines,
         6
     );
+    assert_eq!(
+        count_source_lines(&fs::read(conv_src.join("empty.py")).unwrap()),
+        0
+    );
+    assert_eq!(conv_bundle.metadata.file_stamps.len(), 2);
+    assert!(
+        !conv_bundle
+            .metadata
+            .file_stamps
+            .iter()
+            .any(|s| s.rel_path == "empty.py"),
+        "zero-byte files are skipped by the scanner and must never appear in file_stamps"
+    );
     for stamp in &conv_bundle.metadata.file_stamps {
         match stamp.rel_path.as_str() {
             "tnl.py" | "nonl.py" => assert_eq!(stamp.line_count, 3, "for {}", stamp.rel_path),
-            "empty.py" => assert_eq!(stamp.line_count, 0),
             other => panic!("unexpected stamp {other}"),
         }
     }

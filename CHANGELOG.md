@@ -47,6 +47,10 @@ All notable changes to this project are listed here. Versions follow
 
 ### Fixed
 
+- **Honest Incremental Stage Timings, Header-Validated TSV Integrity & Exact-Symbol Loader (`scanner.rs`, `query.rs`, `lib.rs`)**:
+  - Removed the artificial `link_ms = graph_ms = 0` override in `convert_repo` when `resolve_and_link` and `analyze_graph` run after line-count-changing comment edits; `link_ms = graph_ms = shard_ms = 0` is reported only when the real `can_short_circuit` fast path skips those stages.
+  - Added `scanner::has_valid_tsv_header` and wired it into `scanner::first_missing_bundle_artifact` and `query::load_index_table` so zero-byte or header-less `index/*.tsv` files are treated as missing/incomplete, self-healed by `ensure`/`convert`/`auto_refresh_bundles`, and flagged as stale by `status --check`.
+  - Updated `query::bundles_have_exact_symbol` to read `index/symbols.tsv` through `load_index_table` so `callers` and `callees` with `--no-sync` fail with `ChipsrcError::IncompleteBundle` naming `index/symbols.tsv` instead of silently broadening matches.
 - **Duplicate-Content Per-File Cache Shard Disambiguation (`model.rs`, `scanner.rs`, `emitter.rs`, `lib.rs`)**:
   - Added `CacheShardEntry::shard_key(rel_path, blake3_hash)` and `CacheShardEntry::shard_rel_path(rel_path, blake3_hash)` keying per-file AST cache shards by `blake3(rel_path + "\0" + blake3_hash)` (`cache/<shard_key>.json`) and verifying `scanned.rel_path` on load so byte-identical files at different paths never alias or drop sibling sections/symbols across incremental refreshes.
 - **Unified Source Line Counting Across Full Scan & Incremental Sync (`scanner.rs`)**:

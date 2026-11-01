@@ -549,10 +549,38 @@ pub fn has_bundle_cache(bundle_dir: &Path) -> bool {
     load_cache_manifest(bundle_dir).is_some()
 }
 
+/// Returns `true` when `content` (or the initial prefix of a TSV file) begins with the canonical
+/// header line for `rel` (`index/<table_name>.tsv`).
+pub fn has_valid_tsv_header(rel: &str, content: &str) -> bool {
+    let expected_prefix = match rel.strip_prefix("index/").unwrap_or(rel) {
+        "sections.tsv" => {
+            "section_id\ttitle\tmodule_path\tarch_layer\tscope\tfile_count\tsymbol_count\ttype_count\tmacro_count\ttoken_estimate\tmd_file"
+        }
+        "symbols.tsv" => {
+            "symbol_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tsignature\tpagerank\tin_deg\tout_deg\tarch_layer\tscope\tsection_id\tdoc_summary"
+        }
+        "types.tsv" => {
+            "type_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tfields_summary\tarch_layer\tscope\tsection_id\tdoc_summary"
+        }
+        "calls.tsv" => {
+            "caller_id\tcaller_name\tcallee_name\tcallee_id\tfile\tline\ttier\tsection_id"
+        }
+        "macros.tsv" => {
+            "name\tkind\tvalue_or_args\thex_addr\tfile\tline\tarch_layer\tscope\tsection_id\tdescription"
+        }
+        "xref.tsv" => "symbol\tcategory\trelation\ttarget\tfile\tline\tsection_id\tcontext",
+        _ => return !content.trim().is_empty(),
+    };
+    let Some(first_line) = content.lines().next() else {
+        return false;
+    };
+    first_line.starts_with(expected_prefix)
+}
+
 /// Returns the relative path of the first missing or invalid required bundle artifact in `bundle_dir`,
-/// or `None` when the bundle is complete (`meta.json`, `INDEX.md`, all six `index/*.tsv` tables,
-/// every `md_file` listed in column 11 of `index/sections.tsv`, `cache/manifest.json`, and every
-/// shard listed in `cache/manifest.json`).
+/// or `None` when the bundle is complete (`meta.json`, `INDEX.md`, all six `index/*.tsv` tables
+/// with non-empty header lines, every `md_file` listed in column 11 of `index/sections.tsv`,
+/// `cache/manifest.json`, and every shard listed in `cache/manifest.json`).
 pub fn first_missing_bundle_artifact(bundle_dir: &Path) -> Option<String> {
     if !bundle_dir.is_dir() {
         return Some("bundle directory".to_string());
@@ -573,7 +601,10 @@ pub fn first_missing_bundle_artifact(bundle_dir: &Path) -> Option<String> {
         "index/xref.tsv",
     ];
     for rel in REQUIRED_TSVS {
-        if !bundle_dir.join(rel).is_file() {
+        let Ok(content) = fs::read_to_string(bundle_dir.join(rel)) else {
+            return Some(rel.to_string());
+        };
+        if !has_valid_tsv_header(rel, &content) {
             return Some(rel.to_string());
         }
     }
@@ -1999,7 +2030,7 @@ mod tests {
         assert!(bundle_artifacts_complete(&bundle_dir));
         assert_eq!(first_missing_bundle_artifact(&bundle_dir), None);
 
-        // 1. Delete each required TSV one by one
+        // 1. Delete, truncate to 0 bytes, or strip header of each required TSV one by one
         for tsv in [
             "index/sections.tsv",
             "index/symbols.tsv",
@@ -2019,6 +2050,29 @@ mod tests {
                 first_missing_bundle_artifact(&bundle_dir).as_deref(),
                 Some(tsv)
             );
+
+            // 0-byte TSV must also be treated as missing/incomplete
+            std::fs::write(&p, b"").unwrap();
+            assert!(
+                !bundle_artifacts_complete(&bundle_dir),
+                "Expected incomplete when {tsv} is 0 bytes"
+            );
+            assert_eq!(
+                first_missing_bundle_artifact(&bundle_dir).as_deref(),
+                Some(tsv)
+            );
+
+            // Header-less TSV must also be treated as missing/incomplete
+            std::fs::write(&p, b"not_a_valid_header\tcol2\n").unwrap();
+            assert!(
+                !bundle_artifacts_complete(&bundle_dir),
+                "Expected incomplete when {tsv} lacks its header line"
+            );
+            assert_eq!(
+                first_missing_bundle_artifact(&bundle_dir).as_deref(),
+                Some(tsv)
+            );
+
             std::fs::write(&p, saved).unwrap();
             assert!(bundle_artifacts_complete(&bundle_dir));
         }
