@@ -1,0 +1,68 @@
+{
+  "repo": "smart_locker",
+  "total_files": 123,
+  "total_lines": 41247,
+  "sym_query": "pm_match_key",
+  "sym_file": "smart_locker/domain/identifiers.py",
+  "sym_start_line": 38,
+  "callers_limit": 100,
+  "import_resolved_tier": "import_resolved",
+  "import_resolved_callers": [
+    ["smart_locker/sync/source_import.py", 429],
+    ["smart_locker/sync/source_import.py", 433],
+    ["smart_locker/database/repositories.py", 489],
+    ["smart_locker/api/dashboard_routes.py", 133],
+    ["smart_locker/services/device_registration.py", 254]
+  ],
+  "same_file_callee": "normalize_pm",
+  "same_file_tier": "same_file",
+  "type_query": "Device",
+  "type_field_contains": "pm_number: Mapped[str]",
+  "inline_source_symbol": "pm_match_key",
+  "inline_source_contains": "normalize_pm(value).casefold()",
+  "max_limit_probe": 1,
+  "limit_probe_queries": [
+    ["sym", "pm_match_key"],
+    ["callers", "pm_match_key"],
+    ["callees", "pm_match_key"],
+    ["type", "Device"],
+    ["search", "pm_match_key"]
+  ],
+  "sync": {
+    "target_file": "smart_locker/domain/identifiers.py",
+    "old_def": "def pm_match_key(",
+    "new_def": "def pm_match_qa1(",
+    "old_symbol": "pm_match_key",
+    "renamed_symbol_1": "pm_match_qa1",
+    "renamed_symbol_2": "pm_match_qa2",
+    "renamed_symbol_3": "pm_match_qa3",
+    "expected_changed_files_count": 1,
+    "expected_reparsed_files": 1,
+    "expected_reused_files": 122,
+    "comment_prefix": "# QA line inserted before all definitions\n",
+    "shifted_start_line": 39,
+    "inline_source_contains": "normalize_pm(value).casefold()",
+    "model_file": "smart_locker/database/models.py",
+    "old_docstring": "Physical device stored in the locker system.",
+    "new_docstring": "QA documentation revised for the locker device.",
+    "added_file": "smart_locker/domain/qa_added.py",
+    "added_symbol": "pm_match_added",
+    "renamed_file_name": "qa_identifiers.py"
+  },
+  "same_second_probe": {
+    "language": "python",
+    "repo": "smart_locker",
+    "relative_path": "smart_locker/domain/identifiers.py",
+    "old_symbol": "pm_match_key",
+    "new_symbol": "pm_match_new"
+  },
+  "focused": {
+    "linecount_file": "smart_locker/domain/identifiers.py",
+    "linecount_comment": "# QA comment adds one line\n",
+    "perf_target_file": "smart_locker/domain/identifiers.py",
+    "perf_initial_symbol": "pm_match_key",
+    "perf_symbol_prefix": "pm_match_q",
+    "perf_iterations": 5,
+    "perf_expected_reparsed": 1
+  }
+}

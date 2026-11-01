@@ -1,0 +1,17 @@
+{
+  "repo": "chipsrc",
+  "sym_query": "convert_repo",
+  "sym_file": "crates/chipsrc-core/src/lib.rs",
+  "sym_sig_contains": "ConvertConfig",
+  "type_query": "ConvertConfig",
+  "type_field_contains": "vendor_mode",
+  "expected_callee": "scan_repository",
+  "unknown_symbol": "qa_no_such_symbol_038d",
+  "multi_bundle_symbol": "main",
+  "multi_bundle_limit": 100,
+  "multi_bundle_min_bundles": 2,
+  "expected_bundle_count": 4,
+  "negative_limit_arg": "-1",
+  "literal_fallback_query": "[",
+  "literal_fallback_limit": 1
+}

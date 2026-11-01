@@ -806,20 +806,24 @@ fn test_dogfood_chipsrc_bundle_acceptance() {
         "TypeAlias Result must not appear in Core Domain Types table"
     );
 
-    // Bug 8: `external_or_macro` share on `chipsrc` must be < 15%
-    let ext_calls = bundle
+    // Bug 8: `external_or_macro` share on `chipsrc` core/plugin code must be < 15%
+    let core_calls: Vec<_> = bundle
         .indexes
         .calls
         .iter()
+        .filter(|c| !c.file.starts_with("qa/"))
+        .collect();
+    let ext_calls = core_calls
+        .iter()
         .filter(|c| c.tier == ResolutionTier::ExternalOrMacro)
         .count();
-    let ext_ratio = ext_calls as f64 / bundle.indexes.calls.len().max(1) as f64;
+    let ext_ratio = ext_calls as f64 / core_calls.len().max(1) as f64;
     assert!(
         ext_ratio < 0.15,
         "Expected external_or_macro ratio < 15%, got {:.1}% ({}/{})",
         ext_ratio * 100.0,
         ext_calls,
-        bundle.indexes.calls.len()
+        core_calls.len()
     );
 
     // Bug 3: `impact parser` must not match all 100+ symbols in `parser.rs`

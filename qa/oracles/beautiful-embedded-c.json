@@ -1,0 +1,51 @@
+{
+  "repo": "beautiful-embedded-c",
+  "total_files": 6,
+  "total_lines": 1655,
+  "sym_query": "motor_ReadCurrent",
+  "expected_callers": [
+    "motor_Update",
+    "TIM1_UP_IRQHandler"
+  ],
+  "isr_symbol": "TIM1_UP_IRQHandler",
+  "isr_kind": "isr",
+  "isr_count": 2,
+  "type_query": "MotorConfig_t",
+  "type_count": 2,
+  "type_field_contains": "max_current: float",
+  "register_queries": [
+    "VENDOR_ADC1->CR",
+    "VENDOR_ADC1_CR",
+    "VENDOR_ADC1.CR"
+  ],
+  "register_hit_count": 2,
+  "xref_query": "VENDOR_ADC1",
+  "inline_source_symbol": "motor_ReadCurrent",
+  "inline_source_contains": "VENDOR_ADC1->CHSEL",
+  "same_second_probe": {
+    "language": "c",
+    "repo": "beautiful-embedded-c",
+    "relative_path": "skills/embedded-c-review/evals/review-motor-ctrl/files/motor_ctrl.c",
+    "old_symbol": "motor_ReadCurrent",
+    "new_symbol": "motor_ReadVoltage"
+  },
+  "vendor_probe": {
+    "source_c": "skills/embedded-c-review/evals/review-motor-ctrl/files/motor_ctrl.c",
+    "source_h": "skills/embedded-c-review/evals/review-motor-ctrl/files/motor_ctrl.h",
+    "target_c_name": "motor_ctrl.c",
+    "target_h_name": "motor_ctrl.h",
+    "vendor_c_name": "unused_motor.c",
+    "old_prefix": "motor_",
+    "new_prefix": "unused_vendor_",
+    "vendor_symbol": "unused_vendor_ReadCurrent",
+    "expected_active_vendor_files": 1,
+    "expected_none_vendor_files": 0,
+    "registers_header_name": "qa_registers.h",
+    "registers_header_content": "#define QA_REG_CONTROL 0x40000004U\n#define QA_REG_STATUS 0x40000008U\n",
+    "hex_queries": [
+      "0x40000004",
+      "40000004h",
+      "0X40000004"
+    ]
+  }
+}

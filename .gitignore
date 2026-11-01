@@ -9,6 +9,7 @@ __pycache__/
 # Generated output directories
 /output/
 /out/
+/qa/results/
 
 # Environment & IDE
 .env

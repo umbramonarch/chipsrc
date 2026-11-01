@@ -1,0 +1,59 @@
+{
+  "repo": "volt_website",
+  "total_files": 32,
+  "total_lines": 4837,
+  "sym_query": "validateKontakt",
+  "caller_name": "POST",
+  "caller_file": "src/pages/api/kontakt.ts",
+  "caller_line": 41,
+  "caller_tier": "import_resolved",
+  "macro_query": "LIMITS",
+  "macro_value_contains": "4000",
+  "macro_line": 18,
+  "inline_source_symbol": "validateKontakt",
+  "inline_source_contains": "EMAIL_RE.test",
+  "search_query": "kontakt",
+  "search_limit": 5,
+  "search_kinds": [
+    "source",
+    "symbols",
+    "types",
+    "calls",
+    "macros",
+    "xref",
+    "sections"
+  ],
+  "regex_pattern": "validateKon(takt|TAKT)",
+  "regex_min_hits": 2,
+  "expected_section_count": 6,
+  "section_query": "contact",
+  "sync": {
+    "target_file": "src/plugins/contact/kontakt.ts",
+    "old_symbol": "validateKontakt",
+    "renamed_symbol_1": "validateKontaktQA",
+    "renamed_symbol_2": "validateKontaktQB",
+    "malformed_file": "src/qa_malformed.ts",
+    "malformed_content": "export function qa_broken( { ???\n",
+    "invalid_utf8_file": "src/qa_invalid_utf8.ts"
+  },
+  "same_second_probe": {
+    "language": "typescript",
+    "repo": "volt_website",
+    "relative_path": "src/plugins/contact/kontakt.ts",
+    "old_symbol": "validateKontakt",
+    "new_symbol": "validateContact"
+  },
+  "spaces_probe": {
+    "source_file": "src/plugins/contact/kontakt.ts",
+    "copied_name": "kontakt.ts",
+    "symbol": "validateKontakt"
+  },
+  "hooks": {
+    "target_file": "src/plugins/contact/kontakt.ts",
+    "old_symbol": "validateKontakt",
+    "renamed_symbol_1": "validateKontaktQA",
+    "renamed_symbol_2": "validateKontaktQB",
+    "renamed_symbol_3": "validateKontaktQC",
+    "malformed_payload": "{not valid json"
+  }
+}
