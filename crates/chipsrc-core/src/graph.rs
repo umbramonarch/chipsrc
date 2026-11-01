@@ -34,9 +34,15 @@ pub fn analyze_graph(
         id_to_idx.entry(sym.symbol_id.as_str()).or_insert(i as u32);
     }
 
-    // 2. Build outgoing adj and incoming rev_adj (excluding self-loops, sorted & deduplicated)
+    // 2. Build outgoing adj and incoming rev_adj (excluding self-loops, sorted & deduplicated).
+    // `deg_adj` / `deg_rev_adj` track degrees emitted to `symbols.tsv` (including Test -> Test
+    // edges, while excluding Test -> FirstParty so unit tests never inflate production in_degree).
+    // `adj` / `rev_adj` exclude all edges whose caller has `FileScope::Test` (weighted 0 in
+    // PageRank and HITS so test volume never manufactures hubs).
     let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
     let mut rev_adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut deg_adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut deg_rev_adj: Vec<Vec<u32>> = vec![Vec::new(); n];
 
     for call in calls {
         if !call.tier.is_high_confidence() {
@@ -47,15 +53,19 @@ pub fn analyze_graph(
             id_to_idx.get(call.callee_id.as_str()),
         ) {
             if u != v {
-                // Do not let unit-test callers inflate the production in-degree / PageRank of
-                // first-party symbols.
-                if symbols[u as usize].scope == FileScope::Test
-                    && symbols[v as usize].scope == FileScope::FirstParty
-                {
+                let caller_scope = symbols[u as usize].scope;
+                let callee_scope = symbols[v as usize].scope;
+                // Do not let unit-test callers inflate the production in-degree of first-party symbols.
+                if caller_scope == FileScope::Test && callee_scope == FileScope::FirstParty {
                     continue;
                 }
-                adj[u as usize].push(v);
-                rev_adj[v as usize].push(u);
+                deg_adj[u as usize].push(v);
+                deg_rev_adj[v as usize].push(u);
+
+                if caller_scope != FileScope::Test {
+                    adj[u as usize].push(v);
+                    rev_adj[v as usize].push(u);
+                }
             }
         }
     }
@@ -68,9 +78,17 @@ pub fn analyze_graph(
         list.sort_unstable();
         list.dedup();
     }
+    for list in &mut deg_adj {
+        list.sort_unstable();
+        list.dedup();
+    }
+    for list in &mut deg_rev_adj {
+        list.sort_unstable();
+        list.dedup();
+    }
 
-    // 3. Run 25-iteration deterministic PageRank (damping = 0.85)
-    // Give 1.5x base prior weight to FileScope::FirstParty symbols over VendorSdk
+    // 3. Run 25-iteration deterministic PageRank (damping = 0.85) and 25-iteration HITS
+    // Give 1.5x base prior weight to FileScope::FirstParty symbols over VendorSdk, and 0 to Test
     const DAMPING: f64 = 0.85;
     const ITERS: usize = 25;
 
@@ -78,7 +96,7 @@ pub fn analyze_graph(
         .iter()
         .map(|s| match s.scope {
             FileScope::FirstParty => 1.5,
-            FileScope::Test => 1.0,
+            FileScope::Test => 0.1,
             FileScope::VendorSdk => 1.0,
         })
         .collect();
@@ -114,6 +132,8 @@ pub fn analyze_graph(
         std::mem::swap(&mut ranks, &mut next_ranks);
     }
 
+    let (hubs, authorities) = compute_hits(&adj, &rev_adj, &symbols, ITERS);
+
     // 4. Run Tarjan's Strongly Connected Components (SCC) algorithm on adj
     let (cycles, node_scc_ids) = compute_tarjan_sccs(&adj, &symbols);
 
@@ -122,8 +142,8 @@ pub fn analyze_graph(
         .iter()
         .enumerate()
         .map(|(i, sym)| {
-            let in_degree = rev_adj[i].len();
-            let out_degree = adj[i].len();
+            let in_degree = deg_rev_adj[i].len();
+            let out_degree = deg_adj[i].len();
             let is_named_entry = matches!(
                 sym.name.as_str(),
                 "main" | "app_main" | "Reset_Handler" | "_start" | "SystemInit"
@@ -147,6 +167,8 @@ pub fn analyze_graph(
             RankedSymbol {
                 symbol,
                 pagerank: ranks[i],
+                hub_score: hubs[i],
+                authority_score: authorities[i],
                 in_degree,
                 out_degree,
                 is_god_node: false,
@@ -156,21 +178,27 @@ pub fn analyze_graph(
         })
         .collect();
 
-    // 6. Identify God Nodes (Top architectural hubs)
-    // Prefer true architectural transit hubs (`in_degree > 0 && out_degree > 0`) and orchestration
-    // coordinators (`out_degree >= 2`) over pure leaf utility functions (`out_degree == 0`).
-    let hub_score = |r: &RankedSymbol| -> f64 {
-        let deg = (r.in_degree + r.out_degree) as f64;
-        let base = r.pagerank * (1.0 + deg).ln_1p();
-        if r.in_degree > 0 && r.out_degree > 0 {
-            base * 2.0
-        } else if r.out_degree >= 2 {
-            base * 1.2
-        } else if r.out_degree == 0 {
-            base * 0.15
+    // 6. Identify God Nodes (Top architectural hubs via HITS hub × authority + bridging score)
+    let god_node_score = |r: &RankedSymbol| -> f64 {
+        let bridge = (1.0 + r.in_degree as f64).ln_1p()
+            * (1.0 + r.out_degree as f64).ln_1p()
+            * (r.out_degree as f64).sqrt().max(1.0);
+        let vis = if r.symbol.visibility == Visibility::Public {
+            1.4
         } else {
-            base
-        }
+            0.85
+        };
+        let layer_w = match r.symbol.arch_layer {
+            ArchLayer::Cli => 0.55,
+            _ => 1.0,
+        };
+        let leaf_penalty = match r.out_degree {
+            0 => 0.10,
+            1 if r.in_degree >= 2 => 0.45,
+            1 => 0.55,
+            _ => 1.0,
+        };
+        (r.hub_score * r.authority_score).sqrt() * bridge * vis * layer_w * leaf_penalty
     };
 
     let mut hub_candidates: Vec<(usize, f64)> = ranked
@@ -178,29 +206,50 @@ pub fn analyze_graph(
         .enumerate()
         .filter(|(_, r)| {
             r.symbol.scope == FileScope::FirstParty
-                && r.out_degree > 0
-                && (r.in_degree + r.out_degree) >= 2
+                && r.out_degree >= 2
+                && (r.in_degree >= 1
+                    || (r.symbol.visibility == Visibility::Public && r.out_degree >= 3))
         })
-        .map(|(idx, r)| (idx, hub_score(r)))
+        .map(|(idx, r)| (idx, god_node_score(r)))
         .collect();
 
-    if hub_candidates.len() < 5 {
+    if hub_candidates.is_empty() {
+        hub_candidates = ranked
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.symbol.scope == FileScope::FirstParty && r.out_degree >= 2)
+            .map(|(idx, r)| (idx, god_node_score(r)))
+            .collect();
+    }
+
+    if ranked.len() < 40 && hub_candidates.len() < 5 {
         hub_candidates = ranked
             .iter()
             .enumerate()
             .filter(|(_, r)| {
-                r.symbol.scope == FileScope::FirstParty && (r.in_degree + r.out_degree) >= 2
+                r.symbol.scope == FileScope::FirstParty
+                    && r.out_degree >= 1
+                    && (r.in_degree + r.out_degree) >= 2
             })
-            .map(|(idx, r)| (idx, hub_score(r)))
+            .map(|(idx, r)| (idx, god_node_score(r)))
             .collect();
     }
 
-    if hub_candidates.is_empty() {
+    if ranked.len() < 40 && hub_candidates.is_empty() {
+        hub_candidates = ranked
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.symbol.scope == FileScope::FirstParty && r.out_degree >= 1)
+            .map(|(idx, r)| (idx, god_node_score(r)))
+            .collect();
+    }
+
+    if ranked.len() < 40 && hub_candidates.is_empty() {
         hub_candidates = ranked
             .iter()
             .enumerate()
             .filter(|(_, r)| r.symbol.scope == FileScope::FirstParty)
-            .map(|(idx, r)| (idx, hub_score(r)))
+            .map(|(idx, r)| (idx, god_node_score(r)))
             .collect();
     }
 
@@ -208,8 +257,30 @@ pub fn analyze_graph(
         hub_candidates = ranked
             .iter()
             .enumerate()
-            .map(|(idx, r)| (idx, hub_score(r)))
+            .map(|(idx, r)| (idx, god_node_score(r)))
             .collect();
+    }
+
+    // Apply per-file diminishing return so a single module with many sibling handlers
+    // does not crowd out the primary architectural entry orchestrators of other modules.
+    hub_candidates.sort_by(|(idx_a, score_a), (idx_b, score_b)| {
+        score_b.total_cmp(score_a).then_with(|| {
+            ranked[*idx_a]
+                .symbol
+                .symbol_id
+                .cmp(&ranked[*idx_b].symbol.symbol_id)
+        })
+    });
+    {
+        let mut file_counts: FxHashMap<&str, usize> = FxHashMap::default();
+        for (idx, score) in &mut hub_candidates {
+            let f = ranked[*idx].symbol.file.as_str();
+            let count = file_counts.entry(f).or_insert(0);
+            if *count >= 1 {
+                *score /= 1.0 + 0.85 * (*count as f64);
+            }
+            *count += 1;
+        }
     }
 
     hub_candidates.sort_by(|(idx_a, score_a), (idx_b, score_b)| {
@@ -257,6 +328,147 @@ pub fn analyze_graph(
     let layer_edges = compute_layer_edges(&symbols, calls, units);
 
     (ranked, god_nodes, entrypoints, layer_edges, cycles)
+}
+
+/// Runs deterministic 25-iteration HITS (`auth = Aᵀ·hub`, `hub = A·auth`) with L2 normalization
+/// each iteration over the high-confidence call graph (`FileScope::Test` callers excluded).
+fn compute_hits(
+    adj: &[Vec<u32>],
+    rev_adj: &[Vec<u32>],
+    symbols: &[ExtractedSymbol],
+    iters: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let n = symbols.len();
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut prior_hub = vec![0.0_f64; n];
+    let mut prior_auth = vec![0.0_f64; n];
+
+    for i in 0..n {
+        if symbols[i].scope == FileScope::Test {
+            continue;
+        }
+        let scope_w = if symbols[i].scope == FileScope::FirstParty {
+            1.5
+        } else {
+            0.5
+        };
+        let vis_w = if symbols[i].visibility == Visibility::Public {
+            2.5
+        } else {
+            1.0
+        };
+        let cross_out = adj[i]
+            .iter()
+            .filter(|&&v| symbols[v as usize].file != symbols[i].file)
+            .count();
+        let cross_in = rev_adj[i]
+            .iter()
+            .filter(|&&u| symbols[u as usize].file != symbols[i].file)
+            .count();
+        let out_deg = adj[i].len();
+        let in_deg = rev_adj[i].len();
+
+        prior_hub[i] = scope_w
+            * vis_w
+            * if out_deg >= 2 {
+                1.0 + (out_deg as f64).ln_1p() + 2.0 * (cross_out as f64).ln_1p()
+            } else {
+                0.2
+            };
+        let auth_out_factor = if out_deg >= 2 {
+            2.0
+        } else if out_deg == 1 {
+            0.5
+        } else {
+            0.15
+        };
+        prior_auth[i] = scope_w
+            * vis_w
+            * auth_out_factor
+            * (1.0 + (in_deg as f64).ln_1p() + 2.5 * (cross_in as f64).ln_1p());
+    }
+
+    l2_normalize(&mut prior_hub);
+    l2_normalize(&mut prior_auth);
+
+    let mut hub = prior_hub.clone();
+    let mut auth = prior_auth.clone();
+    let mut next_hub = vec![0.0_f64; n];
+    let mut next_auth = vec![0.0_f64; n];
+
+    let edge_weight = |u: usize, v: usize| -> f64 {
+        let cross_file = symbols[u].file != symbols[v].file;
+        let u_out = adj[u].len().max(1) as f64;
+        let caller_damp = if rev_adj[u].is_empty() || symbols[u].arch_layer == ArchLayer::Cli {
+            0.35 / u_out.sqrt()
+        } else {
+            1.0 / u_out.sqrt()
+        };
+        let v_out = adj[v].len();
+        if v_out == 0 {
+            let v_in = rev_adj[v].len().max(1) as f64;
+            return caller_damp * (0.10 / v_in);
+        }
+        let base = if cross_file {
+            if symbols[v].visibility == Visibility::Public && v_out >= 2 {
+                4.0
+            } else {
+                2.5
+            }
+        } else if v_out >= 2 {
+            1.0
+        } else {
+            0.35
+        };
+        caller_damp * base
+    };
+
+    const ALPHA: f64 = 0.75;
+    for _ in 0..iters {
+        for v in 0..n {
+            if symbols[v].scope == FileScope::Test {
+                next_auth[v] = 0.0;
+                continue;
+            }
+            let mut sum_h = 0.0_f64;
+            for &u in &rev_adj[v] {
+                let u_idx = u as usize;
+                sum_h += edge_weight(u_idx, v) * hub[u_idx];
+            }
+            next_auth[v] = (1.0 - ALPHA) * prior_auth[v] + ALPHA * sum_h;
+        }
+        l2_normalize(&mut next_auth);
+        std::mem::swap(&mut auth, &mut next_auth);
+
+        for u in 0..n {
+            if symbols[u].scope == FileScope::Test {
+                next_hub[u] = 0.0;
+                continue;
+            }
+            let mut sum_a = 0.0_f64;
+            for &v in &adj[u] {
+                let v_idx = v as usize;
+                sum_a += edge_weight(u, v_idx) * auth[v_idx];
+            }
+            next_hub[u] = (1.0 - ALPHA) * prior_hub[u] + ALPHA * sum_a;
+        }
+        l2_normalize(&mut next_hub);
+        std::mem::swap(&mut hub, &mut next_hub);
+    }
+
+    (hub, auth)
+}
+
+fn l2_normalize(vec: &mut [f64]) {
+    let norm = vec.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if norm > 0.0 {
+        for x in vec.iter_mut() {
+            *x /= norm;
+        }
+    }
 }
 
 fn compute_tarjan_sccs(

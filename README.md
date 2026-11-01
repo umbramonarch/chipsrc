@@ -1,6 +1,6 @@
 # `chipsrc` — Agent Code Intelligence CLI & Auto-Sync Plugin for Firmware and Software Repositories
 
-`chipsrc` is a fast, zero-LLM **Rust CLI, library, and Hybrid Claude Code plugin** — and the sister project to [`chipdoc`](https://github.com/umbramonarch/chipdoc) — that turns C, C++, Rust, Python, TypeScript, and JavaScript source repositories into a queryable **Hierarchical Agent Codebase Bundle** and **Code + Hardware Cross-Reference Graph** (`INDEX.md` + `index/*.tsv` + `sections/*.md` + `meta.json` + incremental `cache.json`).
+`chipsrc` is a fast, zero-LLM **Rust CLI, library, and Hybrid Claude Code plugin** — and the sister project to [`chipdoc`](https://github.com/umbramonarch/chipdoc) — that turns C, C++, Rust, Python, TypeScript, and JavaScript source repositories into a queryable **Hierarchical Agent Codebase Bundle** and **Code + Hardware Cross-Reference Graph** (`INDEX.md` + `index/*.tsv` + `sections/*.md` + `meta.json` + per-file incremental `cache/*.json` shards).
 
 Instead of burning 25,000+ context tokens reading entire source files or running 6 sequential `Grep` + `Read` turns to trace call graphs, struct layouts, `#define` register macros, and ISR handlers, an AI coding agent uses `chipsrc` to resolve symbols, types, callers/callees, macros/MMIO addresses, and hardware cross-references in **a single deterministic CLI call (~120 tokens)** — while **automatic incremental AST synchronization** keeps the bundle 100% up to date whenever source files change.
 
@@ -15,10 +15,10 @@ General-purpose repo packers (`repomix`, `code2prompt`) and naive `Grep` + `Read
 3. **Zero-Build Multi-Language AST Extraction**: Embedded and full-stack projects mix C/C++ firmware (`CMSIS`, vendor HALs, RTOS), Rust services/crates, Python test harnesses, and TypeScript/JavaScript tooling — often requiring cross-compilers (`arm-none-eabi-gcc`) that aren't installed in agent environments. `chipsrc` uses native **Tree-sitter grammars (`C`, `C++`, `Rust`, `Python`, `TypeScript`, `TSX`, `JavaScript`, `JSX`)** + **Rayon** to parse thousands of files in milliseconds with zero compiler setup.
 4. **1-Turn Static Call Graph & Architectural Diagnostics (`callers` / `callees`)**: `chipsrc` resolves `caller -> callee` edges across files with confidence tiers (`same_file`, `import_resolved`, `unique_global`, `ambiguous_name`, `external_or_macro`), ranks high-impact "god nodes" via deterministic PageRank, detects Tarjan SCC recursion cycles, and flags upward architectural layer violations (`drvs` calling `app`).
 5. **Hardware Register & Macro Normalization (`macro` / `reg` / `mmio`)**: Firmware code accesses hardware via `#define` offsets (`0x41C00004`), CMSIS struct pointers (`GPIOA->MODER`), or peripheral bitmasks (`USART_CR1_UE`). `chipsrc` normalizes C/vendor hex (`0x400` $\leftrightarrow$ `400h`) and peripheral separators (`GPIOA_MODER` $\leftrightarrow$ `GPIOA->MODER` $\leftrightarrow$ `GPIOA.MODER`) so `chipsrc reg` and `chipdoc reg` speak the exact same language.
-6. **Live Incremental AST Synchronization (`cache.json` + Auto-Refresh + Hooks)**:
-   - **Per-File AST Cache (`output/<repo>/cache.json`)**: Stores extracted AST units keyed by per-file BLAKE3 hash. Unchanged repositories return `[CACHE HIT]` in **<2 ms**; editing a source file re-parses **only the modified file (`[INCREMENTAL SYNC]`) in <50 ms** and rebuilds the cross-reference graph.
-   - **Automatic Query Refresh (`auto_refresh_bundles`)**: Every query command (`sym`, `callers`, `callees`, `type`, `macro`/`reg`/`mmio`, `section`, `xref`, `search`) automatically checks bundle freshness before executing and incrementally re-indexes any modified/added/deleted source files on the fly (disable with `--no-sync`).
-   - **Claude Code Auto-Sync Hooks (`hooks/hooks.json`)**: `SessionStart` (`scripts/session_start_hook.py`) discovers and refreshes workspace bundles on startup, while `PostToolUse` (`scripts/post_edit_hook.py` on `Edit|Write|MultiEdit`) triggers `chipsrc ensure` in the background immediately after any code edit.
+6. **Live Incremental AST Synchronization (`cache/` Shards + Auto-Refresh + Native Hooks)**:
+   - **Per-File AST Cache Shards (`output/<repo>/cache/manifest.json` + `cache/<blake3>.json`)**: Stores extracted AST units as content-addressed per-file shards alongside a structural digest. Stat-only `stamp_check` returns `[CACHE HIT]` in **<2 ms** without reading unchanged files; comment-only edits short-circuit via structural digest in **<25 ms**; structural edits re-parse and write **only the modified shard (`[INCREMENTAL SYNC]`) in <50 ms**.
+   - **Automatic Query Refresh (`auto_refresh_bundles`)**: Every query command (`sym`, `callers`, `callees`, `type`, `macro`/`reg`/`mmio`, `section`, `xref`, `path`, `impact`, `search`) automatically checks bundle freshness before executing and incrementally re-indexes any modified/added/deleted source files on the fly (disable with `--no-sync`).
+   - **Claude Code Auto-Sync Hooks (`hooks/hooks.json`)**: `SessionStart` (`chipsrc hook session-start` with `scripts/session_start_hook.py` fallback) discovers and refreshes workspace bundles on startup, while `PostToolUse` (`chipsrc hook post-edit` on `Edit|Write|MultiEdit`) incrementally synchronizes affected bundles immediately after any code edit.
 
 ---
 
@@ -29,8 +29,10 @@ Running `chipsrc convert /path/to/repo` (or `chipsrc ensure /path/to/repo -o out
 ```text
 output/<repo_name>/
 ├── INDEX.md                        # Master entry point: architecture layers, god nodes, entrypoints/ISRs, active vendor surface, shard map
-├── meta.json                       # Provenance, BLAKE3 Merkle fingerprint, language & scope breakdown, sanity score
-├── cache.json                      # Per-file BLAKE3 AST cache for <50ms incremental single-file rebuilds
+├── meta.json                       # Provenance, BLAKE3 Merkle fingerprint, language & scope breakdown, stage timings, sanity score
+├── cache/
+│   ├── manifest.json               # Schema 2.0.0 manifest mapping relative paths to BLAKE3 hashes & structural digests
+│   └── <blake3>.json               # Content-addressed per-file ParsedFileUnit shards for <25ms incremental rebuilds
 ├── index/
 │   ├── sections.tsv                # section_id | title | module_path | arch_layer | scope | files | symbols | types | macros | tokens | md_file
 │   ├── symbols.tsv                 # symbol_id | name | qualified_name | kind | vis | file | lines | scope | layer | pagerank | in_deg | out_deg | signature | doc

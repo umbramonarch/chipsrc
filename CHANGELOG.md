@@ -8,6 +8,17 @@ All notable changes to this project are listed here. Versions follow
 
 ### Added
 
+- **Per-File Content-Addressed AST Cache Shards (`2.0.0`), Stat-Only `stamp_check`, Structural Digest Short-Circuit & Stage Timings (`model.rs`, `scanner.rs`, `emitter.rs`, `lib.rs`, `main.rs`)**:
+  - Replaced the monolithic `cache.json` with `cache/manifest.json` (`CACHE_SCHEMA_VERSION = "2.0.0"`) and per-file `cache/<blake3>.json` shards (with automatic migration and cleanup of legacy `cache.json`).
+  - Added `scanner::stamp_check` to verify `(size_bytes, mtime_secs)` against `meta.file_stamps` without reading unchanged files from disk (`<2ms` warm cache hits) and refresh `mtime_secs` on touch-only edits.
+  - Added `ParsedFileUnit::structural_digest()` (16-char BLAKE3 over symbols, types, macros, imports, raw_calls, and raw_xrefs, excluding line numbers and docstrings) to short-circuit comment-only edits in `<25ms` without re-running global link, graph, sharding, or sanity passes.
+  - Added `scan_ms`, `parse_ms`, `link_ms`, `graph_ms`, `shard_ms`, and `emit_ms` to `RepoMetadata` and `--timings` to `chipsrc convert` and `chipsrc ensure`.
+- **Deterministic 25-Iteration HITS Hub/Authority Ranking (`model.rs`, `graph.rs`, `emitter.rs`)**:
+  - Added `compute_hits` alongside PageRank over the high-confidence call graph (`FileScope::Test` callers weighted `0`), emitting `hub_score` and `authority_score` to `RankedSymbol` and `index/symbols.tsv` (columns 16–17) and ranking God Nodes by `sqrt(hub * auth)` bridging centrality with per-file diversity.
+- **Native Rust Claude Code Hooks, Universal `--json` Output & CI `status --check` (`main.rs`, `query.rs`, `hooks/hooks.json`)**:
+  - Added `chipsrc hook session-start` and `chipsrc hook post-edit` subcommands for `<25ms` zero-Python hook execution (with Python fallback in `hooks/hooks.json`).
+  - Added `--json` output across all query subcommands (`status`, `inspect`, `sym`, `callers`, `callees`, `type`, `macro`, `section`, `xref`, `path`, `impact`, `search`) and `chipsrc status --check` (exits with status code `2` when any bundle is `STALE`).
+  - Added `crates/chipsrc-core/tests/invariants.rs` (`INV-1`..`INV-7` and Bugs #1–#20 regression harness) and `scripts/bench.ps1`.
 - **Agent-Once Onboarding Blueprint (`.chipsrc.json`) & Turn-1 Discovery (`model.rs`, `scanner.rs`, `mmio.rs`, `parser.rs`, `lib.rs`, `main.rs`)**:
   - Added root `.chipsrc.json` `RepoBlueprint` support (`scopes`, `layers`, `shards`, `ignore_dirs`, `c_qualifiers`, `entrypoints`, `isr_patterns`, `mmio_ranges`) with BLAKE3 hash folding into the repository Merkle `fingerprint` and `cache.json` (`blueprint_hash`) for automatic cache invalidation.
   - Extended `chipsrc inspect` (`InspectReport`) with an **Onboarding Digest** (`has_blueprint`, `unclassified_dirs`, `detected_workspaces`, `candidate_c_macros`) and multi-package workspace sharding (`crates/`, `packages/`, `apps/`, `services/`, `modules/`, `components/`).
@@ -32,6 +43,13 @@ All notable changes to this project are listed here. Versions follow
 
 ### Fixed
 
+- **Round 2 Sharder, C/CMSIS Qualifier, Query Identity, Vendor Surface & Receiver Binding Fixes (`scanner.rs`, `parser.rs`, `mmio.rs`, `resolver.rs`, `graph.rs`, `sharder.rs`, `sanity.rs`, `emitter.rs`, `query.rs`)**:
+  - Fixed `resolve_numbered` in `sharder.rs` to resolve by file path (`file_to_numbered`) before raw slug so split sub-shards never lose symbols or inherit wrong scopes, keyed `group_map` by `(scope, slug)`, disambiguated generic file stems (`main`, `mod`, `index`, `lib`), preserved canonical `module_path` on multi-file split chunks, and enforced global shard/TSV invariants in `sanity.rs`.
+  - Replaced `brace_depth` with a `Vec<BraceFrame>` stack (`Transparent` for `extern "C" { ... }`, `Aggregate` for `struct`/`union`/`class` bodies) in `normalize_c_qualifier_macros` and added `__I`, `__O`, `__IO`, `__IM`, `__OM`, `__IOM`, `__IAR_FT`, `__ALIGNED` so CMSIS register structs (`GPIO_TypeDef`) extract clean field types.
+  - Added `SymbolIdView` (`parse_symbol_id`) and `query_targets_file` in `query.rs` so symbol, caller, callee, type, and impact queries never match file-path prefixes (`smart_locker/`, `parser.rs`) unless the query targets a file path, restricted `search` to semantic TSV columns with `(bundle, file, line)` deduplication, and optimized `xref` with zero-allocation `QueryHw` stack canonicalization.
+  - Fixed `CallerSite` in `resolver.rs` to use the caller symbol's scope (`symbols[i].scope`) so inline `#[cfg(test)]` helpers resolve as `SameFile`, expanded Rust/Python/JS/Tree-sitter builtin allowlists (`<15%` `external_or_macro` ratio), and excluded `external::*` pseudo-nodes from `path` and `impact` BFS graphs.
+  - Hardened `compute_vendor_surface` with path-boundary header matching (`GENERIC_HEADER_STEMS`), excluded `LinkerSection` and generic bit utility macros (`SET_BIT`, `CLEAR_BIT`, `READ_BIT`) from active MMIO surfaces, synchronized post-compaction `god_nodes`/`entrypoints`/`vendor_surface`, and reserved up to 8 entrypoint slots + 17 ISR slots in `INDEX.md`.
+  - Extended local receiver type inference to `for` loops, `if let` / `while let` (`let_condition`), tuple bindings, and closure parameters via `elem_type_of`, accepted 2..=8 hex-digit `<HEX>h` literals (`deadbeefh` -> `0xDEADBEEF`) with English stoplist filtering, reported invalid `.chipsrc.json` files via `InspectReport.blueprint_error`, stripped glob suffixes (`/**`, `/*`) in `match_longest_prefix`, and mapped web/SFC directories (`web`, `frontend`, `client`, `ui`, `components`, `views`, `pages`, `screens`, `widgets`, `layouts`) to `ArchLayer::App`.
 - **AST & MMIO Extraction Precision (`mmio.rs`, `scanner.rs`, `parser.rs`, `emitter.rs`)**:
   - Restricted C-style `PERIPH->REG` and `*(volatile ...)` extraction to C/C++, masked standard and multi-line Rust raw string literals (`r#"..."#`), and stopped MMIO regex scanning at `#[cfg(test)]`.
   - Extended `PERIPH_REG_RE` and `is_register_write_in_line` to capture chained nested struct members and array subscripts (`IOMUX->SECCFG.PINCM[idx] |= ...`, `TIMG2->CPU_INT.ICLR = ...`).

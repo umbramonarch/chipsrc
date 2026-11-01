@@ -1,9 +1,19 @@
 use crate::model::{
     ArchLayer, ExtractedMacro, ExtractedType, FileScope, MacroKind, ParsedFileUnit, RankedSymbol,
-    ResolvedCallEdge, SectionShard, SectionSummary, VendorMode, VendorSurfaceSummary, XrefEntry,
+    ResolvedCallEdge, SectionShard, SectionSummary, SymbolKind, VendorMode, VendorSurfaceSummary,
+    XrefEntry,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet};
+
+const GENERIC_FILE_STEMS: &[&str] = &[
+    "main", "mod", "index", "lib", "init", "test", "tests", "config", "utils",
+];
+
+const GENERIC_HEADER_STEMS: &[&str] = &[
+    "main", "config", "types", "common", "board", "system", "version", "def", "defs", "utils",
+    "hal", "bsp",
+];
 
 struct RawShardGroup<'a> {
     raw_slug: String,
@@ -40,8 +50,9 @@ pub fn build_section_shards(
         infer_repo_name(units)
     };
 
-    // 1. Group files by initial section_id slug
-    let mut group_map: BTreeMap<String, RawShardGroup<'_>> = BTreeMap::new();
+    // 1. Group files by (FileScope, initial section_id slug) so Test, VendorSdk, and FirstParty
+    // files never share a RawShardGroup.
+    let mut group_map: BTreeMap<(u8, String), RawShardGroup<'_>> = BTreeMap::new();
     let mut file_to_raw_slug: FxHashMap<String, String> = FxHashMap::default();
 
     for unit in units {
@@ -49,37 +60,42 @@ pub fn build_section_shards(
             continue;
         }
         let (slug, title, module_path) = derive_unit_shard_meta(unit);
+        let effective_scope = if unit.scanned.scope == FileScope::FirstParty
+            && crate::scanner::path_is_vendor_owned(&module_path)
+        {
+            FileScope::VendorSdk
+        } else {
+            unit.scanned.scope
+        };
         file_to_raw_slug.insert(unit.scanned.rel_path.clone(), slug.clone());
 
-        let entry = group_map
-            .entry(slug.clone())
-            .or_insert_with(|| RawShardGroup {
-                raw_slug: slug,
-                title,
-                module_path,
-                arch_layer: unit.scanned.arch_layer,
-                scope: unit.scanned.scope,
-                units: Vec::new(),
-            });
+        let key = (scope_sort_order(effective_scope), slug.clone());
+        let entry = group_map.entry(key).or_insert_with(|| RawShardGroup {
+            raw_slug: slug,
+            title,
+            module_path,
+            arch_layer: unit.scanned.arch_layer,
+            scope: effective_scope,
+            units: Vec::new(),
+        });
 
         entry.units.push(unit);
     }
 
-    // Resolve each shard group's dominant ownership scope from ALL of its files, so a single
-    // first-party file can never mask a majority-vendor module (and vice versa).
+    // Resolve each shard group's dominant ownership scope and architectural layer from its files.
     for group in group_map.values_mut() {
         let scope = dominant_group_scope(&group.units, &group.module_path);
         group.scope = scope;
-        group.arch_layer = if scope == FileScope::VendorSdk {
-            ArchLayer::VendorHal
-        } else {
-            group
+        group.arch_layer = match scope {
+            FileScope::VendorSdk => ArchLayer::VendorHal,
+            FileScope::Test => ArchLayer::Tests,
+            FileScope::FirstParty => group
                 .units
                 .iter()
                 .filter(|u| u.scanned.scope == scope)
                 .map(|u| u.scanned.arch_layer)
                 .min_by_key(|layer| layer_sort_order(*layer))
-                .unwrap_or(ArchLayer::Other)
+                .unwrap_or(ArchLayer::Other),
         };
         let layer_str = group.arch_layer.as_str();
         group.title = if group.module_path == "root" {
@@ -129,6 +145,20 @@ pub fn build_section_shards(
         .flat_map(|g| split_oversized_shard_group(g, &mut file_to_raw_slug))
         .collect();
 
+    // Compact vendor groups' file lists up front under VendorMode::Active so `file_to_numbered`
+    // and `ranked_symbols`/`types`/`macros` agree on the exact retained files.
+    for group in &mut groups {
+        if vendor_mode == VendorMode::Active
+            && has_non_vendor
+            && group.scope == FileScope::VendorSdk
+        {
+            group.units.retain(|u| {
+                unit_is_active_vendor_surface(u, &active_vendor_set, &active_header_set)
+            });
+        }
+    }
+    groups.retain(|g| !g.units.is_empty());
+
     // 2. Order shards deterministically:
     // FirstParty shards first (ordered by ArchLayer rank descending: app/cli/api -> core/services -> bsp -> drvs/domain -> config/libs -> other),
     // then Test shards, then VendorSdk shards.
@@ -140,82 +170,53 @@ pub fn build_section_shards(
             .then_with(|| a.raw_slug.cmp(&b.raw_slug))
     });
 
-    // Collect active files across surviving groups so we can prune inactive vendor entries
-    // from `index/*.tsv` when `has_non_vendor` is true and `vendor_mode != VendorMode::All`.
-    if has_non_vendor && vendor_mode != VendorMode::All {
-        let mut active_vendor_files: FxHashSet<&str> = FxHashSet::default();
-        if vendor_mode == VendorMode::Active {
-            for g in &groups {
-                if g.scope == FileScope::VendorSdk {
-                    for u in &g.units {
-                        if unit_is_active_vendor_surface(u, &active_vendor_set, &active_header_set)
-                        {
-                            active_vendor_files.insert(u.scanned.rel_path.as_str());
-                        }
+    // Guarantee global clean_slug uniqueness across all groups (appending `-test` / `-vendor`
+    // when a non-first-party group collides with an earlier slug, and a numeric suffix as last resort).
+    {
+        let mut used_slugs: BTreeSet<String> = BTreeSet::new();
+        for group in &mut groups {
+            let base = strip_numeric_prefix(&group.raw_slug).to_string();
+            let mut candidate = base.clone();
+            if used_slugs.contains(&candidate) {
+                match group.scope {
+                    FileScope::Test
+                        if !candidate.ends_with("-test") && !candidate.ends_with("-tests") =>
+                    {
+                        candidate = format!("{base}-test");
                     }
-                } else {
-                    for u in &g.units {
-                        if u.scanned.scope == FileScope::VendorSdk
-                            && unit_is_active_vendor_surface(
-                                u,
-                                &active_vendor_set,
-                                &active_header_set,
-                            )
-                        {
-                            active_vendor_files.insert(u.scanned.rel_path.as_str());
-                        }
+                    FileScope::VendorSdk if !candidate.ends_with("-vendor") => {
+                        candidate = format!("{base}-vendor");
                     }
+                    _ => {}
                 }
             }
+            let stem_for_num = candidate.clone();
+            let mut suffix_num = 2usize;
+            while used_slugs.contains(&candidate) {
+                candidate = format!("{stem_for_num}-{suffix_num}");
+                suffix_num += 1;
+            }
+            used_slugs.insert(candidate.clone());
+            group.raw_slug = candidate.clone();
+            for u in &group.units {
+                file_to_raw_slug.insert(u.scanned.rel_path.clone(), candidate.clone());
+            }
         }
-
-        let has_any_active_vendor_sym = ranked_symbols.iter().any(|rs| {
-            rs.symbol.scope == FileScope::VendorSdk
-                && active_vendor_files.contains(rs.symbol.file.as_str())
-                && (active_vendor_set.contains(rs.symbol.name.as_str()) || rs.in_degree > 0)
-        });
-
-        ranked_symbols.retain(|rs| {
-            if rs.symbol.scope != FileScope::VendorSdk {
-                return true;
-            }
-            vendor_mode == VendorMode::Active
-                && active_vendor_files.contains(rs.symbol.file.as_str())
-                && (!has_any_active_vendor_sym
-                    || active_vendor_set.contains(rs.symbol.name.as_str())
-                    || rs.in_degree > 0)
-        });
-        types.retain(|t| {
-            if t.scope != FileScope::VendorSdk {
-                return true;
-            }
-            vendor_mode == VendorMode::Active && active_vendor_files.contains(t.file.as_str())
-        });
-        macros.retain(|m| {
-            if m.scope != FileScope::VendorSdk {
-                return true;
-            }
-            vendor_mode == VendorMode::Active && active_vendor_files.contains(m.file.as_str())
-        });
-
-        let non_vendor_files: FxHashSet<&str> = units
-            .iter()
-            .filter(|u| u.scanned.scope != FileScope::VendorSdk)
-            .map(|u| u.scanned.rel_path.as_str())
-            .collect();
-        calls.retain(|c| {
-            non_vendor_files.contains(c.file.as_str())
-                || (vendor_mode == VendorMode::Active
-                    && active_vendor_files.contains(c.file.as_str()))
-        });
-        xrefs.retain(|x| {
-            non_vendor_files.contains(x.file.as_str())
-                || (vendor_mode == VendorMode::Active
-                    && active_vendor_files.contains(x.file.as_str()))
-        });
     }
 
-    // 3. Assign numbered section IDs (01-<slug>, 02-<slug>, ...) and build slug -> numbered map
+    // Collect surviving files across all groups and prune items belonging to dropped files.
+    let surviving_files: FxHashSet<&str> = groups
+        .iter()
+        .flat_map(|g| g.units.iter().map(|u| u.scanned.rel_path.as_str()))
+        .collect();
+
+    ranked_symbols.retain(|rs| surviving_files.contains(rs.symbol.file.as_str()));
+    types.retain(|t| surviving_files.contains(t.file.as_str()));
+    macros.retain(|m| surviving_files.contains(m.file.as_str()));
+    calls.retain(|c| surviving_files.contains(c.file.as_str()));
+    xrefs.retain(|x| surviving_files.contains(x.file.as_str()));
+
+    // 3. Assign numbered section IDs (01-<slug>, 02-<slug>, ...) and build file/slug -> numbered maps
     let mut slug_to_numbered: FxHashMap<String, String> = FxHashMap::default();
     let mut file_to_numbered: FxHashMap<String, String> = FxHashMap::default();
     let mut section_to_layer: FxHashMap<String, ArchLayer> = FxHashMap::default();
@@ -223,8 +224,12 @@ pub fn build_section_shards(
     for (idx, group) in groups.iter().enumerate() {
         let clean_slug = strip_numeric_prefix(&group.raw_slug);
         let numbered_id = format!("{:02}-{clean_slug}", idx + 1);
-        slug_to_numbered.insert(group.raw_slug.clone(), numbered_id.clone());
-        slug_to_numbered.insert(clean_slug.to_string(), numbered_id.clone());
+        slug_to_numbered
+            .entry(group.raw_slug.clone())
+            .or_insert_with(|| numbered_id.clone());
+        slug_to_numbered
+            .entry(clean_slug.to_string())
+            .or_insert_with(|| numbered_id.clone());
         section_to_layer.insert(numbered_id.clone(), group.arch_layer);
         for u in &group.units {
             file_to_numbered.insert(u.scanned.rel_path.clone(), numbered_id.clone());
@@ -239,10 +244,8 @@ pub fn build_section_shards(
         })
         .unwrap_or_else(|| "01-root".to_string());
 
+    // File-first resolution so split sub-shards always own their files' symbols/types/macros.
     let resolve_numbered = |raw_sec: &str, file: &str| -> String {
-        if let Some(mapped) = slug_to_numbered.get(raw_sec) {
-            return mapped.clone();
-        }
         if let Some(mapped) = file_to_numbered.get(file) {
             return mapped.clone();
         }
@@ -250,6 +253,13 @@ pub fn build_section_shards(
             if let Some(mapped) = slug_to_numbered.get(raw_slug) {
                 return mapped.clone();
             }
+        }
+        if let Some(mapped) = slug_to_numbered.get(raw_sec) {
+            return mapped.clone();
+        }
+        let clean_raw = strip_numeric_prefix(raw_sec);
+        if let Some(mapped) = slug_to_numbered.get(clean_raw) {
+            return mapped.clone();
         }
         fallback_sec_id.clone()
     };
@@ -351,22 +361,18 @@ pub fn build_section_shards(
     // 5. Render each shard's markdown_body and assemble SectionSummary + SectionShard
     let mut summaries = Vec::with_capacity(groups.len());
     let mut shards = Vec::with_capacity(groups.len());
+    let mut kept_symbol_keys: FxHashSet<(String, usize, String)> = FxHashSet::default();
+    let mut kept_type_keys: FxHashSet<(String, usize, String)> = FxHashSet::default();
+    let mut kept_macro_keys: FxHashSet<(String, usize, String)> = FxHashSet::default();
 
     for (idx, mut group) in groups.into_iter().enumerate() {
         let clean_slug = strip_numeric_prefix(&group.raw_slug);
         let section_id = format!("{:02}-{clean_slug}", idx + 1);
         let md_file = format!("{section_id}.md");
 
-        // A vendor shard rendered under `VendorMode::Active` is compacted down to the active
-        // hardware/SDK surface actually referenced by first-party code.
         let compact_vendor = vendor_mode == VendorMode::Active
             && has_non_vendor
             && group.scope == FileScope::VendorSdk;
-        if compact_vendor {
-            group.units.retain(|u| {
-                unit_is_active_vendor_surface(u, &active_vendor_set, &active_header_set)
-            });
-        }
 
         group
             .units
@@ -441,6 +447,20 @@ pub fn build_section_shards(
             });
         }
 
+        for rs in &shard_symbols {
+            kept_symbol_keys.insert((
+                rs.symbol.file.clone(),
+                rs.symbol.start_line,
+                rs.symbol.symbol_id.clone(),
+            ));
+        }
+        for t in &shard_types {
+            kept_type_keys.insert((t.file.clone(), t.start_line, t.type_id.clone()));
+        }
+        for m in &shard_macros {
+            kept_macro_keys.insert((m.file.clone(), m.line, m.name.clone()));
+        }
+
         let depends_on_sections: Vec<String> = depends_on_map
             .remove(&section_id)
             .map(|s| s.into_iter().collect())
@@ -490,7 +510,27 @@ pub fn build_section_shards(
         });
     }
 
+    // Synchronize index tables with the exact per-shard retained sets so
+    // `Σ section_summaries.{symbol,type,macro}_count == index/*.tsv` always holds.
+    if compact_vendor_occurred(vendor_mode, has_non_vendor) {
+        ranked_symbols.retain(|rs| {
+            kept_symbol_keys.contains(&(
+                rs.symbol.file.clone(),
+                rs.symbol.start_line,
+                rs.symbol.symbol_id.clone(),
+            ))
+        });
+        types.retain(|t| {
+            kept_type_keys.contains(&(t.file.clone(), t.start_line, t.type_id.clone()))
+        });
+        macros.retain(|m| kept_macro_keys.contains(&(m.file.clone(), m.line, m.name.clone())));
+    }
+
     (summaries, shards)
+}
+
+fn compact_vendor_occurred(vendor_mode: VendorMode, has_non_vendor: bool) -> bool {
+    vendor_mode == VendorMode::Active && has_non_vendor
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -706,18 +746,50 @@ fn render_shard_markdown(
                 format!(" | calls: {callees}")
             };
 
-            lines.push(format!(
-                "- `{}` `{}` `{}` (`{}:{}-{}`){tag_str} — PR: `{:.4}`, in: `{}`, out: `{}`{callees_part}",
-                s.visibility.as_str(),
-                s.kind.as_str(),
-                s.signature,
-                s.file,
-                s.start_line,
-                s.end_line,
-                rs.pagerank,
-                rs.in_degree,
-                rs.out_degree
-            ));
+            let sig_trimmed = s.signature.trim_start();
+            let sig_after_vis = sig_trimmed
+                .strip_prefix("pub(crate) ")
+                .or_else(|| sig_trimmed.strip_prefix("pub(super) "))
+                .or_else(|| sig_trimmed.strip_prefix("pub "))
+                .or_else(|| sig_trimmed.strip_prefix("export default "))
+                .or_else(|| sig_trimmed.strip_prefix("export "))
+                .unwrap_or(sig_trimmed);
+            let omit_kind_badge = s.kind == SymbolKind::Function
+                && (sig_trimmed.starts_with("fn ")
+                    || sig_trimmed.starts_with("def ")
+                    || sig_trimmed.starts_with("function ")
+                    || sig_trimmed.starts_with("async ")
+                    || sig_after_vis.starts_with("fn ")
+                    || sig_after_vis.starts_with("def ")
+                    || sig_after_vis.starts_with("function ")
+                    || sig_after_vis.starts_with("async "));
+
+            if omit_kind_badge {
+                lines.push(format!(
+                    "- `{}` `{}` (`{}:{}-{}`){tag_str} — PR: `{:.4}`, in: `{}`, out: `{}`{callees_part}",
+                    s.visibility.as_str(),
+                    s.signature,
+                    s.file,
+                    s.start_line,
+                    s.end_line,
+                    rs.pagerank,
+                    rs.in_degree,
+                    rs.out_degree
+                ));
+            } else {
+                lines.push(format!(
+                    "- `{}` `{}` `{}` (`{}:{}-{}`){tag_str} — PR: `{:.4}`, in: `{}`, out: `{}`{callees_part}",
+                    s.visibility.as_str(),
+                    s.kind.as_str(),
+                    s.signature,
+                    s.file,
+                    s.start_line,
+                    s.end_line,
+                    rs.pagerank,
+                    rs.in_degree,
+                    rs.out_degree
+                ));
+            }
             if !s.doc_summary.is_empty() {
                 lines.push(format!("  - _{}_", s.doc_summary));
             }
@@ -769,6 +841,31 @@ fn dominant_group_scope(units: &[&ParsedFileUnit], module_path: &str) -> FileSco
     }
 }
 
+/// Returns `true` when `raw_header` matches `vendor_rel_path` at a path boundary, rejecting
+/// bare generic header basenames (`main.h`, `config.h`, `types.h`, etc.).
+pub(crate) fn vendor_path_matches_header(vendor_rel_path: &str, raw_header: &str) -> bool {
+    let vp = vendor_rel_path.replace('\\', "/");
+    let hc = raw_header.replace('\\', "/");
+    let hc = hc.trim_start_matches("./").trim_matches('/');
+    if hc.is_empty() {
+        return false;
+    }
+    if vp == hc {
+        return true;
+    }
+    if !hc.contains('/') {
+        let stem = hc
+            .rsplit_once('.')
+            .map(|(s, _)| s)
+            .unwrap_or(hc)
+            .to_ascii_lowercase();
+        if GENERIC_HEADER_STEMS.contains(&stem.as_str()) {
+            return false;
+        }
+    }
+    vp.ends_with(&format!("/{hc}"))
+}
+
 /// Returns `true` when a vendor file participates in the active hardware/SDK surface referenced
 /// by first-party code (via an active header, symbol, type, or macro).
 fn unit_is_active_vendor_surface(
@@ -778,7 +875,7 @@ fn unit_is_active_vendor_surface(
 ) -> bool {
     if active_header_set
         .iter()
-        .any(|h| unit.scanned.rel_path.ends_with(h))
+        .any(|h| vendor_path_matches_header(&unit.scanned.rel_path, h))
     {
         return true;
     }
@@ -825,7 +922,7 @@ fn group_has_active_vendor_refs(
         .any(|u| unit_is_active_vendor_surface(u, active_vendor_set, active_header_set))
 }
 
-/// Sub-shards an oversized first-party shard group (`> 8` files or `> 3,000` total source lines)
+/// Sub-shards an oversized non-vendor shard group (`> 8` files or `> 3,000` total source lines)
 /// into cohesive sub-modules so no single `sections/*.md` file balloons into a 20k+ token monolith.
 fn split_oversized_shard_group<'a>(
     group: RawShardGroup<'a>,
@@ -836,11 +933,16 @@ fn split_oversized_shard_group<'a>(
     const LARGE_SINGLE_FILE_LINES: usize = 1400;
 
     let total_lines: usize = group.units.iter().map(|u| u.scanned.line_count).sum();
-    if group.scope != FileScope::FirstParty
+    if group.scope == FileScope::VendorSdk
         || group.units.len() <= 1
         || (group.units.len() <= MAX_GROUP_FILES && total_lines <= MAX_GROUP_LINES)
     {
         return vec![group];
+    }
+
+    let mut stem_counts: FxHashMap<String, usize> = FxHashMap::default();
+    for u in &group.units {
+        *stem_counts.entry(unit_file_stem(u)).or_insert(0) += 1;
     }
 
     // Step 1: Partition by each unit's individual `ArchLayer` if multiple layers exist in this group
@@ -860,6 +962,7 @@ fn split_oversized_shard_group<'a>(
         layer_units.sort_by(|a, b| a.scanned.rel_path.cmp(&b.scanned.rel_path));
         let layer_lines: usize = layer_units.iter().map(|u| u.scanned.line_count).sum();
         let layer_str = layer.as_str();
+        let part_scope = dominant_group_scope(&layer_units, &group.module_path);
 
         // If this layer slice is already compact, keep it as a single sub-shard.
         if layer_units.len() <= MAX_GROUP_FILES && layer_lines <= MAX_GROUP_LINES {
@@ -868,11 +971,7 @@ fn split_oversized_shard_group<'a>(
             } else {
                 group.raw_slug.clone()
             };
-            let sub_path = if has_multiple_layers && layer != group.arch_layer {
-                format!("{}/{layer_str}", group.module_path)
-            } else {
-                group.module_path.clone()
-            };
+            let sub_path = group.module_path.clone();
             for u in &layer_units {
                 file_to_raw_slug.insert(u.scanned.rel_path.clone(), sub_slug.clone());
             }
@@ -881,7 +980,7 @@ fn split_oversized_shard_group<'a>(
                 title: format!("{sub_path} ({layer_str})"),
                 module_path: sub_path,
                 arch_layer: layer,
-                scope: group.scope,
+                scope: part_scope,
                 units: layer_units,
             });
             continue;
@@ -892,16 +991,17 @@ fn split_oversized_shard_group<'a>(
         let mut small_units: Vec<&'a ParsedFileUnit> = Vec::new();
         for u in layer_units {
             if u.scanned.line_count >= LARGE_SINGLE_FILE_LINES {
-                let stem = unit_file_stem(u);
+                let stem = disambiguated_unit_stem(u, &stem_counts, &group.raw_slug);
                 let sub_slug = sanitize_slug(&format!("{}-{stem}", group.raw_slug));
-                let sub_path = format!("{}/{stem}", group.module_path);
+                let sub_path = group.module_path.clone();
+                let u_scope = u.scanned.scope;
                 file_to_raw_slug.insert(u.scanned.rel_path.clone(), sub_slug.clone());
                 out.push(RawShardGroup {
                     raw_slug: sub_slug,
-                    title: format!("{sub_path} ({layer_str})"),
+                    title: format!("{sub_path} [{stem}] ({layer_str})"),
                     module_path: sub_path,
                     arch_layer: layer,
-                    scope: group.scope,
+                    scope: u_scope,
                     units: vec![u],
                 });
             } else {
@@ -935,27 +1035,31 @@ fn split_oversized_shard_group<'a>(
 
         let num_chunks = chunks.len();
         for chunk in chunks {
-            let (sub_slug, sub_path) = if num_chunks == 1 && out.is_empty() {
-                (group.raw_slug.clone(), group.module_path.clone())
+            let chunk_scope = dominant_group_scope(&chunk, &group.module_path);
+            let sub_path = group.module_path.clone();
+            let (sub_slug, title) = if num_chunks == 1 && out.is_empty() {
+                (group.raw_slug.clone(), format!("{sub_path} ({layer_str})"))
             } else if chunk.len() == 1 {
-                let stem = unit_file_stem(chunk[0]);
+                let stem = disambiguated_unit_stem(chunk[0], &stem_counts, &group.raw_slug);
                 (
                     sanitize_slug(&format!("{}-{stem}", group.raw_slug)),
-                    format!("{}/{stem}", group.module_path),
+                    format!("{sub_path} [{stem}] ({layer_str})"),
                 )
-            } else if num_chunks == 1 {
-                (group.raw_slug.clone(), group.module_path.clone())
             } else {
-                let first_stem = unit_file_stem(chunk[0]);
-                let last_stem = unit_file_stem(chunk[chunk.len() - 1]);
-                let suffix = if first_stem == last_stem {
-                    first_stem
+                let first_stem = disambiguated_unit_stem(chunk[0], &stem_counts, &group.raw_slug);
+                let last_stem =
+                    disambiguated_unit_stem(chunk[chunk.len() - 1], &stem_counts, &group.raw_slug);
+                let (suffix, range_label) = if first_stem == last_stem {
+                    (first_stem.clone(), format!("[{first_stem}]"))
                 } else {
-                    format!("{first_stem}-{last_stem}")
+                    (
+                        format!("{first_stem}-{last_stem}"),
+                        format!("[{first_stem}..{last_stem}]"),
+                    )
                 };
                 (
                     sanitize_slug(&format!("{}-{suffix}", group.raw_slug)),
-                    format!("{}/{suffix}", group.module_path),
+                    format!("{sub_path} {range_label} ({layer_str})"),
                 )
             };
             for u in &chunk {
@@ -963,16 +1067,47 @@ fn split_oversized_shard_group<'a>(
             }
             out.push(RawShardGroup {
                 raw_slug: sub_slug,
-                title: format!("{sub_path} ({layer_str})"),
+                title,
                 module_path: sub_path,
                 arch_layer: layer,
-                scope: group.scope,
+                scope: chunk_scope,
                 units: chunk,
             });
         }
     }
 
     out
+}
+
+fn disambiguated_unit_stem(
+    unit: &ParsedFileUnit,
+    stem_counts: &FxHashMap<String, usize>,
+    group_raw_slug: &str,
+) -> String {
+    let raw_stem = unit_file_stem(unit);
+    let is_generic = GENERIC_FILE_STEMS.contains(&raw_stem.as_str());
+    let collides = stem_counts.get(&raw_stem).copied().unwrap_or(0) > 1;
+    if !is_generic && !collides {
+        return raw_stem;
+    }
+
+    let norm = unit.scanned.rel_path.replace('\\', "/");
+    let parts: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() >= 2 {
+        let mut parent = parts[parts.len() - 2];
+        if parent.eq_ignore_ascii_case("src") && parts.len() >= 3 {
+            parent = parts[parts.len() - 3];
+        }
+        let parent_slug = sanitize_slug(parent);
+        if !parent_slug.is_empty()
+            && parent_slug != "src"
+            && parent_slug != group_raw_slug
+            && !group_raw_slug.ends_with(&format!("-{parent_slug}"))
+        {
+            return sanitize_slug(&format!("{parent_slug}-{raw_stem}"));
+        }
+    }
+    raw_stem
 }
 
 fn unit_file_stem(unit: &ParsedFileUnit) -> String {
@@ -983,6 +1118,29 @@ fn unit_file_stem(unit: &ParsedFileUnit) -> String {
         .map(|(s, _)| s)
         .unwrap_or(fname)
         .to_ascii_lowercase()
+}
+
+fn is_three_segment_module_dirs(first: &str, second: &str) -> bool {
+    matches!(
+        first.to_ascii_lowercase().as_str(),
+        "src" | "fw" | "firmware" | "app" | "apps" | "source"
+    ) && matches!(
+        second.to_ascii_lowercase().as_str(),
+        "drvs"
+            | "drv"
+            | "drivers"
+            | "driver"
+            | "libs"
+            | "lib"
+            | "app"
+            | "apps"
+            | "bsp"
+            | "services"
+            | "service"
+            | "core"
+            | "modules"
+            | "components"
+    )
 }
 
 fn derive_unit_shard_meta(unit: &ParsedFileUnit) -> (String, String, String) {
@@ -1005,13 +1163,33 @@ fn derive_unit_shard_meta(unit: &ParsedFileUnit) -> (String, String, String) {
         ) {
         let ws_root = parts[0];
         let crate_name = parts[1];
-        let module_path = format!("{ws_root}/{crate_name}");
-        let slug = sanitize_slug(&format!("{ws_root}-{crate_name}"));
-        let title = format!("{module_path} ({layer_str})");
-        (slug, title, module_path)
+        if unit.scanned.scope == FileScope::Test
+            || matches!(
+                parts.get(2).copied(),
+                Some("tests" | "test" | "benches" | "evals")
+            )
+        {
+            let module_path = format!("{ws_root}/{crate_name}/tests");
+            let slug = sanitize_slug(&format!("{ws_root}-{crate_name}-tests"));
+            let title = format!("{module_path} ({layer_str})");
+            (slug, title, module_path)
+        } else {
+            let module_path = format!("{ws_root}/{crate_name}");
+            let slug = sanitize_slug(&format!("{ws_root}-{crate_name}"));
+            let title = format!("{module_path} ({layer_str})");
+            (slug, title, module_path)
+        }
     } else {
         let dir_count = parts.len().saturating_sub(1);
-        if dir_count >= 2 {
+        if dir_count >= 3 && is_three_segment_module_dirs(parts[0], parts[1]) {
+            let a = parts[0];
+            let b = parts[1];
+            let c = parts[2];
+            let module_path = format!("{a}/{b}/{c}");
+            let slug = sanitize_slug(&format!("{a}-{b}-{c}"));
+            let title = format!("{module_path} ({layer_str})");
+            (slug, title, module_path)
+        } else if dir_count >= 2 {
             let a = parts[0];
             let b = parts[1];
             let module_path = format!("{a}/{b}");
@@ -1217,6 +1395,8 @@ mod tests {
             .map(|symbol| RankedSymbol {
                 symbol,
                 pagerank: 0.5,
+                hub_score: 0.1,
+                authority_score: 0.1,
                 in_degree: 0,
                 out_degree: 0,
                 is_god_node: false,
@@ -1247,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn test_majority_vendor_group_stays_vendor() {
+    fn test_scope_keyed_grouping_separates_first_party_and_vendor() {
         let mut units = vec![
             make_unit(
                 "fw/drvs/My_DriverLib/foo.c",
@@ -1262,20 +1442,26 @@ mod tests {
             make_unit("fw/drvs/pwm.c", FileScope::FirstParty, ArchLayer::Drivers),
         ];
         add_symbol(&mut units[0], "driverlib_foo_init");
+        add_symbol(&mut units[2], "pwm_init");
 
         let surface = VendorSurfaceSummary::default();
         let (summaries, shards) = build(&units, &surface, VendorMode::All);
 
-        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0].module_path, "fw/drvs");
-        assert_eq!(summaries[0].scope, "vendor_sdk");
-        assert_eq!(summaries[0].arch_layer, "vendor_hal");
-        assert_eq!(summaries[0].title, "fw/drvs (vendor_hal)");
-        assert!(shards[0].markdown_body.contains("scope: \"vendor_sdk\""));
+        assert_eq!(summaries[0].scope, "first_party");
+        assert_eq!(summaries[0].arch_layer, "drvs");
+        assert_eq!(summaries[0].symbol_count, 1);
+
+        assert_eq!(summaries[1].module_path, "fw/drvs/My_DriverLib");
+        assert_eq!(summaries[1].scope, "vendor_sdk");
+        assert_eq!(summaries[1].arch_layer, "vendor_hal");
+        assert_eq!(summaries[1].symbol_count, 1);
+        assert!(shards[1].markdown_body.contains("scope: \"vendor_sdk\""));
     }
 
     #[test]
-    fn test_minority_vendor_group_stays_first_party() {
+    fn test_same_slug_different_scopes_disambiguated() {
         let units = vec![
             make_unit("fw/drvs/pwm.c", FileScope::FirstParty, ArchLayer::Drivers),
             make_unit("fw/drvs/motor.c", FileScope::FirstParty, ArchLayer::Drivers),
@@ -1289,10 +1475,13 @@ mod tests {
         let surface = VendorSurfaceSummary::default();
         let (summaries, _) = build(&units, &surface, VendorMode::All);
 
-        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].section_id, "01-fw-drvs");
         assert_eq!(summaries[0].scope, "first_party");
         assert_eq!(summaries[0].arch_layer, "drvs");
-        assert_eq!(summaries[0].title, "fw/drvs (drvs)");
+        assert_eq!(summaries[1].section_id, "02-fw-drvs-vendor");
+        assert_eq!(summaries[1].scope, "vendor_sdk");
+        assert_eq!(summaries[1].arch_layer, "vendor_hal");
     }
 
     #[test]

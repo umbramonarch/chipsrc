@@ -1,4 +1,15 @@
 use crate::model::{BundleIndexes, FileScope, ParsedFileUnit, SanityReport, SectionShard};
+use rustc_hash::{FxHashMap, FxHashSet};
+
+fn strip_numeric_prefix(slug: &str) -> &str {
+    let bytes = slug.as_bytes();
+    if bytes.len() > 3 && bytes[0].is_ascii_digit() && bytes[1].is_ascii_digit() && bytes[2] == b'-'
+    {
+        &slug[3..]
+    } else {
+        slug
+    }
+}
 
 /// Computes structural conversion health, parse coverage, call resolution rate,
 /// token compression ratio, architectural warnings, and overall sanity score (0..=100).
@@ -114,6 +125,82 @@ pub fn compute_sanity_report(
     if sections.is_empty() {
         score -= 50;
         warnings.push("No architectural module shards were generated.".to_string());
+    } else {
+        // Invariant 1: Every symbol/type/macro section_id must name a shard whose file list contains its file.
+        let mut sec_files: FxHashMap<&str, FxHashSet<&str>> = FxHashMap::default();
+        let mut seen_slugs: FxHashSet<&str> = FxHashSet::default();
+        let mut duplicate_slugs: Vec<String> = Vec::new();
+        let mut sum_syms = 0usize;
+        let mut sum_types = 0usize;
+        let mut sum_macros = 0usize;
+
+        for shard in sections {
+            let sec_id = shard.summary.section_id.as_str();
+            let clean_slug = strip_numeric_prefix(sec_id);
+            if !seen_slugs.insert(clean_slug) {
+                duplicate_slugs.push(clean_slug.to_string());
+            }
+            sum_syms += shard.summary.symbol_count;
+            sum_types += shard.summary.type_count;
+            sum_macros += shard.summary.macro_count;
+            let file_set: FxHashSet<&str> = shard.files.iter().map(|f| f.as_str()).collect();
+            sec_files.insert(sec_id, file_set);
+        }
+
+        let mut orphan_items = 0usize;
+        for rs in &indexes.symbols {
+            let ok = sec_files
+                .get(rs.symbol.section_id.as_str())
+                .is_some_and(|fset| fset.contains(rs.symbol.file.as_str()));
+            if !ok {
+                orphan_items += 1;
+            }
+        }
+        for t in &indexes.types {
+            let ok = sec_files
+                .get(t.section_id.as_str())
+                .is_some_and(|fset| fset.contains(t.file.as_str()));
+            if !ok {
+                orphan_items += 1;
+            }
+        }
+        for m in &indexes.macros {
+            let ok = sec_files
+                .get(m.section_id.as_str())
+                .is_some_and(|fset| fset.contains(m.file.as_str()));
+            if !ok {
+                orphan_items += 1;
+            }
+        }
+        if orphan_items > 0 {
+            score -= 10;
+            warnings.push(format!(
+                "Shard/TSV file ownership invariant violated: {orphan_items} indexed item(s) reference a shard that does not contain their source file."
+            ));
+        }
+
+        // Invariant 2: Sum of section_summaries.{symbol,type,macro}_count == index/*.tsv row counts.
+        if sum_syms != indexes.symbols.len()
+            || sum_types != indexes.types.len()
+            || sum_macros != indexes.macros.len()
+        {
+            score -= 10;
+            warnings.push(format!(
+                "Shard/TSV count invariant violated: shards sum to ({sum_syms} syms, {sum_types} types, {sum_macros} macros) vs index TSVs ({} syms, {} types, {} macros).",
+                indexes.symbols.len(),
+                indexes.types.len(),
+                indexes.macros.len()
+            ));
+        }
+
+        // Invariant 3: No duplicate clean_slug across shards.
+        if !duplicate_slugs.is_empty() {
+            score -= 10;
+            warnings.push(format!(
+                "Duplicate module shard slug(s) detected: {}.",
+                duplicate_slugs.join(", ")
+            ));
+        }
     }
 
     SanityReport {
@@ -168,7 +255,7 @@ mod tests {
                 arch_layer: "drvs".to_string(),
                 scope: "first_party".to_string(),
                 file_count: 2,
-                symbol_count: 2,
+                symbol_count: 0,
                 type_count: 0,
                 macro_count: 0,
                 token_estimate: 50,

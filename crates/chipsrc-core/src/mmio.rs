@@ -8,6 +8,11 @@ use regex::Regex;
 use std::path::Path;
 use std::sync::OnceLock;
 
+const HEX_WORD_STOPLIST: &[&str] = &[
+    "ah", "eh", "oh", "uh", "bah", "dab", "fab", "fad", "bad", "bed", "cab", "cad", "dad", "deaf",
+    "face", "fade", "feed", "beef", "cafe", "dead", "abbe", "babe", "bead", "eac", "beac",
+];
+
 /// Normalizes C/C++/Rust/datasheet hexadecimal literals into canonical `"0x..."` form.
 ///
 /// Examples:
@@ -15,6 +20,7 @@ use std::sync::OnceLock;
 /// - `"0x40000000"` -> `Some("0x40000000")`
 /// - `"0X0004"` -> `Some("0x4")`
 /// - `"400h"` -> `Some("0x400")`
+/// - `"deadbeefh"` -> `Some("0xDEADBEEF")`
 pub fn normalize_hex_literal(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -52,15 +58,28 @@ pub fn normalize_hex_literal(raw: &str) -> Option<String> {
         }
     }
 
-    // Case 2: Trailing 'h' or 'H' datasheet notation (e.g., "400h", "0400H", "41C0_0004h")
+    // Case 2: Trailing 'h' or 'H' datasheet notation (e.g., "400h", "0400H", "41C0_0004h", "deadbeefh")
     if (token.ends_with('h') || token.ends_with('H')) && token.len() >= 2 {
         let body = &token[..token.len() - 1];
-        // Require at least one decimal digit so plain words like "ah" or "eh" are not misclassified
-        if body.bytes().any(|b| b.is_ascii_digit())
-            && body.bytes().all(|b| b.is_ascii_hexdigit() || b == b'_')
-        {
-            if let Some(norm) = format_cleaned_hex_digits(body) {
-                return Some(norm);
+        if body.bytes().all(|b| b.is_ascii_hexdigit() || b == b'_') {
+            let has_decimal = body.bytes().any(|b| b.is_ascii_digit());
+            let hex_len = body.bytes().filter(|b| b.is_ascii_hexdigit()).count();
+            let allowed_hex_only = if !has_decimal && (2..=8).contains(&hex_len) {
+                let clean_lower: String = body
+                    .bytes()
+                    .filter(|&b| b != b'_')
+                    .map(|b| (b as char).to_ascii_lowercase())
+                    .collect();
+                let with_h = format!("{clean_lower}h");
+                !HEX_WORD_STOPLIST.contains(&clean_lower.as_str())
+                    && !HEX_WORD_STOPLIST.contains(&with_h.as_str())
+            } else {
+                false
+            };
+            if has_decimal || allowed_hex_only {
+                if let Some(norm) = format_cleaned_hex_digits(body) {
+                    return Some(norm);
+                }
             }
         }
     }
@@ -275,6 +294,32 @@ pub fn classify_macro_value_with_blueprint(
         .as_deref()
         .and_then(|h| h.strip_prefix("0x"))
         .and_then(|d| u64::from_str_radix(d, 16).ok());
+
+    let is_generic_fn_bit_macro = is_fn_like
+        && matches!(
+            upper_name.as_str(),
+            "SET_BIT"
+                | "CLEAR_BIT"
+                | "READ_BIT"
+                | "CLEAR_REG"
+                | "WRITE_REG"
+                | "READ_REG"
+                | "MODIFY_REG"
+                | "BIT"
+                | "_VAL2FLD"
+                | "_FLD2VAL"
+                | "UNUSED"
+                | "ARRAY_SIZE"
+                | "MIN"
+                | "MAX"
+        );
+    if is_generic_fn_bit_macro {
+        return (
+            MacroKind::FunctionMacro,
+            hex_addr,
+            "Function-like macro".to_string(),
+        );
+    }
 
     let is_mask_name = upper_name.ends_with("_MSK")
         || upper_name.ends_with("_MASK")

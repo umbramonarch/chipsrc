@@ -16,7 +16,9 @@ pub mod sharder;
 pub use crate::error::{ChipsrcError, Result};
 pub use crate::model::*;
 
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -26,7 +28,10 @@ pub fn inspect_repo(repo_path: &Path, vendor_mode: VendorMode) -> Result<Inspect
     let (scanned_files, fingerprint) =
         scanner::scan_repository(repo_path, vendor_mode, DEFAULT_MAX_FILE_BYTES)?;
     let (source_root, repo_name) = scanner::canonical_repo_root_and_name(repo_path);
-    let blueprint_opt = scanner::load_repo_blueprint(repo_path);
+    let (blueprint_opt, blueprint_error) = match scanner::load_repo_blueprint_result(repo_path) {
+        Ok(opt) => (opt, None),
+        Err(err) => (None, Some(err)),
+    };
     let (has_blueprint, unclassified_dirs, detected_workspaces, candidate_c_macros) =
         scanner::analyze_onboarding_signals(
             repo_path,
@@ -77,51 +82,127 @@ pub fn inspect_repo(repo_path: &Path, vendor_mode: VendorMode) -> Result<Inspect
         languages,
         detected_layers,
         has_blueprint,
+        blueprint_error,
         unclassified_dirs,
         detected_workspaces,
         candidate_c_macros,
     })
 }
 
+/// Returns `true` when two parsed units for the same file have identical line coordinates
+/// and docstrings for every extracted symbol, type, macro, call, and xref (meaning no line
+/// numbers or rendered Markdown skeletons shifted).
+fn units_have_identical_coordinates(old_u: &ParsedFileUnit, new_u: &ParsedFileUnit) -> bool {
+    if old_u.symbols.len() != new_u.symbols.len()
+        || old_u.types.len() != new_u.types.len()
+        || old_u.macros.len() != new_u.macros.len()
+        || old_u.raw_calls.len() != new_u.raw_calls.len()
+        || old_u.raw_xrefs.len() != new_u.raw_xrefs.len()
+    {
+        return false;
+    }
+    let syms_eq = old_u.symbols.iter().zip(&new_u.symbols).all(|(a, b)| {
+        a.symbol_id == b.symbol_id
+            && a.start_line == b.start_line
+            && a.end_line == b.end_line
+            && a.doc_summary == b.doc_summary
+    });
+    if !syms_eq {
+        return false;
+    }
+    let types_eq = old_u.types.iter().zip(&new_u.types).all(|(a, b)| {
+        a.name == b.name
+            && a.start_line == b.start_line
+            && a.end_line == b.end_line
+            && a.doc_summary == b.doc_summary
+    });
+    if !types_eq {
+        return false;
+    }
+    let macros_eq = old_u
+        .macros
+        .iter()
+        .zip(&new_u.macros)
+        .all(|(a, b)| a.name == b.name && a.line == b.line && a.description == b.description);
+    if !macros_eq {
+        return false;
+    }
+    let calls_eq = old_u
+        .raw_calls
+        .iter()
+        .zip(&new_u.raw_calls)
+        .all(|(a, b)| a.call_line == b.call_line && a.callee_name == b.callee_name);
+    if !calls_eq {
+        return false;
+    }
+    old_u
+        .raw_xrefs
+        .iter()
+        .zip(&new_u.raw_xrefs)
+        .all(|(a, b)| a.line == b.line && a.target_name == b.target_name)
+}
+
 /// Converts and indexes a source repository into a Hierarchical Agent Codebase Bundle.
 ///
-/// Supports fast-path `<5ms` cache hits when the repository BLAKE3 Merkle fingerprint
-/// matches `meta.json`, and incremental per-file AST caching via `cache.json` so only
-/// modified or added files are re-parsed on subsequent runs.
+/// Supports fast-path `<5ms` cache hits via stat-only `stamp_check` when `meta.json` stamps
+/// match, structural digest no-op short-circuiting on comment-only edits, and per-file AST
+/// shard caching (`cache/manifest.json` + `cache/<blake3>.json`) so only modified files are
+/// re-parsed and written on subsequent runs.
 pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
     let start = Instant::now();
-    let (scanned_files, fingerprint) =
-        scanner::scan_repository(&config.repo_path, config.vendor_mode, config.max_file_bytes)?;
+    let t_scan = Instant::now();
     let (source_root, repo_name) = scanner::canonical_repo_root_and_name(&config.repo_path);
-    let blueprint_opt = scanner::load_repo_blueprint(&config.repo_path);
-    let blueprint_hash = blueprint_opt
-        .as_ref()
-        .map(|(_, h)| h.clone())
-        .unwrap_or_default();
 
     let meta_path = config.output_dir.join("meta.json");
     let index_md_path = config.output_dir.join("INDEX.md");
-    let cache_path = config.output_dir.join("cache.json");
     let single_md_path = config.output_dir.join(format!("{repo_name}.md"));
-
-    // Fast-path cache hit when repository fingerprint and vendor_mode match existing bundle
-    if !config.force
+    let bundle_ready = !config.force
         && meta_path.is_file()
         && index_md_path.is_file()
-        && cache_path.is_file()
-        && (!config.single_file || single_md_path.is_file())
-    {
-        if let Some(mut existing_meta) = scanner::load_meta_file(&config.output_dir) {
-            if existing_meta.metadata.fingerprint == fingerprint
-                && existing_meta.metadata.vendor_mode == config.vendor_mode
-            {
+        && scanner::has_bundle_cache(&config.output_dir)
+        && (!config.single_file || single_md_path.is_file());
+
+    let existing_meta_opt = if bundle_ready {
+        scanner::load_meta_file(&config.output_dir)
+            .filter(|m| m.metadata.vendor_mode == config.vendor_mode)
+    } else {
+        None
+    };
+
+    // 1. Stat-only fast-path check against `meta.file_stamps` (zero source-file reads when clean)
+    let mut pre_scanned: Option<(Vec<ScannedFile>, String)> = None;
+    if let Some(mut existing_meta) = existing_meta_opt.clone() {
+        if let Some(sc) = scanner::stamp_check(
+            &config.repo_path,
+            &existing_meta.metadata,
+            config.max_file_bytes,
+        ) {
+            if sc.unchanged {
                 let claudeignore_updated =
                     emitter::ensure_claudeignore_entry(&config.repo_path, &config.output_dir)
                         .unwrap_or(false);
-                existing_meta.metadata.elapsed_ms = start.elapsed().as_millis() as u64;
+                let elapsed = start.elapsed().as_millis() as u64;
+                existing_meta.metadata.scan_ms = elapsed;
+                existing_meta.metadata.parse_ms = 0;
+                existing_meta.metadata.link_ms = 0;
+                existing_meta.metadata.graph_ms = 0;
+                existing_meta.metadata.shard_ms = 0;
+                existing_meta.metadata.emit_ms = 0;
+                existing_meta.metadata.elapsed_ms = elapsed;
                 existing_meta.metadata.incremental_reparsed_files = 0;
                 existing_meta.metadata.incremental_reused_files =
                     existing_meta.metadata.total_files;
+
+                if !sc.touched_mtimes.is_empty() {
+                    for stamp in &mut existing_meta.metadata.file_stamps {
+                        if let Some(&new_mtime) = sc.touched_mtimes.get(&stamp.rel_path) {
+                            stamp.mtime_secs = new_mtime;
+                        }
+                    }
+                    if let Ok(json_str) = serde_json::to_string_pretty(&existing_meta) {
+                        let _ = fs::write(&meta_path, format!("{json_str}\n"));
+                    }
+                }
 
                 return Ok(ConversionBundle {
                     output_dir: config.output_dir.clone(),
@@ -133,32 +214,269 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                     claudeignore_updated,
                 });
             }
+            if let Some(files) = sc.scanned_files {
+                pre_scanned = Some((files, sc.fingerprint));
+            }
         }
     }
 
-    // Load incremental per-file AST cache if available and not forcing full rebuild.
-    // If `.chipsrc.json` was added, removed, or modified (`blueprint_hash` mismatch) or
-    // `vendor_mode` changed, invalidate per-file AST cache entries so rules re-apply cleanly.
-    let existing_cache = if !config.force && cache_path.is_file() {
-        scanner::load_cache_file(&config.output_dir)
-            .filter(|c| c.blueprint_hash == blueprint_hash && c.vendor_mode == config.vendor_mode)
+    // 2. Scan repository (reusing the single-pass `stamp_check` file list when available)
+    let (scanned_files, fingerprint) = match pre_scanned {
+        Some(res) => res,
+        None => {
+            scanner::scan_repository(&config.repo_path, config.vendor_mode, config.max_file_bytes)?
+        }
+    };
+    let blueprint_opt = scanner::load_repo_blueprint(&config.repo_path);
+    let blueprint_hash = blueprint_opt
+        .as_ref()
+        .map(|(_, h)| h.clone())
+        .unwrap_or_default();
+    let scan_ms = t_scan.elapsed().as_millis() as u64;
+
+    // Fallback fingerprint cache hit check (e.g. when `file_stamps` had `line_count == 0` or was touched)
+    if let Some(mut existing_meta) = existing_meta_opt.clone() {
+        if existing_meta.metadata.fingerprint == fingerprint
+            && existing_meta.metadata.vendor_mode == config.vendor_mode
+        {
+            let claudeignore_updated =
+                emitter::ensure_claudeignore_entry(&config.repo_path, &config.output_dir)
+                    .unwrap_or(false);
+            let elapsed = start.elapsed().as_millis() as u64;
+            existing_meta.metadata.scan_ms = scan_ms;
+            existing_meta.metadata.parse_ms = 0;
+            existing_meta.metadata.link_ms = 0;
+            existing_meta.metadata.graph_ms = 0;
+            existing_meta.metadata.shard_ms = 0;
+            existing_meta.metadata.emit_ms = 0;
+            existing_meta.metadata.elapsed_ms = elapsed;
+            existing_meta.metadata.incremental_reparsed_files = 0;
+            existing_meta.metadata.incremental_reused_files = existing_meta.metadata.total_files;
+
+            return Ok(ConversionBundle {
+                output_dir: config.output_dir.clone(),
+                metadata: existing_meta.metadata,
+                sanity: existing_meta.sanity,
+                sections: Vec::new(),
+                indexes: BundleIndexes::default(),
+                cache_hit: true,
+                claudeignore_updated,
+            });
+        }
+    }
+
+    // 3. Incremental AST parse & Structural Digest No-Op Short-Circuit (Bug 7)
+    let t_parse = Instant::now();
+    let prev_manifest_opt = if !config.force {
+        scanner::load_cache_manifest(&config.output_dir)
+            .filter(|m| m.blueprint_hash == blueprint_hash && m.vendor_mode == config.vendor_mode)
     } else {
         None
     };
 
-    let (units, incremental_reused_files, incremental_reparsed_files) =
+    let (units, incremental_reused_files, incremental_reparsed_files) = if let Some(mut manifest) =
+        prev_manifest_opt
+    {
+        let prev_stamp_map: BTreeMap<&str, &FileStamp> = existing_meta_opt
+            .as_ref()
+            .map(|m| {
+                m.metadata
+                    .file_stamps
+                    .iter()
+                    .map(|s| (s.rel_path.as_str(), s))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut dirty_files = Vec::new();
+        let mut clean_files = Vec::new();
+        for f in &scanned_files {
+            let reusable = manifest.files.get(&f.rel_path).is_some_and(|entry| {
+                entry.blake3_hash == f.blake3_hash
+                    && prev_stamp_map
+                        .get(f.rel_path.as_str())
+                        .is_none_or(|s| s.scope == f.scope && s.arch_layer == f.arch_layer)
+            });
+            if reusable {
+                clean_files.push(f.clone());
+            } else {
+                dirty_files.push(f.clone());
+            }
+        }
+
+        let (dirty_units, _, reparsed_count) = parser::parse_files_incremental_with_blueprint(
+            &dirty_files,
+            None,
+            blueprint_opt.as_ref().map(|(bp, _)| bp),
+        )?;
+
+        // Check Structural Digest No-Op Short-Circuit when no files were added/deleted
+        let can_short_circuit = !dirty_units.is_empty()
+            && existing_meta_opt.is_some()
+            && scanned_files.len() == manifest.files.len()
+            && dirty_units.iter().all(|u| {
+                manifest
+                    .files
+                    .get(&u.scanned.rel_path)
+                    .is_some_and(|entry| {
+                        !entry.structural_digest.is_empty()
+                            && entry.structural_digest == u.structural_digest()
+                            && prev_stamp_map
+                                .get(u.scanned.rel_path.as_str())
+                                .is_some_and(|s| {
+                                    s.scope == u.scanned.scope
+                                        && s.arch_layer == u.scanned.arch_layer
+                                })
+                            && scanner::load_cache_shard(&config.output_dir, &entry.shard)
+                                .is_some_and(|old_u| units_have_identical_coordinates(&old_u, u))
+                    })
+            });
+
+        if can_short_circuit {
+            let parse_ms = t_parse.elapsed().as_millis() as u64;
+            let t_emit = Instant::now();
+            let mut existing_meta = existing_meta_opt.unwrap();
+            let cache_dir = config.output_dir.join("cache");
+            let _ = fs::create_dir_all(&cache_dir);
+
+            for u in &dirty_units {
+                let new_hash = &u.scanned.blake3_hash;
+                let new_shard_rel = format!("cache/{new_hash}.json");
+                let new_shard_path = cache_dir.join(format!("{new_hash}.json"));
+                if let Ok(bytes) = serde_json::to_vec(u) {
+                    let _ = fs::write(&new_shard_path, bytes);
+                }
+                if let Some(old_entry) = manifest.files.get_mut(&u.scanned.rel_path) {
+                    let old_hash = old_entry.blake3_hash.clone();
+                    old_entry.blake3_hash = new_hash.clone();
+                    old_entry.shard = new_shard_rel;
+                    old_entry.structural_digest = u.structural_digest();
+                    if old_hash != *new_hash
+                        && !manifest.files.values().any(|e| e.blake3_hash == old_hash)
+                    {
+                        let _ = fs::remove_file(cache_dir.join(format!("{old_hash}.json")));
+                    }
+                }
+            }
+            manifest.fingerprint = fingerprint.clone();
+            if let Ok(m_bytes) = serde_json::to_vec(&manifest) {
+                let _ = fs::write(cache_dir.join("manifest.json"), m_bytes);
+            }
+
+            let total_lines: usize = scanned_files.iter().map(|f| f.line_count).sum();
+            let languages = compute_language_stats(&scanned_files);
+            let file_stamps: Vec<FileStamp> = scanned_files
+                .iter()
+                .map(|f| FileStamp {
+                    rel_path: f.rel_path.clone(),
+                    size_bytes: f.size_bytes,
+                    mtime_secs: f.mtime_secs,
+                    line_count: f.line_count,
+                    blake3_hash: f.blake3_hash.clone(),
+                    scope: f.scope,
+                    arch_layer: f.arch_layer,
+                })
+                .collect();
+
+            let claudeignore_updated =
+                emitter::ensure_claudeignore_entry(&config.repo_path, &config.output_dir)
+                    .unwrap_or(false);
+            let emit_ms = t_emit.elapsed().as_millis() as u64;
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+
+            existing_meta.metadata.fingerprint = fingerprint;
+            existing_meta.metadata.total_lines = total_lines;
+            existing_meta.metadata.languages = languages;
+            existing_meta.metadata.file_stamps = file_stamps;
+            existing_meta.metadata.incremental_reused_files = clean_files.len();
+            existing_meta.metadata.incremental_reparsed_files = reparsed_count;
+            existing_meta.metadata.scan_ms = scan_ms;
+            existing_meta.metadata.parse_ms = parse_ms;
+            existing_meta.metadata.link_ms = 0;
+            existing_meta.metadata.graph_ms = 0;
+            existing_meta.metadata.shard_ms = 0;
+            existing_meta.metadata.emit_ms = emit_ms;
+            existing_meta.metadata.elapsed_ms = elapsed_ms;
+
+            if let Ok(json_str) = serde_json::to_string_pretty(&existing_meta) {
+                let _ = fs::write(&meta_path, format!("{json_str}\n"));
+            }
+
+            return Ok(ConversionBundle {
+                output_dir: config.output_dir.clone(),
+                metadata: existing_meta.metadata,
+                sanity: existing_meta.sanity,
+                sections: Vec::new(),
+                indexes: BundleIndexes::default(),
+                cache_hit: false,
+                claudeignore_updated,
+            });
+        }
+
+        // Load clean shards in parallel; re-parse any missing shard seamlessly
+        let bp_ref = blueprint_opt.as_ref().map(|(bp, _)| bp);
+        let clean_results: Vec<Result<(ParsedFileUnit, bool)>> = clean_files
+            .into_par_iter()
+            .map(|file| {
+                if let Some(entry) = manifest.files.get(&file.rel_path) {
+                    if let Some(mut cached) =
+                        scanner::load_cache_shard(&config.output_dir, &entry.shard)
+                    {
+                        cached.scanned = file;
+                        return Ok((cached, true));
+                    }
+                }
+                let (mut parsed, _, _) = parser::parse_files_incremental_with_blueprint(
+                    std::slice::from_ref(&file),
+                    None,
+                    bp_ref,
+                )?;
+                Ok((parsed.pop().unwrap(), false))
+            })
+            .collect();
+
+        let mut all_units = Vec::with_capacity(scanned_files.len());
+        let mut reused_count = 0usize;
+        let mut actual_reparsed = reparsed_count;
+        for res in clean_results {
+            let (u, was_reused) = res?;
+            if was_reused {
+                reused_count += 1;
+            } else {
+                actual_reparsed += 1;
+            }
+            all_units.push(u);
+        }
+        all_units.extend(dirty_units);
+        all_units.sort_by(|a, b| a.scanned.rel_path.cmp(&b.scanned.rel_path));
+        (all_units, reused_count, actual_reparsed)
+    } else {
+        let existing_cache = if !config.force && scanner::has_bundle_cache(&config.output_dir) {
+            scanner::load_cache_file(&config.output_dir).filter(|c| {
+                c.blueprint_hash == blueprint_hash && c.vendor_mode == config.vendor_mode
+            })
+        } else {
+            None
+        };
         parser::parse_files_incremental_with_blueprint(
             &scanned_files,
             existing_cache,
             blueprint_opt.as_ref().map(|(bp, _)| bp),
-        )?;
+        )?
+    };
+    let parse_ms = t_parse.elapsed().as_millis() as u64;
 
-    let (symbols, mut types, mut macros, mut calls, mut xrefs, vendor_surface) =
+    let t_link = Instant::now();
+    let (symbols, mut types, mut macros, mut calls, mut xrefs, mut vendor_surface) =
         resolver::resolve_and_link(&units);
+    let link_ms = t_link.elapsed().as_millis() as u64;
 
+    let t_graph = Instant::now();
     let (mut ranked_symbols, mut god_nodes, mut entrypoints, layer_edges, cycles) =
         graph::analyze_graph(symbols, &calls, &units);
+    let graph_ms = t_graph.elapsed().as_millis() as u64;
 
+    let t_shard = Instant::now();
     let (section_summaries, sections) = sharder::build_section_shards(
         &repo_name,
         &units,
@@ -170,23 +488,73 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         &vendor_surface,
         config.vendor_mode,
     );
+    let shard_ms = t_shard.elapsed().as_millis() as u64;
 
-    // Synchronize numbered section_ids onto god_nodes and entrypoints
+    // Synchronize numbered section_ids and post-compaction retention onto god_nodes,
+    // entrypoints, and vendor_surface (Bug 9)
     {
-        let sym_sec_map: BTreeMap<&str, &str> = ranked_symbols
+        let sym_map: BTreeMap<&str, &RankedSymbol> = ranked_symbols
             .iter()
-            .map(|rs| (rs.symbol.symbol_id.as_str(), rs.symbol.section_id.as_str()))
+            .map(|rs| (rs.symbol.symbol_id.as_str(), rs))
             .collect();
-        for gn in &mut god_nodes {
-            if let Some(&sec_id) = sym_sec_map.get(gn.symbol.symbol_id.as_str()) {
-                gn.symbol.section_id = sec_id.to_string();
+        god_nodes.retain_mut(|gn| {
+            if let Some(&rs) = sym_map.get(gn.symbol.symbol_id.as_str()) {
+                gn.symbol.section_id = rs.symbol.section_id.clone();
+                true
+            } else {
+                false
             }
-        }
-        for ep in &mut entrypoints {
-            if let Some(&sec_id) = sym_sec_map.get(ep.symbol.symbol_id.as_str()) {
-                ep.symbol.section_id = sec_id.to_string();
+        });
+        entrypoints.retain_mut(|ep| {
+            if let Some(&rs) = sym_map.get(ep.symbol.symbol_id.as_str()) {
+                ep.symbol.section_id = rs.symbol.section_id.clone();
+                true
+            } else {
+                false
             }
-        }
+        });
+
+        let retained_vendor_files: BTreeSet<&str> = ranked_symbols
+            .iter()
+            .filter(|s| s.symbol.scope == FileScope::VendorSdk)
+            .map(|s| s.symbol.file.as_str())
+            .chain(
+                types
+                    .iter()
+                    .filter(|t| t.scope == FileScope::VendorSdk)
+                    .map(|t| t.file.as_str()),
+            )
+            .chain(
+                macros
+                    .iter()
+                    .filter(|m| m.scope == FileScope::VendorSdk)
+                    .map(|m| m.file.as_str()),
+            )
+            .collect();
+        vendor_surface
+            .active_vendor_headers
+            .retain(|f| retained_vendor_files.contains(f.as_str()));
+
+        let retained_vendor_names: BTreeSet<&str> = ranked_symbols
+            .iter()
+            .filter(|s| s.symbol.scope == FileScope::VendorSdk)
+            .map(|s| s.symbol.name.as_str())
+            .chain(
+                types
+                    .iter()
+                    .filter(|t| t.scope == FileScope::VendorSdk)
+                    .map(|t| t.name.as_str()),
+            )
+            .chain(
+                macros
+                    .iter()
+                    .filter(|m| m.scope == FileScope::VendorSdk)
+                    .map(|m| m.name.as_str()),
+            )
+            .collect();
+        vendor_surface
+            .active_vendor_symbols
+            .retain(|n| retained_vendor_names.contains(n.as_str()));
     }
 
     let indexes = BundleIndexes {
@@ -227,6 +595,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
             rel_path: f.rel_path.clone(),
             size_bytes: f.size_bytes,
             mtime_secs: f.mtime_secs,
+            line_count: f.line_count,
             blake3_hash: f.blake3_hash.clone(),
             scope: f.scope,
             arch_layer: f.arch_layer,
@@ -246,9 +615,8 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         files: cache_files,
     };
 
-    let elapsed_ms = start.elapsed().as_millis() as u64;
-
-    let metadata = RepoMetadata {
+    let t_emit = Instant::now();
+    let mut metadata = RepoMetadata {
         repo_name,
         source_root,
         fingerprint,
@@ -267,7 +635,13 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         xref_count: indexes.xrefs.len(),
         god_node_count: indexes.god_nodes.len(),
         entrypoint_count: indexes.entrypoints.len(),
-        elapsed_ms,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        scan_ms,
+        parse_ms,
+        link_ms,
+        graph_ms,
+        shard_ms,
+        emit_ms: 0,
         incremental_reused_files,
         incremental_reparsed_files,
         file_stamps,
@@ -275,6 +649,17 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
 
     let claudeignore_updated =
         emitter::emit_bundle(config, &metadata, &sanity, &sections, &indexes, &cache)?;
+    metadata.emit_ms = t_emit.elapsed().as_millis() as u64;
+    metadata.elapsed_ms = start.elapsed().as_millis() as u64;
+
+    // Persist final emit_ms and elapsed_ms in meta.json
+    let meta_file = BundleMetaFile {
+        metadata: metadata.clone(),
+        sanity: sanity.clone(),
+    };
+    if let Ok(meta_json) = serde_json::to_string_pretty(&meta_file) {
+        let _ = fs::write(&meta_path, format!("{meta_json}\n"));
+    }
 
     Ok(ConversionBundle {
         output_dir: config.output_dir.clone(),

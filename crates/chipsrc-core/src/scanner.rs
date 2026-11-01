@@ -3,11 +3,12 @@
 
 use crate::error::{ChipsrcError, Result};
 use crate::model::{
-    ArchLayer, BundleMetaFile, FileScope, IncrementalAstCache, LanguageKind, RepoBlueprint,
-    RepoMetadata, ScannedFile, VendorMode, CACHE_SCHEMA_VERSION,
+    ArchLayer, BundleMetaFile, CacheManifest, FileScope, IncrementalAstCache, LanguageKind,
+    ParsedFileUnit, RepoBlueprint, RepoMetadata, ScannedFile, VendorMode, CACHE_SCHEMA_VERSION,
 };
 use ignore::WalkBuilder;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -135,15 +136,68 @@ fn is_bundled_js_asset(lower_filename: &str) -> bool {
             .any(|prefix| stem.starts_with(prefix))
 }
 
+/// Returns `true` when `rel_path` sits under a `docs|doc|documentation|html` segment AND either
+/// a later directory segment is `search|html|_static|assets` or the file is a generated Doxygen/search JS file.
+fn is_generated_doc_asset(rel_path: &str, lower_filename: &str) -> bool {
+    let parts: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
+    let dir_segments = &parts[..parts.len().saturating_sub(1)];
+    let Some(doc_idx) = dir_segments.iter().position(|seg| {
+        matches!(
+            seg.to_ascii_lowercase().as_str(),
+            "docs" | "doc" | "documentation" | "html"
+        )
+    }) else {
+        return false;
+    };
+
+    if dir_segments[doc_idx + 1..].iter().any(|seg| {
+        matches!(
+            seg.to_ascii_lowercase().as_str(),
+            "search" | "html" | "_static" | "assets"
+        )
+    }) {
+        return true;
+    }
+
+    lower_filename.ends_with(".min.js")
+        || (lower_filename.starts_with("search") && lower_filename.ends_with(".js"))
+        || (lower_filename.starts_with("all_") && lower_filename.ends_with(".js"))
+        || lower_filename == "menudata.js"
+        || (lower_filename.starts_with("navtree") && lower_filename.ends_with(".js"))
+}
+
+/// Loads `<repo_path>/.chipsrc.json` if present, returning `Ok(Some((blueprint, hash)))`,
+/// `Ok(None)` when absent, or `Err(message)` (after emitting a `[warn]` to stderr) when invalid.
+pub fn load_repo_blueprint_result(
+    repo_path: &Path,
+) -> std::result::Result<Option<(RepoBlueprint, String)>, String> {
+    let bp_path = repo_path.join(".chipsrc.json");
+    if !bp_path.is_file() {
+        return Ok(None);
+    }
+    let bytes = match fs::read(&bp_path) {
+        Ok(b) => b,
+        Err(err) => {
+            eprintln!("    [warn] Failed to read .chipsrc.json: {err}");
+            return Err(err.to_string());
+        }
+    };
+    let bp: RepoBlueprint = match serde_json::from_slice(&bytes) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            eprintln!("    [warn] Failed to parse .chipsrc.json: {err}");
+            return Err(err.to_string());
+        }
+    };
+    let full_hash = blake3::hash(&bytes).to_hex();
+    let hash = full_hash[..16].to_string();
+    Ok(Some((bp, hash)))
+}
+
 /// Loads `<repo_path>/.chipsrc.json` if present, returning the parsed [`RepoBlueprint`]
 /// together with its 16-character BLAKE3 content hash.
 pub fn load_repo_blueprint(repo_path: &Path) -> Option<(RepoBlueprint, String)> {
-    let bp_path = repo_path.join(".chipsrc.json");
-    let bytes = fs::read(&bp_path).ok()?;
-    let bp: RepoBlueprint = serde_json::from_slice(&bytes).ok()?;
-    let full_hash = blake3::hash(&bytes).to_hex();
-    let hash = full_hash[..16].to_string();
-    Some((bp, hash))
+    load_repo_blueprint_result(repo_path).ok().flatten()
 }
 
 /// Finds the longest normalized path prefix in `map` that matches `rel_path`.
@@ -159,6 +213,8 @@ fn match_longest_prefix<'a, V>(
         let clean_prefix = raw_prefix
             .replace('\\', "/")
             .trim_start_matches("./")
+            .trim_end_matches("/**")
+            .trim_end_matches("/*")
             .trim_matches('/')
             .to_string();
         if clean_prefix.is_empty() {
@@ -246,7 +302,13 @@ pub fn scan_repository(
                         return false;
                     }
                     if custom_ignore_dirs.iter().any(|ig| {
-                        let clean = ig.trim_matches('/');
+                        let clean = ig
+                            .replace('\\', "/")
+                            .trim_start_matches("./")
+                            .trim_end_matches("/**")
+                            .trim_end_matches("/*")
+                            .trim_matches('/')
+                            .to_string();
                         clean.eq_ignore_ascii_case(name)
                     }) {
                         return false;
@@ -309,6 +371,9 @@ pub fn scan_repository(
         if rel_path.is_empty() {
             continue;
         }
+        if is_generated_doc_asset(&rel_path, &lower_filename) {
+            continue;
+        }
         if let Some(bp) = bp_ref {
             if path_matches_ignore_dirs(&rel_path, &bp.ignore_dirs) {
                 continue;
@@ -326,15 +391,31 @@ pub fn scan_repository(
                 return None;
             }
 
-            let has_explicit_scope = bp_ref
+            let explicit_example_scope = bp_ref
                 .and_then(|bp| match_longest_prefix(&rel_path, &bp.scopes))
-                .is_some();
+                .is_some_and(|(matched_key, _)| {
+                    matched_key.split('/').any(|seg| {
+                        matches!(
+                            seg.to_ascii_lowercase().as_str(),
+                            "examples"
+                                | "example"
+                                | "samples"
+                                | "sample"
+                                | "demos"
+                                | "demo"
+                                | "templates"
+                                | "template"
+                                | "boards"
+                                | "board"
+                        )
+                    })
+                });
             let scope = classify_file_scope_with_blueprint(&rel_path, size_bytes, &bytes, bp_ref);
             if scope == FileScope::VendorSdk {
                 if vendor_mode == VendorMode::None {
                     return None;
                 }
-                if !has_explicit_scope && is_vendor_example_or_demo_path(&rel_path) {
+                if !explicit_example_scope && is_vendor_example_or_demo_path(&rel_path) {
                     return None;
                 }
             }
@@ -408,76 +489,390 @@ pub fn load_meta_file(bundle_dir: &Path) -> Option<BundleMetaFile> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Loads `cache.json` from `bundle_dir` if present and matching `CACHE_SCHEMA_VERSION`.
-pub fn load_cache_file(bundle_dir: &Path) -> Option<IncrementalAstCache> {
-    let bytes = fs::read(bundle_dir.join("cache.json")).ok()?;
-    let cache: IncrementalAstCache = serde_json::from_slice(&bytes).ok()?;
-    if !cache.schema_version.is_empty() && cache.schema_version != CACHE_SCHEMA_VERSION {
+/// Loads `cache/manifest.json` from `bundle_dir` if present and matching `CACHE_SCHEMA_VERSION`.
+pub fn load_cache_manifest(bundle_dir: &Path) -> Option<CacheManifest> {
+    let manifest_path = bundle_dir.join("cache").join("manifest.json");
+    let bytes = fs::read(manifest_path).ok()?;
+    let manifest: CacheManifest = serde_json::from_slice(&bytes).ok()?;
+    if !manifest.schema_version.is_empty() && manifest.schema_version != CACHE_SCHEMA_VERSION {
         return None;
     }
+    Some(manifest)
+}
+
+/// Loads a single per-file AST cache shard (`cache/<blake3_hash>.json`) from `bundle_dir`.
+pub fn load_cache_shard(bundle_dir: &Path, shard_rel: &str) -> Option<ParsedFileUnit> {
+    let shard_path = bundle_dir.join(shard_rel);
+    let bytes = fs::read(shard_path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Returns `true` when `bundle_dir` has either `cache/manifest.json` (schema 2.0.0) or legacy `cache.json`.
+pub fn has_bundle_cache(bundle_dir: &Path) -> bool {
+    bundle_dir.join("cache").join("manifest.json").is_file()
+        || bundle_dir.join("cache.json").is_file()
+}
+
+/// Loads the incremental AST cache from `bundle_dir/cache/manifest.json` + `cache/*.json` shards
+/// (schema `2.0.0`), falling back once to legacy `bundle_dir/cache.json` (`1.0.0`) for migration.
+pub fn load_cache_file(bundle_dir: &Path) -> Option<IncrementalAstCache> {
+    if let Some(manifest) = load_cache_manifest(bundle_dir) {
+        let entries: Vec<(&String, &crate::model::CacheShardEntry)> =
+            manifest.files.iter().collect();
+        let loaded_units: Vec<Option<(String, ParsedFileUnit)>> = entries
+            .into_par_iter()
+            .map(|(rel_path, entry)| {
+                load_cache_shard(bundle_dir, &entry.shard).map(|u| (rel_path.clone(), u))
+            })
+            .collect();
+        let mut files = BTreeMap::new();
+        for item in loaded_units {
+            let (rel_path, unit) = item?;
+            files.insert(rel_path, unit);
+        }
+        return Some(IncrementalAstCache {
+            schema_version: manifest.schema_version,
+            repo_root: manifest.repo_root,
+            vendor_mode: manifest.vendor_mode,
+            fingerprint: manifest.fingerprint,
+            blueprint_hash: manifest.blueprint_hash,
+            files,
+        });
+    }
+
+    // Legacy 1.0.0 `cache.json` fallback (migrated and deleted on next emit)
+    let legacy_path = bundle_dir.join("cache.json");
+    let bytes = fs::read(&legacy_path).ok()?;
+    let mut cache: IncrementalAstCache = serde_json::from_slice(&bytes).ok()?;
+    if !cache.schema_version.is_empty()
+        && cache.schema_version != CACHE_SCHEMA_VERSION
+        && cache.schema_version != "1.0.0"
+    {
+        return None;
+    }
+    cache.schema_version = CACHE_SCHEMA_VERSION.to_string();
+    let _ = fs::remove_file(&legacy_path);
     Some(cache)
 }
 
-/// Checks how many files were added, deleted, or modified compared to `meta.file_stamps`
-/// (or `meta.fingerprint` when `file_stamps` is empty), without loading `cache.json`.
-pub fn check_meta_files_changed(
+/// Result of a fast stat-only freshness check against `meta.file_stamps`.
+#[derive(Debug, Clone, Default)]
+pub struct StampCheck {
+    pub unchanged: bool,
+    pub suspects: Vec<PathBuf>,
+    pub suspect_rel_paths: Vec<String>,
+    pub changed_count: usize,
+    pub added: usize,
+    pub deleted: usize,
+    pub touched_mtimes: BTreeMap<String, u64>,
+    pub scanned_files: Option<Vec<ScannedFile>>,
+    pub fingerprint: String,
+}
+
+/// Walks `repo_path` comparing `(mtime_secs, size_bytes)` against `meta.file_stamps` WITHOUT
+/// reading unchanged files from disk. Only files whose `(mtime_secs, size_bytes)` differ from
+/// their recorded stamp ("suspects") are read and BLAKE3-hashed; touch-only suspects whose
+/// BLAKE3 hash matches `stamp.blake3_hash` are treated as unchanged and recorded in `touched_mtimes`.
+pub fn stamp_check(
     repo_path: &Path,
     meta: &RepoMetadata,
     max_file_bytes: u64,
-) -> Option<usize> {
-    if meta.file_stamps.is_empty() {
+) -> Option<StampCheck> {
+    if meta.file_stamps.is_empty() || !repo_path.is_dir() {
         return None;
     }
 
-    let (scanned_files, live_fp) =
-        match scan_repository(repo_path, meta.vendor_mode, max_file_bytes) {
-            Ok(res) => res,
-            Err(ChipsrcError::NoSourceFilesFound(_)) => return Some(meta.file_stamps.len()),
-            Err(_) => return None,
-        };
+    let blueprint_opt = load_repo_blueprint(repo_path);
+    let bp_ref = blueprint_opt.as_ref().map(|(bp, _)| bp);
 
-    if live_fp == meta.fingerprint && scanned_files.len() == meta.file_stamps.len() {
-        return Some(0);
-    }
+    // Verify whether `.chipsrc.json` changed by computing the Merkle fingerprint over existing stamps
+    let expected_fp = {
+        let mut h = blake3::Hasher::new();
+        if let Some((_, ref bp_hash)) = blueprint_opt {
+            h.update(b"blueprint:");
+            h.update(bp_hash.as_bytes());
+            h.update(b"\n");
+        }
+        for stamp in &meta.file_stamps {
+            h.update(stamp.rel_path.as_bytes());
+            h.update(b":");
+            h.update(&stamp.size_bytes.to_le_bytes());
+            h.update(b":");
+            h.update(stamp.blake3_hash.as_bytes());
+            h.update(b"\n");
+        }
+        h.finalize().to_hex()[..16].to_string()
+    };
+    let blueprint_changed = !meta.fingerprint.is_empty() && expected_fp != meta.fingerprint;
 
-    let stamp_map: BTreeMap<&str, &crate::model::FileStamp> = meta
+    let custom_ignore_dirs: Vec<String> = blueprint_opt
+        .as_ref()
+        .map(|(bp, _)| bp.ignore_dirs.clone())
+        .unwrap_or_default();
+
+    let mut walker = WalkBuilder::new(repo_path);
+    walker
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .hidden(true)
+        .add_custom_ignore_filename(".claudeignore")
+        .filter_entry(move |entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                if let Some(name) = entry.file_name().to_str() {
+                    let lower = name.to_ascii_lowercase();
+                    if IGNORED_DIRS.contains(&lower.as_str()) {
+                        return false;
+                    }
+                    if custom_ignore_dirs.iter().any(|ig| {
+                        let clean = ig
+                            .replace('\\', "/")
+                            .trim_start_matches("./")
+                            .trim_end_matches("/**")
+                            .trim_end_matches("/*")
+                            .trim_matches('/')
+                            .to_string();
+                        clean.eq_ignore_ascii_case(name)
+                    }) {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+
+    let stamp_map: FxHashMap<&str, &crate::model::FileStamp> = meta
         .file_stamps
         .iter()
         .map(|s| (s.rel_path.as_str(), s))
         .collect();
 
-    let mut changed = 0usize;
-    let mut seen_paths = HashSet::with_capacity(scanned_files.len());
+    let mut seen_paths: HashSet<String> = HashSet::with_capacity(meta.file_stamps.len());
+    let mut suspects = Vec::new();
+    let mut suspect_rel_paths = Vec::new();
+    let mut touched_mtimes = BTreeMap::new();
+    let mut built_files: Vec<ScannedFile> = Vec::with_capacity(meta.file_stamps.len());
+    let mut can_build_files = !blueprint_changed;
+    let mut added = 0usize;
+    let mut modified = 0usize;
 
-    for file in &scanned_files {
-        seen_paths.insert(file.rel_path.as_str());
-        match stamp_map.get(file.rel_path.as_str()) {
-            Some(stamp) => {
-                if stamp.size_bytes != file.size_bytes
-                    || stamp.blake3_hash != file.blake3_hash
-                    || stamp.scope != file.scope
-                    || stamp.arch_layer != file.arch_layer
-                {
-                    changed += 1;
+    for entry_res in walker.build() {
+        let Ok(entry) = entry_res else {
+            continue;
+        };
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let abs_path = entry.path().to_path_buf();
+        let Some(ext) = abs_path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        let Some(language) = LanguageKind::from_extension(ext) else {
+            continue;
+        };
+        let lower_filename = abs_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_ascii_lowercase())
+            .unwrap_or_default();
+        if is_bundled_js_asset(&lower_filename) {
+            continue;
+        }
+        let Ok(fs_meta) = entry.metadata() else {
+            continue;
+        };
+        let size_bytes = fs_meta.len();
+        if size_bytes == 0 || size_bytes > max_file_bytes {
+            continue;
+        }
+        let mtime_secs = fs_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let rel_path = match abs_path.strip_prefix(repo_path) {
+            Ok(rel) => normalize_rel_path(rel),
+            Err(_) => normalize_rel_path(&abs_path),
+        };
+        if rel_path.is_empty() || is_generated_doc_asset(&rel_path, &lower_filename) {
+            continue;
+        }
+        if let Some(bp) = bp_ref {
+            if path_matches_ignore_dirs(&rel_path, &bp.ignore_dirs) {
+                continue;
+            }
+        }
+
+        if let Some(&stamp) = stamp_map.get(rel_path.as_str()) {
+            seen_paths.insert(rel_path.clone());
+            if !blueprint_changed
+                && stamp.size_bytes == size_bytes
+                && stamp.mtime_secs == mtime_secs
+                && stamp.mtime_secs > 0
+            {
+                // Trusted stat-only hit: no fs::read needed!
+                if stamp.line_count > 0 {
+                    built_files.push(ScannedFile {
+                        rel_path,
+                        abs_path,
+                        language,
+                        scope: stamp.scope,
+                        arch_layer: stamp.arch_layer,
+                        size_bytes,
+                        mtime_secs,
+                        blake3_hash: stamp.blake3_hash.clone(),
+                        line_count: stamp.line_count,
+                    });
+                } else {
+                    can_build_files = false;
+                }
+                continue;
+            }
+            suspects.push(abs_path.clone());
+            suspect_rel_paths.push(rel_path.clone());
+            let Ok(bytes) = fs::read(&abs_path) else {
+                modified += 1;
+                can_build_files = false;
+                continue;
+            };
+            let full_hash = blake3::hash(&bytes).to_hex();
+            let blake3_hash = full_hash[..16].to_string();
+            let scope = classify_file_scope_with_blueprint(&rel_path, size_bytes, &bytes, bp_ref);
+            let arch_layer = classify_arch_layer_with_blueprint(&rel_path, scope, bp_ref);
+            let line_count =
+                memchr::memchr_iter(b'\n', &bytes).count() + usize::from(!bytes.ends_with(b"\n"));
+            if stamp.size_bytes == size_bytes
+                && stamp.blake3_hash == blake3_hash
+                && stamp.scope == scope
+                && stamp.arch_layer == arch_layer
+            {
+                touched_mtimes.insert(rel_path.clone(), mtime_secs);
+            } else {
+                modified += 1;
+            }
+            built_files.push(ScannedFile {
+                rel_path,
+                abs_path,
+                language,
+                scope,
+                arch_layer,
+                size_bytes,
+                mtime_secs,
+                blake3_hash,
+                line_count,
+            });
+        } else {
+            can_build_files = false;
+            // Candidate new file: check if it would be filtered by VendorMode::None or vendor example rules
+            let explicit_example_scope = bp_ref
+                .and_then(|bp| match_longest_prefix(&rel_path, &bp.scopes))
+                .is_some_and(|(matched_key, _)| {
+                    matched_key.split('/').any(|seg| {
+                        matches!(
+                            seg.to_ascii_lowercase().as_str(),
+                            "examples"
+                                | "example"
+                                | "samples"
+                                | "sample"
+                                | "demos"
+                                | "demo"
+                                | "templates"
+                                | "template"
+                                | "boards"
+                                | "board"
+                        )
+                    })
+                });
+            let dir_scope = classify_file_scope_with_blueprint(&rel_path, 0, b"", bp_ref);
+            if dir_scope == FileScope::VendorSdk
+                && (meta.vendor_mode == VendorMode::None
+                    || (!explicit_example_scope && is_vendor_example_or_demo_path(&rel_path)))
+            {
+                continue;
+            }
+            if size_bytes > 200 * 1024
+                && (lower_filename.ends_with(".h") || lower_filename.ends_with(".hpp"))
+            {
+                if let Ok(bytes) = fs::read(&abs_path) {
+                    let scope =
+                        classify_file_scope_with_blueprint(&rel_path, size_bytes, &bytes, bp_ref);
+                    if scope == FileScope::VendorSdk
+                        && (meta.vendor_mode == VendorMode::None
+                            || (!explicit_example_scope
+                                && is_vendor_example_or_demo_path(&rel_path)))
+                    {
+                        continue;
+                    }
                 }
             }
-            None => {
-                changed += 1;
-            }
+            seen_paths.insert(rel_path.clone());
+            suspects.push(abs_path);
+            suspect_rel_paths.push(rel_path);
+            added += 1;
         }
     }
 
+    let mut deleted = 0usize;
     for cached_rel_path in stamp_map.keys() {
         if !seen_paths.contains(*cached_rel_path) {
-            changed += 1;
+            deleted += 1;
         }
     }
 
-    if changed == 0 && !meta.fingerprint.is_empty() && meta.fingerprint != live_fp {
-        changed = 1;
+    let mut changed_count = added + deleted + modified;
+    if changed_count == 0 && blueprint_changed {
+        changed_count = 1;
     }
 
-    Some(changed)
+    let (scanned_files, fingerprint) = if can_build_files && !built_files.is_empty() {
+        built_files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        let mut repo_hasher = blake3::Hasher::new();
+        if let Some((_, ref bp_hash)) = blueprint_opt {
+            repo_hasher.update(b"blueprint:");
+            repo_hasher.update(bp_hash.as_bytes());
+            repo_hasher.update(b"\n");
+        }
+        for file in &built_files {
+            repo_hasher.update(file.rel_path.as_bytes());
+            repo_hasher.update(b":");
+            repo_hasher.update(&file.size_bytes.to_le_bytes());
+            repo_hasher.update(b":");
+            repo_hasher.update(file.blake3_hash.as_bytes());
+            repo_hasher.update(b"\n");
+        }
+        let fp = repo_hasher.finalize().to_hex()[..16].to_string();
+        (Some(built_files), fp)
+    } else {
+        (None, String::new())
+    };
+
+    Some(StampCheck {
+        unchanged: changed_count == 0,
+        suspects,
+        suspect_rel_paths,
+        changed_count,
+        added,
+        deleted,
+        touched_mtimes,
+        scanned_files,
+        fingerprint,
+    })
+}
+
+/// Checks how many files were added, deleted, or modified compared to `meta.file_stamps`
+/// using the stat-only `stamp_check` fast path (reading only suspect files whose `mtime`/`size` changed).
+pub fn check_meta_files_changed(
+    repo_path: &Path,
+    meta: &RepoMetadata,
+    max_file_bytes: u64,
+) -> Option<usize> {
+    stamp_check(repo_path, meta, max_file_bytes).map(|sc| sc.changed_count)
 }
 
 /// Checks how many files were added, deleted, or modified compared to `cached.files`.
@@ -586,7 +981,37 @@ pub fn assign_section_id(
 
     // Number of directory segments is `parts.len().saturating_sub(1)`
     let dir_count = parts.len().saturating_sub(1);
-    if dir_count >= 2 {
+    if dir_count >= 3
+        && matches!(
+            parts[0].to_ascii_lowercase().as_str(),
+            "src" | "fw" | "firmware" | "app" | "apps" | "source"
+        )
+        && matches!(
+            parts[1].to_ascii_lowercase().as_str(),
+            "drvs"
+                | "drv"
+                | "drivers"
+                | "driver"
+                | "libs"
+                | "lib"
+                | "app"
+                | "apps"
+                | "bsp"
+                | "services"
+                | "service"
+                | "core"
+                | "modules"
+                | "components"
+        )
+    {
+        let a = parts[0];
+        let b = parts[1];
+        let c = parts[2];
+        let module_path = format!("{a}/{b}/{c}");
+        let slug = sanitize_slug(&format!("{a}-{b}-{c}"));
+        let title = format!("{module_path} ({layer_str})");
+        (slug, title, module_path)
+    } else if dir_count >= 2 {
         let a = parts[0];
         let b = parts[1];
         let module_path = format!("{a}/{b}");
@@ -742,7 +1167,15 @@ fn is_candidate_unknown_c_qualifier(
     // Skip macros already normalized by parser.rs
     if matches!(
         first,
-        "STATIC"
+        "__I"
+            | "__O"
+            | "__IO"
+            | "__IM"
+            | "__OM"
+            | "__IOM"
+            | "__IAR_FT"
+            | "__ALIGNED"
+            | "STATIC"
             | "CONST"
             | "INLINE"
             | "__INLINE"
@@ -773,6 +1206,7 @@ fn is_candidate_unknown_c_qualifier(
         || first.ends_with("_INTERRUPT")
         || first.ends_with("_RAMFUNC")
         || first.ends_with("_PACKED")
+        || first.ends_with("_ALIGNED")
         || first.ends_with("_ATTR")
         || first.ends_with("_ATTRIBUTE")
     {
@@ -866,9 +1300,9 @@ fn is_vendor_composite_segment(lower_seg: &str) -> bool {
 }
 
 fn dir_segments_are_vendor(dir_segments: &[&str]) -> bool {
-    if let Some(first) = dir_segments.first() {
-        let lower_first = first.to_ascii_lowercase();
-        if ROOT_VENDOR_DIRS.contains(&lower_first.as_str()) {
+    for &seg in dir_segments.iter().take(2) {
+        let lower_seg = seg.to_ascii_lowercase();
+        if ROOT_VENDOR_DIRS.contains(&lower_seg.as_str()) {
             return true;
         }
     }
@@ -912,7 +1346,11 @@ fn classify_file_scope(rel_path: &str, size_bytes: u64, bytes: &[u8]) -> FileSco
         && (lower_filename.ends_with(".h") || lower_filename.ends_with(".hpp"))
         && (memchr::memmem::find(bytes, b"_TypeDef").is_some()
             || memchr::memmem::find(bytes, b"typedef struct").is_some()
-            || memchr::memmem::find(bytes, b"__IO").is_some())
+            || memchr::memmem::find(bytes, b"__IO").is_some()
+            || memchr::memmem::find(bytes, b"__IOM").is_some()
+            || memchr::memmem::find(bytes, b"__IM").is_some()
+            || memchr::memmem::find(bytes, b"__OM").is_some()
+            || memchr::memmem::find(bytes, b"__IAR_FT").is_some())
     {
         return FileScope::VendorSdk;
     }
@@ -1050,18 +1488,18 @@ fn classify_arch_layer(rel_path: &str, scope: FileScope) -> ArchLayer {
 
 fn match_segment_to_layer(lower: &str) -> Option<ArchLayer> {
     match lower {
-        "app" | "application" | "apps" | "pages" | "views" | "screens" => Some(ArchLayer::App),
+        "app" | "application" | "apps" | "web" | "frontend" | "client" | "ui" | "components"
+        | "views" | "pages" | "screens" | "widgets" | "layouts" => Some(ArchLayer::App),
         "bsp" | "board" | "boards" | "platform" => Some(ArchLayer::Bsp),
         "drvs" | "drv" | "drivers" | "driver" | "nfc" | "peripherals" => Some(ArchLayer::Drivers),
         "config" | "configs" | "cfg" => Some(ArchLayer::Config),
-        "libs" | "lib" | "utils" | "common" | "security" | "helpers" | "ui" | "components"
-        | "widgets" | "shell" | "layouts" => Some(ArchLayer::Libs),
+        "libs" | "lib" | "utils" | "common" | "security" | "helpers" | "shell" => {
+            Some(ArchLayer::Libs)
+        }
         "domain" | "models" | "entities" | "schema" | "schemas" => Some(ArchLayer::Domain),
         "services" | "service" | "sync" | "database" | "db" | "auth" | "plugins" | "features"
         | "store" => Some(ArchLayer::Services),
-        "api" | "frontend" | "routes" | "endpoints" | "controllers" | "handlers" | "web" => {
-            Some(ArchLayer::Api)
-        }
+        "api" | "routes" | "endpoints" | "controllers" | "handlers" => Some(ArchLayer::Api),
         "cli" | "bin" | "scripts" | "tools" => Some(ArchLayer::Cli),
         "core" | "engine" | "kernel" => Some(ArchLayer::Core),
         s if s.ends_with("-cli") => Some(ArchLayer::Cli),

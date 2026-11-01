@@ -222,7 +222,7 @@ fn test_full_pipeline_vendor_modes_incremental_sync_and_queries() {
     // Verify all emitted files exist (and `.claudeignore` is written inside `repo_dir`, not parent `base`)
     assert!(bundle_dir.join("INDEX.md").is_file());
     assert!(bundle_dir.join("meta.json").is_file());
-    assert!(bundle_dir.join("cache.json").is_file());
+    assert!(bundle_dir.join("cache").join("manifest.json").is_file());
     assert!(bundle_dir.join("synth_fw.md").is_file());
     assert!(repo_dir.join(".claudeignore").is_file());
     assert!(!base.0.join(".claudeignore").is_file());
@@ -514,12 +514,13 @@ void custom_boot_entry(void) {
     assert_eq!(fpga_mac.kind, MacroKind::MmioAddress);
     assert!(fpga_mac.description.contains("Custom FPGA MMIO aperture"));
 
-    // Verify `cache.json` is compact single-line JSON
-    let cache_raw = fs::read_to_string(bundle_dir.join("cache.json")).expect("read cache.json");
+    // Verify `cache/manifest.json` is compact single-line JSON
+    let cache_raw = fs::read_to_string(bundle_dir.join("cache").join("manifest.json"))
+        .expect("read cache/manifest.json");
     assert_eq!(
         cache_raw.lines().count(),
         1,
-        "cache.json must be compact JSON"
+        "cache/manifest.json must be compact JSON"
     );
 
     // 3. Modifying `.chipsrc.json` must invalidate the cache and re-parse

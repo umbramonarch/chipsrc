@@ -403,7 +403,7 @@ pub struct RawXrefSite {
     pub context: String,
 }
 
-/// Complete AST extraction output for a single file, cached in `cache.json` for incremental rebuilds.
+/// Complete AST extraction output for a single file, cached in `cache/` for incremental rebuilds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedFileUnit {
     pub scanned: ScannedFile,
@@ -416,7 +416,112 @@ pub struct ParsedFileUnit {
     pub parse_errors: usize,
 }
 
-/// Persistent per-file AST cache stored in `output/<stem>/cache.json` so incremental code edits re-parse only changed files.
+impl ParsedFileUnit {
+    /// Computes a deterministic 16-character BLAKE3 structural digest over extracted symbols,
+    /// types, macros, imports, raw calls, and raw xrefs while excluding line numbers and doc
+    /// comments so comment-only or line-shift edits can short-circuit full graph relinking.
+    pub fn structural_digest(&self) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(self.scanned.scope.as_str().as_bytes());
+        h.update(b"|");
+        h.update(self.scanned.arch_layer.as_str().as_bytes());
+        h.update(b"\n");
+        for s in &self.symbols {
+            h.update(b"S:");
+            h.update(s.name.as_bytes());
+            h.update(b"|");
+            h.update(s.kind.as_str().as_bytes());
+            h.update(b"|");
+            h.update(s.visibility.as_str().as_bytes());
+            h.update(b"|");
+            h.update(s.signature.as_bytes());
+            h.update(b"|");
+            if let Some(ref et) = s.enclosing_type {
+                h.update(et.as_bytes());
+            }
+            h.update(b"|");
+            h.update(s.scope.as_str().as_bytes());
+            h.update(b"\n");
+        }
+        for t in &self.types {
+            h.update(b"T:");
+            h.update(t.name.as_bytes());
+            h.update(b"|");
+            h.update(t.kind.as_str().as_bytes());
+            h.update(b"|");
+            h.update(t.visibility.as_str().as_bytes());
+            h.update(b"|");
+            h.update(t.fields_summary.as_bytes());
+            h.update(b"\n");
+        }
+        for m in &self.macros {
+            h.update(b"M:");
+            h.update(m.name.as_bytes());
+            h.update(b"|");
+            h.update(m.kind.as_str().as_bytes());
+            h.update(b"|");
+            h.update(m.value_or_args.as_bytes());
+            h.update(b"\n");
+        }
+        for imp in &self.imports {
+            h.update(b"I:");
+            h.update(imp.raw_path.as_bytes());
+            h.update(b"|");
+            for name in &imp.imported_names {
+                h.update(name.as_bytes());
+                h.update(b",");
+            }
+            h.update(b"\n");
+        }
+        for c in &self.raw_calls {
+            h.update(b"C:");
+            h.update(c.caller_name.as_bytes());
+            h.update(b"|");
+            h.update(c.callee_name.as_bytes());
+            h.update(b"|");
+            if let Some(ref q) = c.receiver_or_qualifier {
+                h.update(q.as_bytes());
+            }
+            h.update(b"\n");
+        }
+        for x in &self.raw_xrefs {
+            h.update(b"X:");
+            h.update(x.target_name.as_bytes());
+            h.update(b"|");
+            h.update(x.category.as_bytes());
+            h.update(b"|");
+            if let Some(ref es) = x.enclosing_symbol {
+                h.update(es.as_bytes());
+            }
+            h.update(b"\n");
+        }
+        h.finalize().to_hex()[..16].to_string()
+    }
+}
+
+/// Entry in `cache/manifest.json` pointing to a per-file AST shard (`cache/<blake3_hash>.json`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheShardEntry {
+    pub blake3_hash: String,
+    pub shard: String,
+    #[serde(default)]
+    pub structural_digest: String,
+}
+
+/// Per-file cache manifest stored at `output/<stem>/cache/manifest.json` (schema `2.0.0`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheManifest {
+    pub schema_version: String,
+    pub repo_root: String,
+    pub vendor_mode: VendorMode,
+    #[serde(default)]
+    pub fingerprint: String,
+    #[serde(default)]
+    pub blueprint_hash: String,
+    pub files: BTreeMap<String, CacheShardEntry>,
+}
+
+/// Persistent per-file AST cache stored in `output/<stem>/cache/` so incremental code edits re-parse only changed files.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IncrementalAstCache {
     pub schema_version: String,
@@ -480,11 +585,15 @@ pub struct RepoBlueprint {
     pub mmio_ranges: Vec<MmioAddressRange>,
 }
 
-/// Symbol enriched with deterministic PageRank, degree centrality, and SCC cycle info.
+/// Symbol enriched with deterministic PageRank, HITS hub/authority scores, degree centrality, and SCC cycle info.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RankedSymbol {
     pub symbol: ExtractedSymbol,
     pub pagerank: f64,
+    #[serde(default)]
+    pub hub_score: f64,
+    #[serde(default)]
+    pub authority_score: f64,
     pub in_degree: usize,
     pub out_degree: usize,
     pub is_god_node: bool,
@@ -606,6 +715,8 @@ pub struct FileStamp {
     pub size_bytes: u64,
     #[serde(default)]
     pub mtime_secs: u64,
+    #[serde(default)]
+    pub line_count: usize,
     pub blake3_hash: String,
     pub scope: FileScope,
     pub arch_layer: ArchLayer,
@@ -633,6 +744,18 @@ pub struct RepoMetadata {
     pub god_node_count: usize,
     pub entrypoint_count: usize,
     pub elapsed_ms: u64,
+    #[serde(default)]
+    pub scan_ms: u64,
+    #[serde(default)]
+    pub parse_ms: u64,
+    #[serde(default)]
+    pub link_ms: u64,
+    #[serde(default)]
+    pub graph_ms: u64,
+    #[serde(default)]
+    pub shard_ms: u64,
+    #[serde(default)]
+    pub emit_ms: u64,
     pub incremental_reused_files: usize,
     pub incremental_reparsed_files: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -661,8 +784,8 @@ pub struct BundleMetaFile {
 /// Default maximum source file size (4 MiB) indexed by `chipsrc`.
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Current schema version for `cache.json` (`IncrementalAstCache`).
-pub const CACHE_SCHEMA_VERSION: &str = "1.0.0";
+/// Current schema version for `cache/manifest.json` (`IncrementalAstCache`).
+pub const CACHE_SCHEMA_VERSION: &str = "2.0.0";
 
 /// Configuration for repository conversion / indexing.
 #[derive(Debug, Clone)]
@@ -715,6 +838,8 @@ pub struct InspectReport {
     pub detected_layers: Vec<String>,
     #[serde(default)]
     pub has_blueprint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blueprint_error: Option<String>,
     #[serde(default)]
     pub unclassified_dirs: Vec<String>,
     #[serde(default)]

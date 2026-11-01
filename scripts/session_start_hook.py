@@ -125,7 +125,7 @@ def main() -> int:
             f"{b['calls']} calls, {b['macros']} macros/MMIO, sanity {b['score']}/100)"
             for b in bundles
         )
-        lines.append(f"- Indexed codebase bundles ready (auto-synced via `cache.json`): {summary}")
+        lines.append(f"- Indexed codebase bundles ready (auto-synced via `cache/`): {summary}")
     else:
         if has_blueprint:
             lines.append(

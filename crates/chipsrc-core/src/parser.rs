@@ -35,7 +35,8 @@ pub fn parse_files_incremental_with_blueprint(
     existing_cache: Option<IncrementalAstCache>,
     blueprint: Option<&RepoBlueprint>,
 ) -> Result<(Vec<ParsedFileUnit>, usize, usize)> {
-    let mut cache_map = existing_cache.map(|c| c.files).unwrap_or_default();
+    let mut cache_map: std::collections::BTreeMap<String, ParsedFileUnit> =
+        existing_cache.map(|c| c.files).unwrap_or_default();
     let mut reused_units = Vec::new();
     let mut to_parse = Vec::new();
 
@@ -161,6 +162,7 @@ pub fn parse_source_str_with_blueprint(
         raw_xrefs: Vec::new(),
         handled_type_ranges: HashSet::new(),
         local_var_types: FxHashMap::default(),
+        local_collection_elem_types: FxHashMap::default(),
         local_vars: FxHashSet::default(),
         seen_fn_ptr_candidates: FxHashSet::default(),
         seen_field_xrefs: FxHashSet::default(),
@@ -343,7 +345,15 @@ fn classify_c_qualifier_macro_replacement(
     }
     if matches!(
         s,
-        "WEAK"
+        "__I"
+            | "__O"
+            | "__IO"
+            | "__IM"
+            | "__OM"
+            | "__IOM"
+            | "__IAR_FT"
+            | "__ALIGNED"
+            | "WEAK"
             | "__WEAK"
             | "__IRQ"
             | "__INTERRUPT"
@@ -356,6 +366,7 @@ fn classify_c_qualifier_macro_replacement(
         || s.ends_with("_INTERRUPT")
         || s.ends_with("_RAMFUNC")
         || s.ends_with("_PACKED")
+        || s.ends_with("_ALIGNED")
         || s.ends_with("_ATTR")
         || s.ends_with("_ATTRIBUTE")
     {
@@ -380,11 +391,30 @@ fn is_followed_by_c_decl_token(bytes: &[u8], mut pos: usize) -> bool {
     false
 }
 
-/// Byte-length-preserving normalization of top-level C/C++ storage-class and attribute macros.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BraceFrame {
+    /// `extern "C" { ... }` or `extern "C++" { ... }` linkage block (transparent to top-level depth).
+    Transparent,
+    /// `struct`, `union`, or `class` body where member qualifier macros (`__IO`, `__I`, etc.) appear.
+    Aggregate,
+    /// Function body or statement block where local expressions must not be rewritten.
+    Block,
+}
+
+fn blank_range_preserving_newlines(buf: &mut [u8], start: usize, end: usize) {
+    for b in &mut buf[start..end] {
+        if *b != b'\n' && *b != b'\r' {
+            *b = b' ';
+        }
+    }
+}
+
+/// Byte-length-preserving normalization of C/C++ storage-class and attribute macros.
 ///
-/// Only rewrites qualifier tokens at top-level (`brace_depth == 0 && paren_depth == 0`) that are
-/// followed by a declaration type/identifier token, leaving `enum { STATIC = 0 }`, preprocessor
-/// directives, comments, and literals completely untouched.
+/// Rewrites qualifier tokens at top-level (including inside `extern "C" { ... }` transparent frames)
+/// and inside `struct`/`union`/`class` aggregate bodies (`__IO`, `__I`, `__O`, etc.) when followed
+/// by a declaration type/identifier token, leaving function bodies, `enum { STATIC = 0 }`,
+/// preprocessor directives, comments, and literals completely untouched.
 fn normalize_c_qualifier_macros(
     source: &str,
     blueprint: Option<&RepoBlueprint>,
@@ -396,8 +426,9 @@ fn normalize_c_qualifier_macros(
     let mut in_continued_directive = false;
     let mut line_directive_known = false;
     let mut line_directive = false;
-    let mut brace_depth = 0u32;
+    let mut brace_stack: Vec<BraceFrame> = Vec::new();
     let mut paren_depth = 0u32;
+    let mut pending_aggregate = false;
 
     while i < bytes.len() {
         let b = bytes[i];
@@ -477,12 +508,36 @@ fn normalize_c_qualifier_macros(
 
         match b {
             b'{' => {
-                brace_depth = brace_depth.saturating_add(1);
+                if !line_directive_known {
+                    line_directive = line_is_preproc_directive(bytes, line_start, i);
+                    line_directive_known = true;
+                }
+                if !line_directive {
+                    let frame = if pending_aggregate && paren_depth == 0 {
+                        BraceFrame::Aggregate
+                    } else {
+                        BraceFrame::Block
+                    };
+                    brace_stack.push(frame);
+                    pending_aggregate = false;
+                }
                 i += 1;
                 continue;
             }
             b'}' => {
-                brace_depth = brace_depth.saturating_sub(1);
+                if !line_directive_known {
+                    line_directive = line_is_preproc_directive(bytes, line_start, i);
+                    line_directive_known = true;
+                }
+                if !line_directive {
+                    pending_aggregate = false;
+                    if let Some(frame) = brace_stack.pop() {
+                        if frame == BraceFrame::Transparent {
+                            let buf = out.get_or_insert_with(|| bytes.to_vec());
+                            buf[i] = b' ';
+                        }
+                    }
+                }
                 i += 1;
                 continue;
             }
@@ -493,6 +548,16 @@ fn normalize_c_qualifier_macros(
             }
             b')' => {
                 paren_depth = paren_depth.saturating_sub(1);
+                if paren_depth == 0 {
+                    pending_aggregate = false;
+                }
+                i += 1;
+                continue;
+            }
+            b';' => {
+                if paren_depth == 0 {
+                    pending_aggregate = false;
+                }
                 i += 1;
                 continue;
             }
@@ -508,9 +573,93 @@ fn normalize_c_qualifier_macros(
                 line_directive = line_is_preproc_directive(bytes, line_start, start);
                 line_directive_known = true;
             }
-            if !line_directive && brace_depth == 0 && paren_depth == 0 {
-                let token = &bytes[start..i];
+            if line_directive {
+                continue;
+            }
+
+            let token = &bytes[start..i];
+            if paren_depth == 0 && matches!(token, b"struct" | b"union" | b"class") {
+                pending_aggregate = true;
+                continue;
+            }
+
+            let allow_qual_replace = paren_depth == 0
+                && brace_stack
+                    .iter()
+                    .all(|&f| matches!(f, BraceFrame::Transparent | BraceFrame::Aggregate));
+
+            // Detect `extern "C"` / `extern "C++"` linkage blocks and single-line declarations.
+            if allow_qual_replace && token == b"extern" {
+                let mut p = i;
+                while p < bytes.len() && matches!(bytes[p], b' ' | b'\t' | b'\r') {
+                    p += 1;
+                }
+                let c_lit_end = if bytes.get(p..p + 3) == Some(b"\"C\"") {
+                    Some(p + 3)
+                } else if bytes.get(p..p + 5) == Some(b"\"C++\"") {
+                    Some(p + 5)
+                } else {
+                    None
+                };
+                if let Some(lit_end) = c_lit_end {
+                    let mut q = lit_end;
+                    while q < bytes.len() && matches!(bytes[q], b' ' | b'\t' | b'\r' | b'\n') {
+                        q += 1;
+                    }
+                    let buf = out.get_or_insert_with(|| bytes.to_vec());
+                    if bytes.get(q) == Some(&b'{') {
+                        blank_range_preserving_newlines(buf, start, q + 1);
+                        brace_stack.push(BraceFrame::Transparent);
+                        // Recompute line_start if we crossed newlines between `"C"` and `{`
+                        if let Some(rel_nl) = bytes[start..=q].iter().rposition(|&c| c == b'\n') {
+                            line_start = start + rel_nl + 1;
+                            line_directive_known = false;
+                            line_directive = false;
+                        }
+                        i = q + 1;
+                        continue;
+                    } else {
+                        blank_range_preserving_newlines(buf, p, lit_end);
+                        i = lit_end;
+                        continue;
+                    }
+                }
+            }
+
+            if allow_qual_replace {
                 if let Some(kw) = classify_c_qualifier_macro_replacement(token, blueprint) {
+                    if kw.is_empty() {
+                        // Check for function-like qualifier macro such as `__ALIGNED(4)`
+                        let mut p = i;
+                        while p < bytes.len() && matches!(bytes[p], b' ' | b'\t') {
+                            p += 1;
+                        }
+                        if bytes.get(p) == Some(&b'(') {
+                            let mut depth = 1u32;
+                            let mut q = p + 1;
+                            while q < bytes.len() && depth > 0 {
+                                match bytes[q] {
+                                    b'(' => depth += 1,
+                                    b')' => depth -= 1,
+                                    _ => {}
+                                }
+                                q += 1;
+                            }
+                            if depth == 0 && is_followed_by_c_decl_token(bytes, q) {
+                                let buf = out.get_or_insert_with(|| bytes.to_vec());
+                                blank_range_preserving_newlines(buf, start, q);
+                                if let Some(rel_nl) =
+                                    bytes[start..q].iter().rposition(|&c| c == b'\n')
+                                {
+                                    line_start = start + rel_nl + 1;
+                                    line_directive_known = false;
+                                    line_directive = false;
+                                }
+                                i = q;
+                                continue;
+                            }
+                        }
+                    }
                     if kw.len() <= token.len() && is_followed_by_c_decl_token(bytes, i) {
                         let buf = out.get_or_insert_with(|| bytes.to_vec());
                         let dst = &mut buf[start..i];
@@ -545,6 +694,7 @@ struct ExtractContext<'a> {
     raw_xrefs: Vec<RawXrefSite>,
     handled_type_ranges: HashSet<(usize, usize)>,
     local_var_types: FxHashMap<String, String>,
+    local_collection_elem_types: FxHashMap<String, String>,
     local_vars: FxHashSet<String>,
     seen_fn_ptr_candidates: FxHashSet<(usize, String)>,
     seen_field_xrefs: FxHashSet<(usize, String, bool)>,
@@ -678,9 +828,10 @@ fn walk_ast(
 
     let saved_scope = if entered_new_fn {
         let prev_types = std::mem::take(&mut ctx.local_var_types);
+        let prev_elems = std::mem::take(&mut ctx.local_collection_elem_types);
         let prev_vars = std::mem::take(&mut ctx.local_vars);
         extract_function_parameters(ctx, node);
-        Some((prev_types, prev_vars))
+        Some((prev_types, prev_elems, prev_vars))
     } else {
         None
     };
@@ -697,8 +848,9 @@ fn walk_ast(
         walk_ast(ctx, child, active_type, active_fn);
     }
 
-    if let Some((prev_types, prev_vars)) = saved_scope {
+    if let Some((prev_types, prev_elems, prev_vars)) = saved_scope {
         ctx.local_var_types = prev_types;
+        ctx.local_collection_elem_types = prev_elems;
         ctx.local_vars = prev_vars;
     }
     ctx.in_test_scope = prev_test_scope;
@@ -879,6 +1031,7 @@ fn extract_c_cpp_function(
         &name,
         effective_enclosing.as_deref(),
         forced_isr,
+        visibility,
         ctx.current_layer(),
         decl_header,
         ctx.blueprint,
@@ -1024,6 +1177,38 @@ fn extract_c_specifier_type(
     Some(name)
 }
 
+fn recover_c_field_from_raw_text(
+    raw_decl: &str,
+    blueprint: Option<&RepoBlueprint>,
+) -> Option<(String, String)> {
+    let before_semi = raw_decl.split(';').next().unwrap_or(raw_decl).trim();
+    let tokens: Vec<&str> = before_semi
+        .split_whitespace()
+        .filter(|tok| {
+            !matches!(*tok, "volatile" | "const" | "mutable")
+                && classify_c_qualifier_macro_replacement(tok.as_bytes(), blueprint).is_none()
+        })
+        .collect();
+    if tokens.len() < 2 {
+        return None;
+    }
+    let last_tok = tokens[tokens.len() - 1];
+    let field_ident = last_tok
+        .split('[')
+        .next()
+        .unwrap_or(last_tok)
+        .trim_start_matches('*')
+        .trim();
+    if !is_valid_identifier(field_ident) {
+        return None;
+    }
+    let real_type = tokens[..tokens.len() - 1].join(" ");
+    if real_type.is_empty() {
+        return None;
+    }
+    Some((real_type, field_ident.to_string()))
+}
+
 fn summarize_c_type_fields(type_node: Node<'_>, bytes: &[u8]) -> String {
     let Some(body) = type_node.child_by_field_name("body") else {
         return String::new();
@@ -1041,6 +1226,14 @@ fn summarize_c_type_fields(type_node: Node<'_>, bytes: &[u8]) -> String {
                     .child_by_field_name("type")
                     .map(|n| normalize_whitespace(node_text(n, bytes)))
                     .unwrap_or_default();
+                if classify_c_qualifier_macro_replacement(ty_txt.as_bytes(), None).is_some() {
+                    if let Some((real_ty, real_field)) =
+                        recover_c_field_from_raw_text(node_text(child, bytes), None)
+                    {
+                        items.push(format!("{real_field}: {real_ty}"));
+                        continue;
+                    }
+                }
                 if let Some(decl) = child.child_by_field_name("declarator") {
                     if let Some(fname) = extract_declarator_name(decl, bytes) {
                         if !ty_txt.is_empty() {
@@ -1394,6 +1587,7 @@ fn extract_rust_function(
         &name,
         enclosing_type,
         has_isr_attr,
+        visibility,
         ctx.current_layer(),
         decl_header,
         ctx.blueprint,
@@ -1785,6 +1979,7 @@ fn extract_python_function(
         &name,
         enclosing_type,
         false,
+        visibility,
         ctx.current_layer(),
         decl_header,
         ctx.blueprint,
@@ -2193,6 +2388,7 @@ fn extract_ts_js_function(
         &name,
         enclosing_type,
         false,
+        visibility,
         ctx.current_layer(),
         decl_header,
         ctx.blueprint,
@@ -2258,6 +2454,7 @@ fn extract_ts_js_arrow_or_const(
             &name,
             enclosing_type,
             false,
+            visibility,
             ctx.current_layer(),
             decl_header,
             ctx.blueprint,
@@ -2304,6 +2501,7 @@ fn extract_ts_js_arrow_or_const(
                 &name,
                 enclosing_type,
                 false,
+                Visibility::Public,
                 ctx.current_layer(),
                 decl_header,
                 ctx.blueprint,
@@ -2780,10 +2978,12 @@ fn parse_callee_expression(raw: &str) -> Option<(String, Option<String>)> {
     Some((leaf.to_string(), qualifier))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify_symbol_kind(
     name: &str,
     enclosing_type: Option<&str>,
     has_isr_attr: bool,
+    visibility: Visibility,
     arch_layer: ArchLayer,
     decl_header: &str,
     blueprint: Option<&RepoBlueprint>,
@@ -2813,9 +3013,16 @@ fn classify_symbol_kind(
     }
 
     // 2. ISR handlers (checked strictly against `decl_header` and `has_isr_attr`, never the function body)
+    let is_isr_name = name.ends_with("IRQHandler")
+        || name.ends_with("IrqHandler")
+        || name.ends_with("_ISR")
+        || (name.ends_with("_Handler")
+            && !matches!(
+                name,
+                "Error_Handler" | "Assert_Handler" | "assert_failed" | "Default_Handler_Weak"
+            ));
     if has_isr_attr
-        || name.ends_with("_IRQHandler")
-        || name.ends_with("_Handler")
+        || is_isr_name
         || name.starts_with("ISR(")
         || name.starts_with("SIGNAL(")
         || name.starts_with("__vector_")
@@ -2840,12 +3047,23 @@ fn classify_symbol_kind(
     }
 
     // 5. Top-level CLI/API/App entrypoints
+    let has_route_evidence = decl_header.contains("@app.")
+        || decl_header.contains("@router.")
+        || decl_header.contains("#[get")
+        || decl_header.contains("#[post")
+        || decl_header.contains("#[put")
+        || decl_header.contains("#[delete")
+        || decl_header.contains("app.get(")
+        || decl_header.contains("router.");
+    let is_handle_entrypoint = name.starts_with("handle_")
+        && (has_route_evidence
+            || (arch_layer == ArchLayer::Api && visibility == Visibility::Public));
+
     if matches!(arch_layer, ArchLayer::Cli | ArchLayer::Api | ArchLayer::App)
         && (name.starts_with("cmd_")
-            || name.starts_with("handle_")
+            || is_handle_entrypoint
             || is_http_method_handler(name)
-            || decl_header.contains("@app.")
-            || decl_header.contains("@router."))
+            || has_route_evidence)
     {
         return SymbolKind::Entrypoint;
     }
@@ -2952,6 +3170,195 @@ fn clean_type_name(raw_type: &str) -> Option<String> {
     Some(s.to_string())
 }
 
+/// Extracts the element or payload type `T` from collection, slice, iterator, option, result,
+/// or map type annotations (`&[T]`, `&mut [T]`, `Vec<T>`, `Option<T>`, `Box<[T]>`,
+/// `impl Iterator<Item = T>`, `[T; N]`, `List[T]`, `T[]`, `Array<T>`, `BTreeMap<K, V>`).
+fn elem_type_of(raw_type: &str) -> Option<String> {
+    let mut s = raw_type
+        .trim()
+        .trim_start_matches(':')
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim_start_matches("const ")
+        .trim();
+
+    if let Some(after_item) = s.find("Item") {
+        let rest = &s[after_item + 4..];
+        if let Some(eq_idx) = rest.find('=') {
+            let after_eq = rest[eq_idx + 1..].trim();
+            let inner = after_eq.split(['>', ',']).next().unwrap_or(after_eq).trim();
+            return elem_type_of(inner).or_else(|| clean_type_name(inner));
+        }
+    }
+
+    if let Some(inner) = s.strip_prefix("Box<[").and_then(|r| r.strip_suffix("]>")) {
+        return elem_type_of(inner).or_else(|| clean_type_name(inner));
+    }
+
+    if let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        let elem_part = inner.split(';').next().unwrap_or(inner).trim();
+        return elem_type_of(elem_part).or_else(|| clean_type_name(elem_part));
+    }
+
+    if let Some(inner) = s.strip_suffix("[]") {
+        return elem_type_of(inner).or_else(|| clean_type_name(inner));
+    }
+
+    if let Some((wrapper, rest)) = s.split_once('<') {
+        if let Some(inner) = rest.strip_suffix('>') {
+            let w_leaf = wrapper
+                .trim()
+                .rsplit_once("::")
+                .map(|(_, l)| l.trim())
+                .unwrap_or(wrapper.trim());
+            match w_leaf {
+                "Vec" | "Option" | "Array" | "ReadonlyArray" | "Set" | "BTreeSet" | "HashSet"
+                | "FxHashSet" | "VecDeque" | "SmallVec" | "LinkedList" | "Arc" | "Rc" | "Box" => {
+                    return elem_type_of(inner).or_else(|| clean_type_name(inner));
+                }
+                "Result" => {
+                    let ok_part = split_top_level_comma(inner)
+                        .first()
+                        .copied()
+                        .unwrap_or(inner);
+                    return elem_type_of(ok_part).or_else(|| clean_type_name(ok_part));
+                }
+                "BTreeMap" | "HashMap" | "FxHashMap" | "Map" => {
+                    let parts = split_top_level_comma(inner);
+                    if parts.len() >= 2 {
+                        let val_part = parts[1];
+                        return elem_type_of(val_part).or_else(|| clean_type_name(val_part));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some((wrapper, rest)) = s.split_once('[') {
+        if let Some(inner) = rest.strip_suffix(']') {
+            let w_leaf = wrapper
+                .trim()
+                .rsplit_once('.')
+                .map(|(_, l)| l.trim())
+                .unwrap_or(wrapper.trim());
+            if matches!(
+                w_leaf,
+                "List" | "list" | "Sequence" | "Iterable" | "Optional" | "Set" | "set" | "Tuple"
+            ) {
+                let first_part = split_top_level_comma(inner)
+                    .first()
+                    .copied()
+                    .unwrap_or(inner);
+                return elem_type_of(first_part).or_else(|| clean_type_name(first_part));
+            }
+        }
+    }
+
+    s = s.trim_end_matches('*').trim();
+    let _ = s;
+    None
+}
+
+fn split_top_level_comma(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '<' | '(' | '[' | '{' => depth += 1,
+            '>' | ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(s[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim());
+    out
+}
+
+fn extract_root_collection_ident(expr_txt: &str) -> Option<&str> {
+    let mut s = expr_txt.trim();
+    while let Some(rest) = s
+        .strip_prefix('&')
+        .or_else(|| s.strip_prefix("mut "))
+        .or_else(|| s.strip_prefix('*'))
+        .or_else(|| s.strip_prefix('('))
+    {
+        s = rest.trim();
+    }
+    let head = s
+        .split(['.', '(', '[', '?'])
+        .next()
+        .unwrap_or(s)
+        .trim()
+        .trim_end_matches(')');
+    if is_valid_identifier(head) {
+        Some(head)
+    } else {
+        None
+    }
+}
+
+fn resolve_collection_elem_type(
+    expr_txt: &str,
+    local_collection_elem_types: &FxHashMap<String, String>,
+    local_var_types: &FxHashMap<String, String>,
+) -> Option<String> {
+    if let Some(root) = extract_root_collection_ident(expr_txt) {
+        if let Some(elem_ty) = local_collection_elem_types.get(root) {
+            return Some(elem_ty.clone());
+        }
+        if let Some(var_ty) = local_var_types.get(root) {
+            return Some(var_ty.clone());
+        }
+    }
+    None
+}
+
+fn clean_loop_pattern_ident(raw_pat: &str) -> Option<String> {
+    let mut s = raw_pat.trim();
+    for prefix in ["const ", "let ", "var ", "auto "] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim();
+        }
+    }
+    loop {
+        if let Some(rest) = s.strip_prefix('&') {
+            s = rest.trim();
+        } else if let Some(rest) = s.strip_prefix("mut ") {
+            s = rest.trim();
+        } else if let Some(rest) = s.strip_prefix("ref ") {
+            s = rest.trim();
+        } else if let Some(rest) = s.strip_prefix('*') {
+            s = rest.trim();
+        } else {
+            break;
+        }
+    }
+    if is_valid_identifier(s) {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_unwrapped_pattern_ident(raw_pat: &str) -> Option<String> {
+    let trimmed = raw_pat.trim();
+    for wrapper in ["Some(", "Ok(", "Err("] {
+        if let Some(inner) = trimmed
+            .strip_prefix(wrapper)
+            .and_then(|r| r.strip_suffix(')'))
+        {
+            return clean_loop_pattern_ident(inner);
+        }
+    }
+    None
+}
+
 fn is_builtin_or_primitive_type(s: &str) -> bool {
     matches!(
         s,
@@ -3038,13 +3445,17 @@ fn extract_function_parameters(ctx: &mut ExtractContext<'_>, fn_node: Node<'_>) 
                             .trim()
                             .to_string()
                     });
-                let ty_name = param
+                let raw_ty = param
                     .child_by_field_name("type")
-                    .map(|t| node_text(t, ctx.bytes))
-                    .and_then(clean_type_name);
+                    .map(|t| node_text(t, ctx.bytes));
+                let ty_name = raw_ty.and_then(clean_type_name);
+                let elem_ty = raw_ty.and_then(elem_type_of);
                 if let Some(vn) = var_name {
                     if is_valid_identifier(&vn) {
                         ctx.local_vars.insert(vn.clone());
+                        if let Some(et) = elem_ty {
+                            ctx.local_collection_elem_types.insert(vn.clone(), et);
+                        }
                         if let Some(tn) = ty_name {
                             ctx.local_var_types.insert(vn, tn);
                         }
@@ -3061,13 +3472,17 @@ fn extract_function_parameters(ctx: &mut ExtractContext<'_>, fn_node: Node<'_>) 
                         .trim()
                         .to_string()
                 });
-                let ty_name = param
+                let raw_ty = param
                     .child_by_field_name("type")
-                    .map(|t| node_text(t, ctx.bytes))
-                    .and_then(clean_type_name);
+                    .map(|t| node_text(t, ctx.bytes));
+                let ty_name = raw_ty.and_then(clean_type_name);
+                let elem_ty = raw_ty.and_then(elem_type_of);
                 if let Some(vn) = var_name {
                     if is_valid_identifier(&vn) {
                         ctx.local_vars.insert(vn.clone());
+                        if let Some(et) = elem_ty {
+                            ctx.local_collection_elem_types.insert(vn.clone(), et);
+                        }
                         if let Some(tn) = ty_name {
                             ctx.local_var_types.insert(vn, tn);
                         }
@@ -3084,13 +3499,17 @@ fn extract_function_parameters(ctx: &mut ExtractContext<'_>, fn_node: Node<'_>) 
                         .or_else(|| param.named_child(0))
                         .map(|n| node_text(n, ctx.bytes).trim().to_string())
                 };
-                let ty_name = param
+                let raw_ty = param
                     .child_by_field_name("type")
-                    .map(|t| node_text(t, ctx.bytes))
-                    .and_then(clean_type_name);
+                    .map(|t| node_text(t, ctx.bytes));
+                let ty_name = raw_ty.and_then(clean_type_name);
+                let elem_ty = raw_ty.and_then(elem_type_of);
                 if let Some(vn) = var_name {
                     if is_valid_identifier(&vn) && vn != "self" && vn != "cls" {
                         ctx.local_vars.insert(vn.clone());
+                        if let Some(et) = elem_ty {
+                            ctx.local_collection_elem_types.insert(vn.clone(), et);
+                        }
                         if let Some(tn) = ty_name {
                             ctx.local_var_types.insert(vn, tn);
                         }
@@ -3103,13 +3522,17 @@ fn extract_function_parameters(ctx: &mut ExtractContext<'_>, fn_node: Node<'_>) 
                     .child_by_field_name("pattern")
                     .or_else(|| param.named_child(0))
                     .map(|p| node_text(p, ctx.bytes).trim().to_string());
-                let ty_name = param
+                let raw_ty = param
                     .child_by_field_name("type")
-                    .map(|t| node_text(t, ctx.bytes))
-                    .and_then(clean_type_name);
+                    .map(|t| node_text(t, ctx.bytes));
+                let ty_name = raw_ty.and_then(clean_type_name);
+                let elem_ty = raw_ty.and_then(elem_type_of);
                 if let Some(vn) = var_name {
                     if is_valid_identifier(&vn) && vn != "this" {
                         ctx.local_vars.insert(vn.clone());
+                        if let Some(et) = elem_ty {
+                            ctx.local_collection_elem_types.insert(vn.clone(), et);
+                        }
                         if let Some(tn) = ty_name {
                             ctx.local_var_types.insert(vn, tn);
                         }
@@ -3223,31 +3646,194 @@ fn extract_local_var_binding(
             }
         }
         "let_declaration" => {
-            // Rust `let [mut] var[: Type] = expr;`
+            // Rust `let [mut] var[: Type] = expr;` or `let (a, b)[: (TA, TB)] = expr;`
             let Some(pat) = node.child_by_field_name("pattern") else {
                 return;
             };
-            let vn = node_text(pat, ctx.bytes)
-                .trim()
-                .trim_start_matches("mut ")
-                .trim_start_matches("ref ")
-                .trim_start_matches('&')
-                .trim()
-                .to_string();
-            if !is_valid_identifier(&vn) {
+            let raw_ty = node
+                .child_by_field_name("type")
+                .map(|t| node_text(t, ctx.bytes));
+
+            if pat.kind() == "tuple_pattern" {
+                let pat_inner = node_text(pat, ctx.bytes)
+                    .trim()
+                    .trim_start_matches('(')
+                    .trim_end_matches(')');
+                let pat_vars: Vec<&str> = split_top_level_comma(pat_inner);
+                let ty_elems: Vec<&str> = raw_ty
+                    .map(|rt| {
+                        let inner = rt.trim().trim_start_matches('(').trim_end_matches(')');
+                        split_top_level_comma(inner)
+                    })
+                    .unwrap_or_default();
+
+                for (idx, raw_v) in pat_vars.into_iter().enumerate() {
+                    if let Some(vn) = clean_loop_pattern_ident(raw_v) {
+                        ctx.local_vars.insert(vn.clone());
+                        if let Some(&ty_str) = ty_elems.get(idx) {
+                            if let Some(et) = elem_type_of(ty_str) {
+                                ctx.local_collection_elem_types.insert(vn.clone(), et);
+                            }
+                            if let Some(tn) = clean_type_name(ty_str) {
+                                ctx.local_var_types.insert(vn, tn);
+                            }
+                        }
+                    }
+                }
                 return;
             }
+
+            let Some(vn) = clean_loop_pattern_ident(node_text(pat, ctx.bytes)) else {
+                return;
+            };
             ctx.local_vars.insert(vn.clone());
-            let resolved_ty = node
-                .child_by_field_name("type")
-                .map(|t| node_text(t, ctx.bytes))
-                .and_then(clean_type_name)
-                .or_else(|| {
-                    node.child_by_field_name("value")
-                        .and_then(|v| infer_type_from_init_expr(v, ctx.bytes))
-                });
+
+            let elem_ty = raw_ty.and_then(elem_type_of).or_else(|| {
+                node.child_by_field_name("value").and_then(|v| {
+                    resolve_collection_elem_type(
+                        node_text(v, ctx.bytes),
+                        &ctx.local_collection_elem_types,
+                        &ctx.local_var_types,
+                    )
+                })
+            });
+            if let Some(et) = elem_ty {
+                ctx.local_collection_elem_types.insert(vn.clone(), et);
+            }
+
+            let resolved_ty = raw_ty.and_then(clean_type_name).or_else(|| {
+                node.child_by_field_name("value")
+                    .and_then(|v| infer_type_from_init_expr(v, ctx.bytes))
+            });
             if let Some(ty) = resolved_ty {
                 ctx.local_var_types.insert(vn, ty);
+            }
+        }
+        "let_condition" => {
+            // Rust `if let Some(x) = expr` / `while let Ok(x) = expr`
+            let Some(pat) = node.child_by_field_name("pattern") else {
+                return;
+            };
+            let Some(vn) = extract_unwrapped_pattern_ident(node_text(pat, ctx.bytes)) else {
+                return;
+            };
+            ctx.local_vars.insert(vn.clone());
+            if let Some(val_node) = node.child_by_field_name("value") {
+                let val_txt = node_text(val_node, ctx.bytes);
+                let resolved_ty = resolve_collection_elem_type(
+                    val_txt,
+                    &ctx.local_collection_elem_types,
+                    &ctx.local_var_types,
+                )
+                .or_else(|| infer_type_from_init_expr(val_node, ctx.bytes));
+                if let Some(ty) = resolved_ty {
+                    ctx.local_var_types.insert(vn, ty);
+                }
+            }
+        }
+        "for_expression" => {
+            // Rust `for var in expr { ... }`
+            let Some(pat) = node.child_by_field_name("pattern") else {
+                return;
+            };
+            let Some(vn) = clean_loop_pattern_ident(node_text(pat, ctx.bytes)) else {
+                return;
+            };
+            ctx.local_vars.insert(vn.clone());
+            if let Some(val_node) = node.child_by_field_name("value") {
+                let val_txt = node_text(val_node, ctx.bytes);
+                if let Some(ty) = resolve_collection_elem_type(
+                    val_txt,
+                    &ctx.local_collection_elem_types,
+                    &ctx.local_var_types,
+                ) {
+                    ctx.local_var_types.insert(vn, ty);
+                }
+            }
+        }
+        "for_statement" | "for_in_statement" | "for_of_statement" => {
+            // Python `for x in items:` and JS/TS `for (const x of items)` / `for (const k in obj)`
+            let Some(left) = node.child_by_field_name("left") else {
+                return;
+            };
+            let Some(vn) = clean_loop_pattern_ident(node_text(left, ctx.bytes)) else {
+                return;
+            };
+            ctx.local_vars.insert(vn.clone());
+            if let Some(right) = node.child_by_field_name("right") {
+                let right_txt = node_text(right, ctx.bytes);
+                if let Some(ty) = resolve_collection_elem_type(
+                    right_txt,
+                    &ctx.local_collection_elem_types,
+                    &ctx.local_var_types,
+                ) {
+                    ctx.local_var_types.insert(vn, ty);
+                }
+            }
+        }
+        "for_range_loop" => {
+            // C++ `for (const auto& x : items)`
+            let decl = node.child_by_field_name("declarator");
+            let vn_opt = decl
+                .and_then(|d| extract_declarator_name(d, ctx.bytes))
+                .and_then(|s| clean_loop_pattern_ident(&s));
+            let Some(vn) = vn_opt else {
+                return;
+            };
+            ctx.local_vars.insert(vn.clone());
+            let explicit_ty = node
+                .child_by_field_name("type")
+                .map(|t| node_text(t, ctx.bytes))
+                .and_then(clean_type_name);
+            let resolved_ty = explicit_ty.or_else(|| {
+                node.child_by_field_name("right").and_then(|r| {
+                    resolve_collection_elem_type(
+                        node_text(r, ctx.bytes),
+                        &ctx.local_collection_elem_types,
+                        &ctx.local_var_types,
+                    )
+                })
+            });
+            if let Some(ty) = resolved_ty {
+                ctx.local_var_types.insert(vn, ty);
+            }
+        }
+        "closure_expression" => {
+            // Rust closure `|unit| { ... }` inside `.filter(|unit| ...)` / `.map(|unit| ...)`
+            let Some(params) = node.child_by_field_name("parameters") else {
+                return;
+            };
+            let raw_params = node_text(params, ctx.bytes).trim().trim_matches('|').trim();
+            if raw_params.contains(',') || raw_params.is_empty() {
+                return;
+            }
+            let (raw_pat, explicit_ty) = match raw_params.split_once(':') {
+                Some((p, t)) => (p.trim(), clean_type_name(t)),
+                None => (raw_params, None),
+            };
+            let Some(vn) = clean_loop_pattern_ident(raw_pat) else {
+                return;
+            };
+            ctx.local_vars.insert(vn.clone());
+            if let Some(ty) = explicit_ty {
+                ctx.local_var_types.insert(vn, ty);
+                return;
+            }
+            if let Some(call_parent) = node
+                .parent()
+                .and_then(|p| p.parent())
+                .filter(|gp| gp.kind() == "call_expression")
+            {
+                if let Some(fn_node) = call_parent.child_by_field_name("function") {
+                    let fn_txt = node_text(fn_node, ctx.bytes);
+                    if let Some(ty) = resolve_collection_elem_type(
+                        fn_txt,
+                        &ctx.local_collection_elem_types,
+                        &ctx.local_var_types,
+                    ) {
+                        ctx.local_var_types.insert(vn, ty);
+                    }
+                }
             }
         }
         "assignment" => {
@@ -3267,14 +3853,16 @@ fn extract_local_var_binding(
             if !raw_left.starts_with("self.") {
                 ctx.local_vars.insert(vn.clone());
             }
-            let resolved_ty = node
+            let raw_ty = node
                 .child_by_field_name("type")
-                .map(|t| node_text(t, ctx.bytes))
-                .and_then(clean_type_name)
-                .or_else(|| {
-                    node.child_by_field_name("right")
-                        .and_then(|v| infer_type_from_init_expr(v, ctx.bytes))
-                });
+                .map(|t| node_text(t, ctx.bytes));
+            if let Some(et) = raw_ty.and_then(elem_type_of) {
+                ctx.local_collection_elem_types.insert(vn.clone(), et);
+            }
+            let resolved_ty = raw_ty.and_then(clean_type_name).or_else(|| {
+                node.child_by_field_name("right")
+                    .and_then(|v| infer_type_from_init_expr(v, ctx.bytes))
+            });
             if let Some(ty) = resolved_ty {
                 ctx.local_var_types.insert(vn, ty);
             }
@@ -3296,14 +3884,16 @@ fn extract_local_var_binding(
                     return;
                 }
                 ctx.local_vars.insert(vn.clone());
-                let resolved_ty = node
+                let raw_ty = node
                     .child_by_field_name("type")
-                    .map(|t| node_text(t, ctx.bytes))
-                    .and_then(clean_type_name)
-                    .or_else(|| {
-                        node.child_by_field_name("value")
-                            .and_then(|v| infer_type_from_init_expr(v, ctx.bytes))
-                    });
+                    .map(|t| node_text(t, ctx.bytes));
+                if let Some(et) = raw_ty.and_then(elem_type_of) {
+                    ctx.local_collection_elem_types.insert(vn.clone(), et);
+                }
+                let resolved_ty = raw_ty.and_then(clean_type_name).or_else(|| {
+                    node.child_by_field_name("value")
+                        .and_then(|v| infer_type_from_init_expr(v, ctx.bytes))
+                });
                 if let Some(ty) = resolved_ty {
                     ctx.local_var_types.insert(vn, ty);
                 }

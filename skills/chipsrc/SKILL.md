@@ -13,20 +13,22 @@ description: >-
 Avoid reading multi-thousand-line source files or vendor SDK headers just to inspect function
 signatures, struct layouts, or call graphs. Use `chipsrc` to index repositories locally at zero
 LLM token cost into a **Hierarchical Agent Codebase Bundle** (`INDEX.md` + `index/*.tsv` +
-`sections/*.md` signature skeletons + incremental `cache.json`) and retrieve exact structural
+`sections/*.md` signature skeletons + incremental `cache/` shards) and retrieve exact structural
 facts in a **single CLI call**.
 
 ## 1. Check Workspace, Inspect, & Ensure Bundles Exist
 
 Before running multi-turn `Grep` + `Read` loops, check which bundles exist or ensure the target
-repository is indexed. `chipsrc` caches per-file AST extractions in `output/<repo>/cache.json`:
-full BLAKE3 cache hits return in **<2 ms**, and single-file edits incrementally re-parse only
-the modified file in **<50 ms**:
+repository is indexed. `chipsrc` caches per-file AST extractions in `output/<repo>/cache/`:
+stat-only BLAKE3 stamp hits return in **<2 ms**, comment-only edits short-circuit in **<25 ms**,
+and single-file structural edits incrementally re-parse only the modified file in **<50 ms**:
 
 ```bash
 # List all indexed codebase bundles in ./output and their live freshness (FRESH vs STALE)
 chipsrc status
 chipsrc status --sync
+chipsrc status --check          # Exit 2 when any bundle is STALE (CI check)
+```
 
 # Inspect language breakdown, first-party vs vendor SDK file counts, architectural layers, and Onboarding Digest
 chipsrc inspect .

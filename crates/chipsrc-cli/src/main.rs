@@ -1,14 +1,15 @@
 use anyhow::{Context, Result};
 use chipsrc_core::query::{
     parallel_bundle_search, query_call_path, query_callees, query_callers, query_impact,
-    query_macros, query_sections, query_symbols, query_types, query_xref, resolve_bundles,
-    resolve_target_and_query, workspace_status,
+    query_macros, query_sections, query_subcommand_json, query_symbols, query_types, query_xref,
+    resolve_bundles, resolve_target_and_query, workspace_status,
 };
 use chipsrc_core::{
     auto_refresh_bundles, convert_repo, ensure_repo, inspect_repo, ConversionBundle, ConvertConfig,
-    VendorMode,
+    LanguageKind, VendorMode,
 };
 use clap::{Parser, Subcommand};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
@@ -46,6 +47,10 @@ enum Commands {
         /// Vendor SDK handling mode (`active`, `all`, `none`)
         #[arg(long, default_value = "active")]
         vendor_mode: String,
+
+        /// Print per-stage pipeline timing breakdown (`scan`, `parse`, `link`, `graph`, `shard`, `emit`)
+        #[arg(long)]
+        timings: bool,
     },
 
     /// Ensure one or more repositories are indexed and incrementally synchronized (`<2ms` on cache hit)
@@ -69,6 +74,10 @@ enum Commands {
         /// Vendor SDK handling mode (`active`, `all`, `none`)
         #[arg(long, default_value = "active")]
         vendor_mode: String,
+
+        /// Print per-stage pipeline timing breakdown (`scan`, `parse`, `link`, `graph`, `shard`, `emit`)
+        #[arg(long)]
+        timings: bool,
     },
 
     /// Show indexed codebase bundles and their live freshness status (`FRESH` vs `STALE`)
@@ -80,6 +89,14 @@ enum Commands {
         /// Immediately synchronize any stale bundles via incremental AST cache refresh
         #[arg(long)]
         sync: bool,
+
+        /// Exit with status code 2 when any indexed bundle is STALE (for CI checks)
+        #[arg(long)]
+        check: bool,
+
+        /// Emit status entries as pretty-printed JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Inspect a repository's language breakdown, first-party vs vendor SDK scope, and architectural layers
@@ -100,6 +117,7 @@ enum Commands {
     /// Look up function, method, constructor, entrypoint, or ISR definitions in 1 turn
     Sym {
         /// Either `<query>` (searches `./output`) or `<bundle_or_repo>` followed by `<query>`
+        #[arg(default_value = "")]
         target_or_query: String,
 
         /// Optional `<query>` when the first positional argument is a bundle/repo path
@@ -124,6 +142,10 @@ enum Commands {
         /// Skip automatic incremental bundle refresh before querying
         #[arg(long)]
         no_sync: bool,
+
+        /// Emit matching symbols as pretty-printed JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// List all static callers of a function, method, or ISR across the codebase
@@ -149,6 +171,10 @@ enum Commands {
         /// Skip automatic incremental bundle refresh before querying
         #[arg(long)]
         no_sync: bool,
+
+        /// Emit caller edges as pretty-printed JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// List all static callees invoked by a function, method, or ISR
@@ -174,11 +200,16 @@ enum Commands {
         /// Skip automatic incremental bundle refresh before querying
         #[arg(long)]
         no_sync: bool,
+
+        /// Emit callee edges as pretty-printed JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Look up struct, enum, union, trait, interface, class, or typedef layouts and fields
     Type {
         /// Either `<query>` or `<bundle_or_repo>` followed by `<query>`
+        #[arg(default_value = "")]
         target_or_query: String,
 
         /// Optional `<query>` when the first positional argument is a bundle/repo path
@@ -199,12 +230,17 @@ enum Commands {
         /// Skip automatic incremental bundle refresh before querying
         #[arg(long)]
         no_sync: bool,
+
+        /// Emit matching types as pretty-printed JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Look up `#define` macros, constants, bitmasks, and MMIO register hex addresses (`0x41C00004`, `400h`)
     #[command(visible_alias = "reg", visible_alias = "mmio")]
     Macro {
         /// Either `<query>` or `<bundle_or_repo>` followed by `<query>`
+        #[arg(default_value = "")]
         target_or_query: String,
 
         /// Optional `<query>` when the first positional argument is a bundle/repo path
@@ -225,6 +261,10 @@ enum Commands {
         /// Skip automatic incremental bundle refresh before querying
         #[arg(long)]
         no_sync: bool,
+
+        /// Emit matching macros/MMIO registers as pretty-printed JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// List or inspect architectural module shards (`sections/*.md`)
@@ -251,6 +291,10 @@ enum Commands {
         /// Skip automatic incremental bundle refresh before querying
         #[arg(long)]
         no_sync: bool,
+
+        /// Emit matching section summaries as pretty-printed JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Traverse the Unified Code + Hardware Cross-Reference Graph (`index/xref.tsv`)
@@ -273,6 +317,10 @@ enum Commands {
         /// Skip automatic incremental bundle refresh before querying
         #[arg(long)]
         no_sync: bool,
+
+        /// Emit cross-reference edges as pretty-printed JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Find the shortest static call path (`from -> ... -> to`) across the call graph
@@ -291,12 +339,16 @@ enum Commands {
         bundle: Option<PathBuf>,
 
         /// Maximum BFS hop depth to search
-        #[arg(short = 'd', long, default_value_t = 8)]
+        #[arg(short = 'd', long, visible_alias = "depth", default_value_t = 8)]
         max_depth: usize,
 
         /// Skip automatic incremental bundle refresh before querying
         #[arg(long)]
         no_sync: bool,
+
+        /// Emit call path result as pretty-printed JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Compute the reverse-BFS blast radius (`callee <- caller <- ...`) of modifying a symbol
@@ -312,7 +364,7 @@ enum Commands {
         bundle: Option<PathBuf>,
 
         /// Maximum reverse-BFS hop depth
-        #[arg(short = 'd', long, default_value_t = 5)]
+        #[arg(short = 'd', long, visible_alias = "depth", default_value_t = 5)]
         max_depth: usize,
 
         /// Maximum impacted callers to display
@@ -322,6 +374,10 @@ enum Commands {
         /// Skip automatic incremental bundle refresh before querying
         #[arg(long)]
         no_sync: bool,
+
+        /// Emit impact analysis as pretty-printed JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Parallel SIMD + Regex search across all indexed Agent Codebase Bundles
@@ -359,7 +415,26 @@ enum Commands {
         /// Skip automatic incremental bundle refresh before querying
         #[arg(long)]
         no_sync: bool,
+
+        /// Emit search hits as pretty-printed JSON
+        #[arg(long)]
+        json: bool,
     },
+
+    /// Native Claude Code plugin hooks (`session-start`, `post-edit`)
+    #[command(hide = true)]
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HookAction {
+    /// Run the SessionStart bundle discovery and refresh hook natively in Rust
+    SessionStart,
+    /// Run the PostToolUse (Edit|Write|MultiEdit) incremental auto-sync hook natively in Rust
+    PostEdit,
 }
 
 fn main() -> Result<()> {
@@ -372,6 +447,7 @@ fn main() -> Result<()> {
             single_file,
             force,
             vendor_mode,
+            timings,
         } => {
             let vmode = parse_vendor_mode(&vendor_mode)?;
             let output_dir = match output {
@@ -395,7 +471,7 @@ fn main() -> Result<()> {
 
             let bundle = convert_repo(&cfg)
                 .with_context(|| format!("Failed to index repository '{}'", repo.display()))?;
-            print_conversion_summary(&bundle);
+            print_conversion_summary(&bundle, timings);
         }
 
         Commands::Ensure {
@@ -403,6 +479,7 @@ fn main() -> Result<()> {
             output_root,
             force,
             vendor_mode,
+            timings,
         } => {
             let vmode = parse_vendor_mode(&vendor_mode)?;
             let targets = if repos.is_empty() {
@@ -436,10 +513,22 @@ fn main() -> Result<()> {
                     bundle.sanity.score,
                     bundle.metadata.elapsed_ms,
                 );
+                if timings {
+                    let m = &bundle.metadata;
+                    println!(
+                        "    [ok] Timings     : scan={}ms parse={}ms link={}ms graph={}ms shard={}ms emit={}ms (total={}ms)",
+                        m.scan_ms, m.parse_ms, m.link_ms, m.graph_ms, m.shard_ms, m.emit_ms, m.elapsed_ms
+                    );
+                }
             }
         }
 
-        Commands::Status { workspace, sync } => {
+        Commands::Status {
+            workspace,
+            sync,
+            check,
+            json,
+        } => {
             let mut entries = workspace_status(&workspace).with_context(|| {
                 format!(
                     "Failed to scan workspace status at '{}'",
@@ -452,9 +541,21 @@ fn main() -> Result<()> {
                     entries.iter().map(|e| e.bundle_dir.clone()).collect();
                 let refreshed = auto_refresh_bundles(&bundle_dirs)?;
                 if refreshed > 0 {
-                    println!("Synchronized {refreshed} stale bundle(s).");
+                    if !json {
+                        println!("Synchronized {refreshed} stale bundle(s).");
+                    }
                     entries = workspace_status(&workspace)?;
                 }
+            }
+
+            let any_stale = entries.iter().any(|e| !e.is_fresh);
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+                if check && any_stale {
+                    std::process::exit(2);
+                }
+                return Ok(());
             }
 
             println!("=== chipsrc Workspace Status ({}) ===", workspace.display());
@@ -478,6 +579,10 @@ fn main() -> Result<()> {
                     );
                 }
             }
+
+            if check && any_stale {
+                std::process::exit(2);
+            }
         }
 
         Commands::Inspect {
@@ -499,10 +604,12 @@ fn main() -> Result<()> {
             println!("Fingerprint    : {}", report.fingerprint);
             println!(
                 "Blueprint      : {}",
-                if report.has_blueprint {
-                    "present (.chipsrc.json)"
+                if let Some(ref err) = report.blueprint_error {
+                    format!("INVALID (.chipsrc.json: {err})")
+                } else if report.has_blueprint {
+                    "present (.chipsrc.json)".to_string()
                 } else {
-                    "none"
+                    "none".to_string()
                 }
             );
             println!(
@@ -571,6 +678,7 @@ fn main() -> Result<()> {
             show,
             limit,
             no_sync,
+            json,
         } => {
             let (bundles, q) = resolve_cli_target_and_query(
                 &target_or_query,
@@ -578,8 +686,15 @@ fn main() -> Result<()> {
                 bundle.as_deref(),
                 no_sync,
             )?;
-            let out = query_symbols(&bundles, &q, kind.as_deref(), show, limit)?;
-            print!("{out}");
+            if json {
+                println!(
+                    "{}",
+                    query_subcommand_json("sym", &bundles, &q, None, kind.as_deref(), 0, limit)?
+                );
+            } else {
+                let out = query_symbols(&bundles, &q, kind.as_deref(), show, limit)?;
+                print!("{out}");
+            }
         }
 
         Commands::Callers {
@@ -589,6 +704,7 @@ fn main() -> Result<()> {
             show,
             limit,
             no_sync,
+            json,
         } => {
             let (bundles, sym) = resolve_cli_target_and_query(
                 &target_or_query,
@@ -596,8 +712,15 @@ fn main() -> Result<()> {
                 bundle.as_deref(),
                 no_sync,
             )?;
-            let out = query_callers(&bundles, &sym, show, limit)?;
-            print!("{out}");
+            if json {
+                println!(
+                    "{}",
+                    query_subcommand_json("callers", &bundles, &sym, None, None, 0, limit)?
+                );
+            } else {
+                let out = query_callers(&bundles, &sym, show, limit)?;
+                print!("{out}");
+            }
         }
 
         Commands::Callees {
@@ -607,6 +730,7 @@ fn main() -> Result<()> {
             show,
             limit,
             no_sync,
+            json,
         } => {
             let (bundles, sym) = resolve_cli_target_and_query(
                 &target_or_query,
@@ -614,8 +738,15 @@ fn main() -> Result<()> {
                 bundle.as_deref(),
                 no_sync,
             )?;
-            let out = query_callees(&bundles, &sym, show, limit)?;
-            print!("{out}");
+            if json {
+                println!(
+                    "{}",
+                    query_subcommand_json("callees", &bundles, &sym, None, None, 0, limit)?
+                );
+            } else {
+                let out = query_callees(&bundles, &sym, show, limit)?;
+                print!("{out}");
+            }
         }
 
         Commands::Type {
@@ -625,6 +756,7 @@ fn main() -> Result<()> {
             show,
             limit,
             no_sync,
+            json,
         } => {
             let (bundles, q) = resolve_cli_target_and_query(
                 &target_or_query,
@@ -632,8 +764,15 @@ fn main() -> Result<()> {
                 bundle.as_deref(),
                 no_sync,
             )?;
-            let out = query_types(&bundles, &q, show, limit)?;
-            print!("{out}");
+            if json {
+                println!(
+                    "{}",
+                    query_subcommand_json("type", &bundles, &q, None, None, 0, limit)?
+                );
+            } else {
+                let out = query_types(&bundles, &q, show, limit)?;
+                print!("{out}");
+            }
         }
 
         Commands::Macro {
@@ -643,6 +782,7 @@ fn main() -> Result<()> {
             show,
             limit,
             no_sync,
+            json,
         } => {
             let (bundles, q) = resolve_cli_target_and_query(
                 &target_or_query,
@@ -650,8 +790,15 @@ fn main() -> Result<()> {
                 bundle.as_deref(),
                 no_sync,
             )?;
-            let out = query_macros(&bundles, &q, show, limit)?;
-            print!("{out}");
+            if json {
+                println!(
+                    "{}",
+                    query_subcommand_json("macro", &bundles, &q, None, None, 0, limit)?
+                );
+            } else {
+                let out = query_macros(&bundles, &q, show, limit)?;
+                print!("{out}");
+            }
         }
 
         Commands::Section {
@@ -661,6 +808,7 @@ fn main() -> Result<()> {
             show,
             limit,
             no_sync,
+            json,
         } => {
             let (bundles, q) = resolve_cli_target_and_query(
                 &target_or_query,
@@ -668,8 +816,15 @@ fn main() -> Result<()> {
                 bundle.as_deref(),
                 no_sync,
             )?;
-            let out = query_sections(&bundles, &q, show, limit)?;
-            print!("{out}");
+            if json {
+                println!(
+                    "{}",
+                    query_subcommand_json("section", &bundles, &q, None, None, 0, limit)?
+                );
+            } else {
+                let out = query_sections(&bundles, &q, show, limit)?;
+                print!("{out}");
+            }
         }
 
         Commands::Xref {
@@ -678,6 +833,7 @@ fn main() -> Result<()> {
             bundle,
             limit,
             no_sync,
+            json,
         } => {
             let (bundles, q) = resolve_cli_target_and_query(
                 &target_or_query,
@@ -685,8 +841,15 @@ fn main() -> Result<()> {
                 bundle.as_deref(),
                 no_sync,
             )?;
-            let out = query_xref(&bundles, &q, limit)?;
-            print!("{out}");
+            if json {
+                println!(
+                    "{}",
+                    query_subcommand_json("xref", &bundles, &q, None, None, 0, limit)?
+                );
+            } else {
+                let out = query_xref(&bundles, &q, limit)?;
+                print!("{out}");
+            }
         }
 
         Commands::Path {
@@ -696,6 +859,7 @@ fn main() -> Result<()> {
             bundle,
             max_depth,
             no_sync,
+            json,
         } => {
             let (bundles, from_sym, to_sym) = if let Some(explicit_to) = to {
                 let (bundles, from_sym) = resolve_cli_target_and_query(
@@ -714,8 +878,23 @@ fn main() -> Result<()> {
                 )?;
                 (bundles, from_sym, to_or_from)
             };
-            let out = query_call_path(&bundles, &from_sym, &to_sym, max_depth)?;
-            print!("{out}");
+            if json {
+                println!(
+                    "{}",
+                    query_subcommand_json(
+                        "path",
+                        &bundles,
+                        &from_sym,
+                        Some(&to_sym),
+                        None,
+                        max_depth,
+                        0
+                    )?
+                );
+            } else {
+                let out = query_call_path(&bundles, &from_sym, &to_sym, max_depth)?;
+                print!("{out}");
+            }
         }
 
         Commands::Impact {
@@ -725,6 +904,7 @@ fn main() -> Result<()> {
             max_depth,
             limit,
             no_sync,
+            json,
         } => {
             let (bundles, sym) = resolve_cli_target_and_query(
                 &target_or_query,
@@ -732,8 +912,15 @@ fn main() -> Result<()> {
                 bundle.as_deref(),
                 no_sync,
             )?;
-            let out = query_impact(&bundles, &sym, max_depth, limit)?;
-            print!("{out}");
+            if json {
+                println!(
+                    "{}",
+                    query_subcommand_json("impact", &bundles, &sym, None, None, max_depth, limit)?
+                );
+            } else {
+                let out = query_impact(&bundles, &sym, max_depth, limit)?;
+                print!("{out}");
+            }
         }
 
         Commands::Search {
@@ -746,6 +933,7 @@ fn main() -> Result<()> {
             limit,
             compact,
             no_sync,
+            json,
         } => {
             let effective_kind = if source { "source" } else { kind.as_str() };
             let (bundles, pattern) = resolve_cli_target_and_query(
@@ -756,6 +944,10 @@ fn main() -> Result<()> {
             )?;
             let hits =
                 parallel_bundle_search(&bundles, &pattern, effective_kind, ignore_case, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&hits)?);
+                return Ok(());
+            }
             if hits.is_empty() {
                 println!("No search hits for pattern '{pattern}' (kind={effective_kind}).");
             } else {
@@ -786,6 +978,11 @@ fn main() -> Result<()> {
                 }
             }
         }
+
+        Commands::Hook { action } => match action {
+            HookAction::SessionStart => run_session_start_hook()?,
+            HookAction::PostEdit => run_post_edit_hook()?,
+        },
     }
 
     Ok(())
@@ -830,7 +1027,7 @@ fn resolve_cli_target_and_query(
     Ok((bundles, resolved_query))
 }
 
-fn print_conversion_summary(bundle: &ConversionBundle) {
+fn print_conversion_summary(bundle: &ConversionBundle, timings: bool) {
     let m = &bundle.metadata;
     let s = &bundle.sanity;
     let mode_tag = if bundle.cache_hit {
@@ -883,6 +1080,12 @@ fn print_conversion_summary(bundle: &ConversionBundle) {
         s.token_compression_ratio,
         m.elapsed_ms
     );
+    if timings {
+        println!(
+            "    [ok] Timings     : scan={}ms parse={}ms link={}ms graph={}ms shard={}ms emit={}ms (total={}ms)",
+            m.scan_ms, m.parse_ms, m.link_ms, m.graph_ms, m.shard_ms, m.emit_ms, m.elapsed_ms
+        );
+    }
     println!(
         "    [ok] ClaudeIgnore: {}",
         if bundle.claudeignore_updated {
@@ -894,4 +1097,205 @@ fn print_conversion_summary(bundle: &ConversionBundle) {
     for warn in &s.warnings {
         println!("    [warn] {warn}");
     }
+}
+
+fn run_session_start_hook() -> Result<()> {
+    let project_dir = std::env::var("CLAUDE_PROJECT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let project_dir = std::fs::canonicalize(&project_dir).unwrap_or(project_dir);
+
+    let bundles = chipsrc_core::query::discover_workspace_bundles(&project_dir).unwrap_or_default();
+    if !bundles.is_empty() {
+        let _ = auto_refresh_bundles(&bundles);
+    }
+
+    let mut bundle_summaries = Vec::new();
+    for bdir in &bundles {
+        if let Some(meta_file) = chipsrc_core::scanner::load_meta_file(bdir) {
+            let m = &meta_file.metadata;
+            let rel = bdir
+                .strip_prefix(&project_dir)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| bdir.to_string_lossy().replace('\\', "/"));
+            let rel_str = if rel.is_empty() { ".".to_string() } else { rel };
+            bundle_summaries.push(format!(
+                "`{rel_str}` ({} files, {} syms, {} types, {} calls, {} macros/MMIO, sanity {}/100)",
+                m.total_files,
+                m.symbol_count,
+                m.type_count,
+                m.call_edge_count,
+                m.macro_count,
+                meta_file.sanity.score
+            ));
+        }
+    }
+
+    if bundle_summaries.is_empty() && !dir_has_source_files(&project_dir, 0, 3) {
+        return Ok(());
+    }
+
+    let mut lines =
+        vec!["[chipsrc] Source Code & Hardware Cross-Reference Intelligence active:".to_string()];
+    let has_blueprint = project_dir.join(".chipsrc.json").is_file();
+    if !bundle_summaries.is_empty() {
+        lines.push(format!(
+            "- Indexed codebase bundles ready (auto-synced via `cache/`): {}",
+            bundle_summaries.join(", ")
+        ));
+    } else if has_blueprint {
+        lines.push(
+            "- Unindexed source repository with `.chipsrc.json` blueprint detected (run `chipsrc ensure . -o output` to build the Agent Codebase Bundle)."
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "- Unindexed source repository detected: run `chipsrc inspect .` first; if an Onboarding Digest appears, write a root `.chipsrc.json` blueprint once, then run `chipsrc ensure . -o output`."
+                .to_string(),
+        );
+    }
+    lines.push(
+        "- Prefer 1-turn CLI queries over blind Grep/Read loops (all queries auto-refresh changed files): `chipsrc sym <name> [-s]`, `chipsrc callers <fn>`, `chipsrc callees <fn>`, `chipsrc path <from> <to>`, `chipsrc impact <fn>`, `chipsrc type <name> [-s]`, `chipsrc macro|reg|mmio <name|0xHEX>`, `chipsrc xref <symbol>`, `chipsrc section [query] [-s]`, `chipsrc search <pattern>`."
+            .to_string(),
+    );
+
+    let payload = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": lines.join("\n"),
+        }
+    });
+    println!("{}", serde_json::to_string(&payload)?);
+    Ok(())
+}
+
+fn dir_has_source_files(dir: &Path, depth: usize, max_depth: usize) -> bool {
+    if depth > max_depth {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if path.is_dir() {
+            if name_str.starts_with('.')
+                || matches!(
+                    name_str.to_ascii_lowercase().as_str(),
+                    "target" | "node_modules" | "bin" | "output" | "dist" | "build" | "venv"
+                )
+            {
+                continue;
+            }
+            if dir_has_source_files(&path, depth + 1, max_depth) {
+                return true;
+            }
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if LanguageKind::from_extension(ext).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn run_post_edit_hook() -> Result<()> {
+    if std::env::var("CHIPSRC_DISABLE_AUTO_SYNC").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    let mut raw_stdin = String::new();
+    if std::io::stdin().read_to_string(&mut raw_stdin).is_err() || raw_stdin.trim().is_empty() {
+        return Ok(());
+    }
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(&raw_stdin) else {
+        return Ok(());
+    };
+    let tool_name = event
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !matches!(tool_name, "Edit" | "Write" | "MultiEdit") {
+        return Ok(());
+    }
+    let file_path_str = event
+        .get("tool_input")
+        .and_then(|ti| ti.get("file_path").or_else(|| ti.get("path")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if file_path_str.is_empty() {
+        return Ok(());
+    }
+
+    let edited_path = PathBuf::from(file_path_str);
+    let Some(ext) = edited_path.extension().and_then(|e| e.to_str()) else {
+        return Ok(());
+    };
+    if LanguageKind::from_extension(ext).is_none() {
+        return Ok(());
+    }
+    if edited_path.components().any(|c| {
+        c.as_os_str().to_str().is_some_and(|s| {
+            matches!(
+                s.to_ascii_lowercase().as_str(),
+                ".git"
+                    | "target"
+                    | "node_modules"
+                    | "bin"
+                    | "output"
+                    | "dist"
+                    | "build"
+                    | ".claude"
+                    | ".factory"
+                    | ".venv"
+                    | "venv"
+            )
+        })
+    }) {
+        return Ok(());
+    }
+
+    let project_dir = std::env::var("CLAUDE_PROJECT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let project_dir = std::fs::canonicalize(&project_dir).unwrap_or(project_dir);
+    let abs_edited = if edited_path.is_absolute() {
+        edited_path
+    } else {
+        project_dir.join(edited_path)
+    };
+    let (edited_canon, _) = chipsrc_core::scanner::canonical_repo_root_and_name(&abs_edited);
+
+    let output_root = project_dir.join("output");
+    let Ok(entries) = std::fs::read_dir(&output_root) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if !child.is_dir() {
+            continue;
+        }
+        let Some(meta_file) = chipsrc_core::scanner::load_meta_file(&child) else {
+            continue;
+        };
+        let src_path = Path::new(&meta_file.metadata.source_root);
+        let (src_canon, _) = chipsrc_core::scanner::canonical_repo_root_and_name(src_path);
+        let prefix = format!("{}/", src_canon.trim_end_matches('/'));
+        if edited_canon.eq_ignore_ascii_case(&src_canon)
+            || edited_canon
+                .to_ascii_lowercase()
+                .starts_with(&prefix.to_ascii_lowercase())
+        {
+            let _ = ensure_repo(
+                src_path,
+                &output_root,
+                false,
+                meta_file.metadata.vendor_mode,
+            );
+        }
+    }
+    Ok(())
 }

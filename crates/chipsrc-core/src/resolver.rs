@@ -161,7 +161,9 @@ pub fn resolve_and_link(
                     file: raw.caller_file.as_str(),
                     section_id: &caller_section_id,
                     language: Some(unit_language),
-                    scope: unit.scanned.scope,
+                    scope: caller_idx
+                        .map(|i| symbols[i].scope)
+                        .unwrap_or(unit.scanned.scope),
                     enclosing_type: caller_enclosing_type,
                 },
                 raw.callee_name.as_str(),
@@ -249,7 +251,9 @@ pub fn resolve_and_link(
                     file: rx.file.as_str(),
                     section_id: &caller_section_id,
                     language: Some(unit_language),
-                    scope: unit.scanned.scope,
+                    scope: caller_idx
+                        .map(|i| symbols[i].scope)
+                        .unwrap_or(unit.scanned.scope),
                     enclosing_type: caller_enclosing_type,
                 },
                 target_name,
@@ -755,6 +759,31 @@ const PYTHON_BUILTINS: &[&str] = &[
     "callable",
     "vars",
     "dir",
+    "round",
+    "divmod",
+    "pow",
+    "format",
+    "input",
+    "exec",
+    "eval",
+    "compile",
+    "globals",
+    "locals",
+    "staticmethod",
+    "classmethod",
+    "property",
+    "object",
+    "frozenset",
+    "bytearray",
+    "memoryview",
+    "slice",
+    "complex",
+    "NotImplemented",
+    "Exception",
+    "ValueError",
+    "TypeError",
+    "KeyError",
+    "RuntimeError",
 ];
 
 const JS_BUILTINS: &[&str] = &[
@@ -771,6 +800,38 @@ const JS_BUILTINS: &[&str] = &[
     "alert",
     "confirm",
     "prompt",
+    "Array",
+    "Object",
+    "Promise",
+    "JSON",
+    "Math",
+    "Date",
+    "Map",
+    "Set",
+    "WeakMap",
+    "WeakSet",
+    "Symbol",
+    "Error",
+    "TypeError",
+    "RegExp",
+    "Number",
+    "String",
+    "Boolean",
+    "BigInt",
+    "Reflect",
+    "Proxy",
+    "console",
+    "document",
+    "window",
+    "querySelector",
+    "querySelectorAll",
+    "getElementById",
+    "addEventListener",
+    "removeEventListener",
+    "requestAnimationFrame",
+    "structuredClone",
+    "encodeURIComponent",
+    "decodeURIComponent",
 ];
 
 /// Ubiquitous container / IO / lifecycle / conversion member names. When such a name is invoked
@@ -1175,13 +1236,42 @@ fn is_language_builtin(name: &str, caller_language: Option<LanguageKind>) -> boo
 }
 
 fn is_ubiquitous_member_name(name: &str) -> bool {
-    UBIQUITOUS_MEMBER_NAMES.contains(&name)
+    UBIQUITOUS_MEMBER_NAMES.contains(&name) || TREE_SITTER_METHODS.contains(&name)
 }
+
+const TREE_SITTER_METHODS: &[&str] = &[
+    "child_by_field_name",
+    "kind",
+    "walk",
+    "start_position",
+    "end_position",
+    "start_byte",
+    "end_byte",
+    "named_child",
+    "named_child_count",
+    "child",
+    "child_count",
+    "children",
+    "next_sibling",
+    "prev_sibling",
+    "parent",
+    "utf8_text",
+    "root_node",
+    "is_named",
+    "is_missing",
+    "has_error",
+    "is_error",
+    "is_extra",
+    "children_by_field_name",
+    "named_children",
+    "id",
+    "set_language",
+];
 
 /// Returns `true` when an unresolved (`ExternalOrMacro`) call in a Rust file is a ubiquitous
 /// standard-library method/constructor/iterator/option operation (`clone`, `to_string`, `as_str`,
-/// `unwrap`, `iter`, `map`, `collect`, `Vec::new`, `String::new`, etc.) that adds noise without
-/// architectural signal.
+/// `unwrap`, `iter`, `map`, `collect`, `Vec::new`, `String::new`, `Some`, `Ok`, `Err`, etc.) that
+/// adds noise without architectural signal.
 fn is_noisy_rust_external_call(
     raw_callee_name: &str,
     short_callee: &str,
@@ -1192,7 +1282,111 @@ fn is_noisy_rust_external_call(
     }
     if matches!(
         short_callee,
-        "saturating_sub"
+        "Some"
+            | "Ok"
+            | "Err"
+            | "Box"
+            | "Arc"
+            | "Rc"
+            | "Vec"
+            | "String"
+            | "Path"
+            | "PathBuf"
+            | "Default"
+            | "From"
+            | "Into"
+            | "Self"
+            | "sum"
+            | "next"
+            | "any"
+            | "all"
+            | "find"
+            | "position"
+            | "enumerate"
+            | "zip"
+            | "chain"
+            | "flat_map"
+            | "filter_map"
+            | "copied"
+            | "cloned"
+            | "take"
+            | "skip"
+            | "rev"
+            | "sort"
+            | "sort_by"
+            | "sort_by_key"
+            | "dedup"
+            | "retain"
+            | "extend"
+            | "insert"
+            | "remove"
+            | "contains"
+            | "contains_key"
+            | "entry"
+            | "or_default"
+            | "or_insert"
+            | "or_insert_with"
+            | "and_then"
+            | "or_else"
+            | "map_err"
+            | "map_or"
+            | "unwrap_or_default"
+            | "unwrap_or_else"
+            | "ok_or"
+            | "ok_or_else"
+            | "is_some"
+            | "is_none"
+            | "is_ok"
+            | "is_err"
+            | "as_ref"
+            | "as_mut"
+            | "as_deref"
+            | "as_bytes"
+            | "as_slice"
+            | "to_vec"
+            | "into"
+            | "from"
+            | "try_into"
+            | "default"
+            | "trim"
+            | "split"
+            | "split_once"
+            | "lines"
+            | "chars"
+            | "bytes"
+            | "starts_with"
+            | "ends_with"
+            | "replace"
+            | "to_lowercase"
+            | "to_ascii_lowercase"
+            | "to_uppercase"
+            | "to_ascii_uppercase"
+            | "parse"
+            | "write"
+            | "writeln"
+            | "push"
+            | "push_str"
+            | "pop"
+            | "iter"
+            | "iter_mut"
+            | "into_iter"
+            | "collect"
+            | "map"
+            | "filter"
+            | "fold"
+            | "count"
+            | "min"
+            | "max"
+            | "first"
+            | "last"
+            | "get_mut"
+            | "with_capacity"
+            | "capacity"
+            | "reserve"
+            | "truncate"
+            | "drain"
+            | "clear"
+            | "saturating_sub"
             | "saturating_add"
             | "div_ceil"
             | "is_ascii_alphanumeric"
@@ -1203,21 +1397,37 @@ fn is_noisy_rust_external_call(
             | "is_ascii_hexdigit"
             | "is_alphanumeric"
             | "is_whitespace"
+            | "is_control"
             | "char_indices"
             | "len_utf8"
             | "from_utf8"
             | "from_utf8_lossy"
+            | "from_str"
+            | "from_str_radix"
+            | "from_slice"
             | "lossy"
             | "to_string_lossy"
+            | "to_string_pretty"
             | "as_os_str"
             | "file_name"
             | "file_stem"
             | "extension"
             | "parent"
+            | "path"
             | "join"
             | "exists"
             | "is_dir"
             | "is_file"
+            | "file_type"
+            | "metadata"
+            | "modified"
+            | "read_dir"
+            | "read_to_string"
+            | "create_dir_all"
+            | "remove_dir_all"
+            | "remove_file"
+            | "temp_dir"
+            | "canonicalize"
             | "components"
             | "display"
             | "duration_since"
@@ -1226,6 +1436,37 @@ fn is_noisy_rust_external_call(
             | "as_nanos"
             | "elapsed"
             | "now"
+            | "with_context"
+            | "context"
+            | "then_some"
+            | "into_mut"
+            | "into_values"
+            | "into_keys"
+            | "borrow"
+            | "borrow_mut"
+            | "fill"
+            | "copy_from_slice"
+            | "is_power_of_two"
+            | "to_be_bytes"
+            | "to_le_bytes"
+            | "ln_1p"
+            | "sqrt"
+            | "round"
+            | "abs"
+            | "into_par_iter"
+            | "par_iter"
+            | "flat_map_iter"
+            | "fetch_add"
+            | "pop_front"
+            | "push_back"
+            | "get_or_init"
+            | "captures"
+            | "is_match"
+            | "escape"
+            | "case_insensitive"
+            | "hash"
+            | "to_hex"
+            | "finalize"
     ) {
         return true;
     }
@@ -1259,6 +1500,18 @@ fn is_noisy_rust_external_call(
                 | "env"
                 | "io"
                 | "fmt"
+                | "serde_json"
+                | "blake3"
+                | "regex"
+                | "memchr"
+                | "memmem"
+                | "Finder"
+                | "Regex"
+                | "RegexBuilder"
+                | "Hasher"
+                | "WalkBuilder"
+                | "Parser"
+                | "Cli"
         ) {
             return true;
         }
@@ -1667,6 +1920,98 @@ fn infer_unit_section_id(unit: &ParsedFileUnit) -> String {
     }
 }
 
+const GENERIC_HEADER_STEMS: &[&str] = &[
+    "main", "config", "types", "common", "board", "system", "version", "def", "defs", "utils",
+    "hal", "bsp",
+];
+
+const GENERIC_BIT_MACROS: &[&str] = &[
+    "SET_BIT",
+    "CLEAR_BIT",
+    "READ_BIT",
+    "CLEAR_REG",
+    "WRITE_REG",
+    "READ_REG",
+    "MODIFY_REG",
+    "BIT",
+    "_VAL2FLD",
+    "_FLD2VAL",
+    "UNUSED",
+    "ARRAY_SIZE",
+    "MIN",
+    "MAX",
+];
+
+/// Returns `true` when `m` is a function-like macro whose expansion body references only its own
+/// formal parameters (and contains no hex MMIO literal), e.g. `#define CLEAR_BIT(REG, BIT) ((REG) &= ~(BIT))`.
+fn is_pure_param_fn_macro(m: &ExtractedMacro) -> bool {
+    if m.hex_addr.is_some() {
+        return false;
+    }
+    let Some((params_raw, body_raw)) = m.value_or_args.split_once(" -> ") else {
+        return false;
+    };
+    if !params_raw.starts_with('(') {
+        return false;
+    }
+    let params: FxHashSet<&str> = params_raw
+        .trim_matches(|c| c == '(' || c == ')')
+        .split(',')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if params.is_empty() {
+        return false;
+    }
+
+    let mut saw_param_ref = false;
+    for tok in body_raw
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|s| !s.is_empty())
+    {
+        if tok.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if matches!(
+            tok,
+            "uint8_t"
+                | "uint16_t"
+                | "uint32_t"
+                | "uint64_t"
+                | "int8_t"
+                | "int16_t"
+                | "int32_t"
+                | "int64_t"
+                | "size_t"
+                | "uintptr_t"
+                | "int"
+                | "unsigned"
+                | "signed"
+                | "long"
+                | "short"
+                | "char"
+                | "void"
+                | "volatile"
+                | "const"
+                | "sizeof"
+        ) {
+            continue;
+        }
+        if params.contains(tok) {
+            saw_param_ref = true;
+        } else {
+            return false;
+        }
+    }
+    saw_param_ref
+}
+
+fn is_excluded_generic_macro(m: &ExtractedMacro) -> bool {
+    m.kind == MacroKind::LinkerSection
+        || GENERIC_BIT_MACROS.contains(&m.name.as_str())
+        || is_pure_param_fn_macro(m)
+}
+
 fn compute_vendor_surface(
     units: &[ParsedFileUnit],
     symbols: &[ExtractedSymbol],
@@ -1698,6 +2043,9 @@ fn compute_vendor_surface(
     let mut vendor_macro_names: FxHashSet<&str> = FxHashSet::default();
     let mut vendor_mmio_names: FxHashSet<&str> = FxHashSet::default();
     for m in macros.iter().filter(|m| m.scope == FileScope::VendorSdk) {
+        if is_excluded_generic_macro(m) {
+            continue;
+        }
         vendor_macro_names.insert(m.name.as_str());
         if matches!(
             m.kind,
@@ -1717,10 +2065,15 @@ fn compute_vendor_surface(
                 let norm = u.scanned.rel_path.replace('\\', "/");
                 vendor_file_paths.insert(norm.clone());
                 if let Some(fname) = Path::new(&norm).file_name().and_then(|s| s.to_str()) {
-                    vendor_file_stems.insert(fname.to_ascii_lowercase());
-                }
-                if let Some(stem) = Path::new(&norm).file_stem().and_then(|s| s.to_str()) {
-                    vendor_file_stems.insert(stem.to_ascii_lowercase());
+                    let stem = Path::new(fname)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(fname)
+                        .to_ascii_lowercase();
+                    if !GENERIC_HEADER_STEMS.contains(&stem.as_str()) {
+                        vendor_file_stems.insert(fname.to_ascii_lowercase());
+                        vendor_file_stems.insert(stem);
+                    }
                 }
             }
             FileScope::FirstParty => {
@@ -1734,8 +2087,11 @@ fn compute_vendor_surface(
     let mut active_mmio_registers: BTreeSet<String> = BTreeSet::new();
     let mut active_vendor_headers: BTreeSet<String> = BTreeSet::new();
 
-    // All MMIO macros defined directly in first-party files are active
+    // All MMIO macros defined directly in first-party files are active (excluding generic bit macros / linker sections)
     for m in macros.iter().filter(|m| m.scope == FileScope::FirstParty) {
+        if is_excluded_generic_macro(m) {
+            continue;
+        }
         if matches!(
             m.kind,
             MacroKind::MmioAddress | MacroKind::RegisterAccess | MacroKind::Bitmask
@@ -1747,6 +2103,9 @@ fn compute_vendor_surface(
     // Check resolved calls from first-party files
     for call in calls {
         if !first_party_files.contains(call.file.as_str()) {
+            continue;
+        }
+        if GENERIC_BIT_MACROS.contains(&call.callee_name.as_str()) {
             continue;
         }
         if let Some(&vname) = vendor_sym_ids.get(call.callee_id.as_str()) {
@@ -1768,6 +2127,9 @@ fn compute_vendor_surface(
     {
         for rx in &unit.raw_xrefs {
             let target = rx.target_name.as_str();
+            if target.starts_with('.') || GENERIC_BIT_MACROS.contains(&target) {
+                continue;
+            }
             if matches!(
                 rx.category.as_str(),
                 "mmio_access" | "mmio_write" | "mmio_read"
@@ -1799,6 +2161,9 @@ fn compute_vendor_surface(
 
         for imp in &unit.imports {
             for imported in &imp.imported_names {
+                if GENERIC_BIT_MACROS.contains(&imported.as_str()) {
+                    continue;
+                }
                 if vendor_sym_names.contains(imported.as_str())
                     || vendor_type_names.contains(imported.as_str())
                     || vendor_macro_names.contains(imported.as_str())
@@ -1815,6 +2180,10 @@ fn compute_vendor_surface(
                 .trim()
                 .trim_matches(|c| matches!(c, '"' | '\'' | '<' | '>'))
                 .replace('\\', "/");
+            let raw_clean = raw_clean
+                .trim_start_matches("./")
+                .trim_matches('/')
+                .to_string();
             let fname_lower = Path::new(&raw_clean)
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -1826,11 +2195,17 @@ fn compute_vendor_surface(
                 .unwrap_or("")
                 .to_ascii_lowercase();
 
-            let is_vendor_header = vendor_file_paths.iter().any(|vp| vp.ends_with(&raw_clean))
-                || (!fname_lower.is_empty() && vendor_file_stems.contains(&fname_lower))
-                || (!stem_lower.is_empty() && vendor_file_stems.contains(&stem_lower));
+            let is_generic_stem = GENERIC_HEADER_STEMS.contains(&stem_lower.as_str());
+            let path_boundary_match = vendor_file_paths.iter().any(|vp| {
+                vp == &raw_clean
+                    || ((!is_generic_stem || raw_clean.contains('/'))
+                        && vp.ends_with(&format!("/{raw_clean}")))
+            });
+            let stem_fallback_match = !is_generic_stem
+                && ((!fname_lower.is_empty() && vendor_file_stems.contains(&fname_lower))
+                    || (!stem_lower.is_empty() && vendor_file_stems.contains(&stem_lower)));
 
-            if is_vendor_header && !raw_clean.is_empty() {
+            if (path_boundary_match || stem_fallback_match) && !raw_clean.is_empty() {
                 active_vendor_headers.insert(raw_clean);
             }
         }
@@ -2588,5 +2963,46 @@ mod tests {
             !calls.iter().any(|c| c.callee_id.ends_with("::as_str")),
             "name.as_str() must never bind to ArchLayer::as_str: {calls:?}"
         );
+    }
+
+    #[test]
+    fn test_inline_cfg_test_helpers_resolve_same_file() {
+        let helper_sym = sample_symbol(
+            "crates/core/src/lib.rs",
+            "make_unit",
+            100,
+            FileScope::Test,
+            ArchLayer::Tests,
+            "crates-core",
+        );
+        let test_fn = sample_symbol(
+            "crates/core/src/lib.rs",
+            "test_something",
+            110,
+            FileScope::Test,
+            ArchLayer::Tests,
+            "crates-core",
+        );
+        let unit = sample_unit(
+            "crates/core/src/lib.rs",
+            FileScope::FirstParty,
+            ArchLayer::Core,
+            LanguageKind::Rust,
+            vec![helper_sym, test_fn],
+            Vec::new(),
+            vec![sample_call(
+                "crates/core/src/lib.rs",
+                "test_something",
+                110,
+                "make_unit",
+                None,
+                112,
+            )],
+        );
+
+        let (_symbols, _types, _macros, calls, _xrefs, _vendor) = resolve_and_link(&[unit]);
+        let edge = find_call(&calls, "make_unit");
+        assert_eq!(edge.tier, ResolutionTier::SameFile);
+        assert_eq!(edge.callee_id, "crates/core/src/lib.rs::make_unit");
     }
 }

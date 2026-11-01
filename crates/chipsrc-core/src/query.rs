@@ -132,8 +132,57 @@ pub fn resolve_target_and_query(
     Ok((bundles, target_or_query.to_string()))
 }
 
+/// Structured zero-copy view of a canonical `file::scoped` (or `file::Enclosing::short`) symbol ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymbolIdView<'a> {
+    pub file: &'a str,
+    pub scoped: &'a str,
+    pub short: &'a str,
+}
+
+impl<'a> SymbolIdView<'a> {
+    pub fn parse(symbol_id: &'a str) -> Self {
+        parse_symbol_id(symbol_id)
+    }
+}
+
+/// Splits a canonical `file::Enclosing::name` symbol/type ID into `(file, scoped, short)`.
+pub fn parse_symbol_id(id: &str) -> SymbolIdView<'_> {
+    if let Some((file, rest)) = id.split_once("::") {
+        let scoped = rest
+            .rsplit_once(':')
+            .filter(|(_, line)| !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit()))
+            .map(|(s, _)| s)
+            .unwrap_or(rest);
+        let short = scoped.rsplit_once("::").map(|(_, s)| s).unwrap_or(scoped);
+        SymbolIdView {
+            file,
+            scoped,
+            short,
+        }
+    } else {
+        SymbolIdView {
+            file: "",
+            scoped: id,
+            short: id,
+        }
+    }
+}
+
+/// Returns `true` when `q` explicitly targets a file path (contains `/` or `\` or ends with a source extension).
+pub fn query_targets_file(q: &str) -> bool {
+    let t = q.trim();
+    t.contains('/')
+        || t.contains('\\')
+        || t.rsplit_once('.')
+            .is_some_and(|(_, ext)| LanguageKind::from_extension(ext).is_some())
+}
+
 /// Scans `workspace` (and `workspace/output`) for indexed bundles and checks live freshness against source files.
 pub fn workspace_status(workspace: &Path) -> Result<Vec<BundleStatusEntry>> {
+    if !workspace.exists() && !Path::new("output").join(workspace).exists() {
+        return Err(ChipsrcError::BundleNotFound(workspace.to_path_buf()));
+    }
     let bundles = match discover_workspace_bundles(workspace) {
         Ok(b) => b,
         Err(ChipsrcError::BundleNotFound(_)) => return Ok(Vec::new()),
@@ -249,22 +298,35 @@ pub fn query_symbols(
                 }
             }
 
+            let id_view = parse_symbol_id(symbol_id);
             let name_lower = name.to_ascii_lowercase();
-            let id_lower = symbol_id.to_ascii_lowercase();
+            let scoped_lower = id_view.scoped.to_ascii_lowercase();
+            let short_lower = id_view.short.to_ascii_lowercase();
             let sig_lower = cols[7].to_ascii_lowercase();
+            let targets_file = query_targets_file(q_trim);
 
             let score = if q_lower.is_empty() {
                 1
-            } else if name == q_trim || symbol_id == q_trim {
+            } else if name == q_trim
+                || id_view.scoped == q_trim
+                || id_view.short == q_trim
+                || symbol_id == q_trim
+            {
                 5
-            } else if name_lower == q_lower || id_lower == q_lower {
+            } else if name_lower == q_lower
+                || scoped_lower == q_lower
+                || short_lower == q_lower
+                || (targets_file && symbol_id.eq_ignore_ascii_case(q_trim))
+            {
                 4
-            } else if id_lower.ends_with(&format!("::{q_lower}"))
+            } else if scoped_lower.ends_with(&format!("::{q_lower}"))
                 || name_lower.starts_with(&q_lower)
+                || scoped_lower.starts_with(&q_lower)
+                || (targets_file && id_view.file.to_ascii_lowercase().contains(&q_lower))
             {
                 3
             } else if name_lower.contains(&q_lower)
-                || id_lower.contains(&q_lower)
+                || scoped_lower.contains(&q_lower)
                 || sig_lower.contains(&q_lower)
             {
                 2
@@ -405,16 +467,26 @@ pub fn query_callers(
             }
             let callee_name = cols[2];
             let callee_id = cols[3];
+            let id_view = parse_symbol_id(callee_id);
             let callee_lower = callee_name.to_ascii_lowercase();
-            let id_lower = callee_id.to_ascii_lowercase();
+            let scoped_lower = id_view.scoped.to_ascii_lowercase();
+            let targets_file = query_targets_file(q_trim);
 
-            let score = if callee_name == q_trim || callee_id == q_trim {
+            let score = if callee_name == q_trim
+                || id_view.scoped == q_trim
+                || id_view.short == q_trim
+                || callee_id == q_trim
+            {
                 4
-            } else if callee_lower == q_lower || id_lower == q_lower || id_lower.ends_with(&suffix)
+            } else if callee_lower == q_lower
+                || scoped_lower == q_lower
+                || id_view.short.eq_ignore_ascii_case(q_trim)
+                || scoped_lower.ends_with(&suffix)
+                || (targets_file && id_view.file.to_ascii_lowercase().contains(&q_lower))
             {
                 3
             } else if !has_exact_sym
-                && (callee_lower.contains(&q_lower) || id_lower.contains(&q_lower))
+                && (callee_lower.contains(&q_lower) || scoped_lower.contains(&q_lower))
             {
                 2
             } else {
@@ -457,10 +529,14 @@ pub fn query_callers(
     });
 
     let total = hits.len();
+    let resolved_count = hits
+        .iter()
+        .filter(|h| h.tier != "external_or_macro")
+        .count();
+    let ext_count = total - resolved_count;
     let mut out = format!(
-        "=== Callers of '{}' ({} call sites) ===\n",
-        symbol,
-        hits.len()
+        "=== Callers of '{}' ({} call sites: {} resolved, {} external/macro) ===\n",
+        symbol, total, resolved_count, ext_count
     );
     let mut snippet_cache = SourceSnippetCache::default();
     for h in hits.into_iter().take(limit) {
@@ -539,16 +615,26 @@ pub fn query_callees(
             }
             let caller_id = cols[0];
             let caller_name = cols[1];
+            let id_view = parse_symbol_id(caller_id);
             let caller_lower = caller_name.to_ascii_lowercase();
-            let id_lower = caller_id.to_ascii_lowercase();
+            let scoped_lower = id_view.scoped.to_ascii_lowercase();
+            let targets_file = query_targets_file(q_trim);
 
-            let score = if caller_name == q_trim || caller_id == q_trim {
+            let score = if caller_name == q_trim
+                || id_view.scoped == q_trim
+                || id_view.short == q_trim
+                || caller_id == q_trim
+            {
                 4
-            } else if caller_lower == q_lower || id_lower == q_lower || id_lower.ends_with(&suffix)
+            } else if caller_lower == q_lower
+                || scoped_lower == q_lower
+                || id_view.short.eq_ignore_ascii_case(q_trim)
+                || scoped_lower.ends_with(&suffix)
+                || (targets_file && id_view.file.to_ascii_lowercase().contains(&q_lower))
             {
                 3
             } else if !has_exact_sym
-                && (caller_lower.contains(&q_lower) || id_lower.contains(&q_lower))
+                && (caller_lower.contains(&q_lower) || scoped_lower.contains(&q_lower))
             {
                 2
             } else {
@@ -596,10 +682,14 @@ pub fn query_callees(
     });
 
     let total = hits.len();
+    let resolved_count = hits
+        .iter()
+        .filter(|h| h.tier != "external_or_macro")
+        .count();
+    let ext_count = total - resolved_count;
     let mut out = format!(
-        "=== Callees invoked by '{}' ({} call sites) ===\n",
-        symbol,
-        hits.len()
+        "=== Callees invoked by '{}' ({} call sites: {} resolved, {} external/macro) ===\n",
+        symbol, total, resolved_count, ext_count
     );
     let mut snippet_cache = SourceSnippetCache::default();
     for h in hits.into_iter().take(limit) {
@@ -683,20 +773,28 @@ pub fn query_types(
             let fields = cols[7];
             let doc_summary = cols.get(11).copied().unwrap_or("");
 
+            let id_view = parse_symbol_id(type_id);
             let name_lower = name.to_ascii_lowercase();
-            let id_lower = type_id.to_ascii_lowercase();
+            let scoped_lower = id_view.scoped.to_ascii_lowercase();
             let fields_lower = fields.to_ascii_lowercase();
+            let targets_file = query_targets_file(q_trim);
 
             let score = if q_lower.is_empty() {
                 1
-            } else if name == q_trim || type_id == q_trim {
+            } else if name == q_trim || id_view.scoped == q_trim || type_id == q_trim {
                 5
-            } else if name_lower == q_lower || id_lower == q_lower {
+            } else if name_lower == q_lower
+                || scoped_lower == q_lower
+                || (targets_file && type_id.eq_ignore_ascii_case(q_trim))
+            {
                 4
-            } else if name_lower.starts_with(&q_lower) {
+            } else if name_lower.starts_with(&q_lower)
+                || scoped_lower.starts_with(&q_lower)
+                || (targets_file && id_view.file.to_ascii_lowercase().contains(&q_lower))
+            {
                 3
             } else if name_lower.contains(&q_lower)
-                || id_lower.contains(&q_lower)
+                || scoped_lower.contains(&q_lower)
                 || fields_lower.contains(&q_lower)
             {
                 2
@@ -802,8 +900,7 @@ pub fn query_macros(
 ) -> Result<String> {
     let q_trim = query.trim();
     let q_lower = q_trim.to_ascii_lowercase();
-    let q_hex = normalize_query_hex_literal(q_trim);
-    let is_explicit_hex = q_hex.is_some() && (q_lower.starts_with("0x") || q_lower.ends_with('h'));
+    let q_hw = QueryHw::new(q_trim);
 
     struct MacroHit {
         bundle_dir: PathBuf,
@@ -842,27 +939,27 @@ pub fn query_macros(
             let desc = cols[9];
 
             let row_hex = if hex_col != "-" && !hex_col.is_empty() {
-                normalize_query_hex_literal(hex_col).or_else(|| normalize_hex_literal(hex_col))
+                normalize_hex_literal(hex_col)
             } else {
                 normalize_hex_literal(val)
             };
 
-            let hex_exact = match (&q_hex, &row_hex) {
+            let hex_exact = match (&q_hw.hex, &row_hex) {
                 (Some(qh), Some(rh)) => qh.eq_ignore_ascii_case(rh),
                 _ => false,
             };
 
             let score = if hex_exact {
                 5
-            } else if is_explicit_hex {
+            } else if q_hw.is_hex {
                 // Issue #9: When the query is an explicit hex address/mask (`0xFF`, `41C00004h`),
-                // require exact numeric hex equality so `0xFF` never substring-matches `0xFFFFFFFF`.
+                // require exact numeric hex equality so `0xFF` never substring-match `0xFFFFFFFF`.
                 0
             } else {
-                let id_score = score_hw_identifier_match(name, q_trim);
+                let id_score = score_hw_identifier_match_prepared(name, &q_hw);
                 let val_score = if !q_lower.is_empty()
-                    && (val.to_ascii_lowercase().contains(&q_lower)
-                        || desc.to_ascii_lowercase().contains(&q_lower))
+                    && (ascii_contains_ignore_case(val.as_bytes(), q_lower.as_bytes())
+                        || ascii_contains_ignore_case(desc.as_bytes(), q_lower.as_bytes()))
                 {
                     1
                 } else {
@@ -1058,6 +1155,7 @@ pub fn query_sections(
             .then_with(|| a.section_id.cmp(&b.section_id))
     });
 
+    let total = hits.len();
     let mut out = String::new();
     for h in hits.into_iter().take(limit) {
         let rel_md = if h.md_file.starts_with("sections/") {
@@ -1084,14 +1182,26 @@ pub fn query_sections(
         if show_markdown {
             let md_path = h.bundle_dir.join(&rel_md);
             if let Ok(md_body) = fs::read_to_string(&md_path) {
+                let body_trimmed = md_body
+                    .strip_prefix("---\r\n")
+                    .or_else(|| md_body.strip_prefix("---\n"))
+                    .unwrap_or(&md_body);
                 out.push_str("---\n");
-                out.push_str(&md_body);
-                if !md_body.ends_with('\n') {
+                out.push_str(body_trimmed);
+                if !body_trimmed.ends_with('\n') {
                     out.push('\n');
                 }
                 out.push_str("---\n");
             }
         }
+    }
+
+    if total > limit {
+        out.push_str(&format!(
+            "... +{} more module sections omitted (pass `--limit {}` to view all).\n",
+            total - limit,
+            total
+        ));
     }
 
     Ok(out)
@@ -1102,8 +1212,7 @@ pub fn query_sections(
 pub fn query_xref(bundles: &[PathBuf], query: &str, limit: usize) -> Result<String> {
     let q_trim = query.trim();
     let q_lower = q_trim.to_ascii_lowercase();
-    let q_hex = normalize_query_hex_literal(q_trim);
-    let is_explicit_hex = q_hex.is_some() && (q_lower.starts_with("0x") || q_lower.ends_with('h'));
+    let q_hw = QueryHw::new(q_trim);
 
     struct XrefHit {
         bundle_name: String,
@@ -1128,6 +1237,12 @@ pub fn query_xref(bundles: &[PathBuf], query: &str, limit: usize) -> Result<Stri
         let bundle_name = bundle_name_from_dir(bundle_dir);
 
         for line in content.lines().skip(1) {
+            if !q_hw.is_hex
+                && !q_hw.fast_prefix.is_empty()
+                && !ascii_contains_ignore_case(line.as_bytes(), q_hw.fast_prefix.as_bytes())
+            {
+                continue;
+            }
             let cols: Vec<&str> = line.split('\t').collect();
             if cols.len() < 8 {
                 continue;
@@ -1141,13 +1256,10 @@ pub fn query_xref(bundles: &[PathBuf], query: &str, limit: usize) -> Result<Stri
             let section_id = cols[6];
             let context = cols[7];
 
-            let hex_match = match &q_hex {
+            let hex_match = match &q_hw.hex {
                 Some(qh) => {
-                    normalize_query_hex_literal(sym)
-                        .or_else(|| normalize_hex_literal(sym))
-                        .is_some_and(|sh| sh.eq_ignore_ascii_case(qh))
-                        || normalize_query_hex_literal(target)
-                            .or_else(|| normalize_hex_literal(target))
+                    normalize_hex_literal(sym).is_some_and(|sh| sh.eq_ignore_ascii_case(qh))
+                        || normalize_hex_literal(target)
                             .is_some_and(|th| th.eq_ignore_ascii_case(qh))
                         || normalize_hex_literal(context)
                             .is_some_and(|ch| ch.eq_ignore_ascii_case(qh))
@@ -1157,17 +1269,18 @@ pub fn query_xref(bundles: &[PathBuf], query: &str, limit: usize) -> Result<Stri
 
             let score = if hex_match {
                 5
-            } else if is_explicit_hex {
+            } else if q_hw.is_hex {
                 0
             } else {
-                let sym_score = score_hw_identifier_match(sym, q_trim);
-                let target_score = score_hw_identifier_match(target, q_trim);
-                let ctx_score =
-                    if !q_lower.is_empty() && context.to_ascii_lowercase().contains(&q_lower) {
-                        1
-                    } else {
-                        0
-                    };
+                let sym_score = score_hw_identifier_match_prepared(sym, &q_hw);
+                let target_score = score_hw_identifier_match_prepared(target, &q_hw);
+                let ctx_score = if !q_lower.is_empty()
+                    && ascii_contains_ignore_case(context.as_bytes(), q_lower.as_bytes())
+                {
+                    1
+                } else {
+                    0
+                };
                 sym_score.max(target_score).max(ctx_score)
             };
 
@@ -1307,6 +1420,11 @@ fn load_bundle_call_graph(
             let tier = cols[6].to_string();
             let section_id = cols[7].to_string();
 
+            // Skip unresolved external/macro pseudo-nodes when building call/impact BFS graph (Bug 8)
+            if callee_id.starts_with("external::") || tier == "external_or_macro" {
+                continue;
+            }
+
             syms.entry(caller_id.clone())
                 .or_insert_with(|| GraphSymMeta {
                     symbol_id: caller_id.clone(),
@@ -1354,16 +1472,28 @@ fn match_symbol_ids_for_query(syms: &FxHashMap<String, GraphSymMeta>, query: &st
     }
     let q_lower = q_trim.to_ascii_lowercase();
     let suffix = format!("::{q_lower}");
+    let targets_file = query_targets_file(q_trim);
 
     let mut scored: Vec<(u8, String)> = Vec::new();
     for (id, meta) in syms {
+        let id_view = parse_symbol_id(id);
         let name_lower = meta.name.to_ascii_lowercase();
-        let id_lower = id.to_ascii_lowercase();
-        let score = if meta.name == q_trim || id == q_trim {
+        let scoped_lower = id_view.scoped.to_ascii_lowercase();
+        let short_lower = id_view.short.to_ascii_lowercase();
+        let score = if meta.name == q_trim
+            || id_view.scoped == q_trim
+            || id_view.short == q_trim
+            || id == q_trim
+        {
             4
-        } else if name_lower == q_lower || id_lower == q_lower || id_lower.ends_with(&suffix) {
+        } else if name_lower == q_lower
+            || scoped_lower == q_lower
+            || short_lower == q_lower
+            || scoped_lower.ends_with(&suffix)
+            || (targets_file && id_view.file.to_ascii_lowercase().contains(&q_lower))
+        {
             3
-        } else if name_lower.contains(&q_lower) || id_lower.contains(&q_lower) {
+        } else if name_lower.contains(&q_lower) || scoped_lower.contains(&q_lower) {
             2
         } else {
             0
@@ -1498,12 +1628,16 @@ pub fn query_call_path(
                 let meta = syms.get(node_id);
                 let kind = meta.map(|m| m.kind.as_str()).unwrap_or("fn");
                 let layer = meta.map(|m| m.arch_layer.as_str()).unwrap_or("other");
+                let def_coord = meta
+                    .map(|m| format!(" at `{}:{}`", m.file, m.start_line))
+                    .unwrap_or_default();
                 out.push_str(&format!(
-                    "  -> [{}] `{}` (`{}`) ({}) via `{}:{}` [tier={}, layer={}, shard=`{}`]\n",
+                    "  -> [{}] `{}` (`{}`) ({}){} via `{}:{}` [tier={}, layer={}, shard=`{}`]\n",
                     idx + 1,
                     edge.callee_name,
                     edge.callee_id,
                     kind,
+                    def_coord,
                     edge.file,
                     edge.line,
                     edge.tier,
@@ -1760,7 +1894,21 @@ pub fn parallel_bundle_search(
     let search_xrefs = !search_source_explicit && (k == "all" || k.starts_with("xref"));
     let search_secs = !search_source_explicit && (k == "all" || k.starts_with("sec") || k == "md");
 
+    let query_is_path_like = pattern.contains('/')
+        || pattern.contains('\\')
+        || pattern.ends_with(".rs")
+        || pattern.ends_with(".c")
+        || pattern.ends_with(".h")
+        || pattern.ends_with(".cpp")
+        || pattern.ends_with(".hpp")
+        || pattern.ends_with(".py")
+        || pattern.ends_with(".ts")
+        || pattern.ends_with(".tsx")
+        || pattern.ends_with(".js");
+    let query_has_scope_sep = pattern.contains("::");
+
     let mut all_hits: Vec<SearchHit> = Vec::new();
+    let mut seen_coords: FxHashSet<(String, String, usize)> = FxHashSet::default();
 
     for bundle_dir in bundles {
         let bundle_name = bundle_name_from_dir(bundle_dir);
@@ -1768,9 +1916,8 @@ pub fn parallel_bundle_search(
         let tsv_targets = [
             (search_syms, "symbol", "symbols.tsv", 4usize, 5usize),
             (search_types, "type", "types.tsv", 4usize, 5usize),
-            (search_calls, "call", "calls.tsv", 4usize, 5usize),
             (search_macros, "macro", "macros.tsv", 4usize, 5usize),
-            (search_xrefs, "xref", "xref.tsv", 4usize, 5usize),
+            (search_calls, "call", "calls.tsv", 4usize, 5usize),
         ];
 
         for (enabled, hit_kind, filename, file_col, line_col) in tsv_targets {
@@ -1795,11 +1942,51 @@ pub fn parallel_bundle_search(
                     continue;
                 }
                 let cols: Vec<&str> = raw_line.split('\t').collect();
+                let semantic_match = if query_is_path_like {
+                    true
+                } else {
+                    match hit_kind {
+                        "symbol" => {
+                            cols.get(1).is_some_and(|c| matches_line(c))
+                                || cols.get(7).is_some_and(|c| matches_line(c))
+                                || cols.get(14).is_some_and(|c| matches_line(c))
+                                || (query_has_scope_sep
+                                    && cols.first().is_some_and(|c| matches_line(c)))
+                        }
+                        "type" => {
+                            cols.get(1).is_some_and(|c| matches_line(c))
+                                || cols.get(7).is_some_and(|c| matches_line(c))
+                                || cols.get(11).is_some_and(|c| matches_line(c))
+                                || (query_has_scope_sep
+                                    && cols.first().is_some_and(|c| matches_line(c)))
+                        }
+                        "macro" => {
+                            cols.first().is_some_and(|c| matches_line(c))
+                                || cols.get(2).is_some_and(|c| matches_line(c))
+                                || cols.get(3).is_some_and(|c| matches_line(c))
+                                || cols.get(9).is_some_and(|c| matches_line(c))
+                        }
+                        "call" => {
+                            cols.get(1).is_some_and(|c| matches_line(c))
+                                || cols.get(2).is_some_and(|c| matches_line(c))
+                                || (query_has_scope_sep
+                                    && (cols.first().is_some_and(|c| matches_line(c))
+                                        || cols.get(3).is_some_and(|c| matches_line(c))))
+                        }
+                        _ => true,
+                    }
+                };
+                if !semantic_match {
+                    continue;
+                }
                 let file = cols.get(file_col).copied().unwrap_or(filename).to_string();
                 let line = cols
                     .get(line_col)
                     .and_then(|s| s.parse::<usize>().ok())
                     .unwrap_or(0);
+                if !seen_coords.insert((bundle_name.clone(), file.clone(), line)) {
+                    continue;
+                }
                 all_hits.push(SearchHit {
                     bundle_name: bundle_name.clone(),
                     kind: hit_kind.to_string(),
@@ -1810,7 +1997,7 @@ pub fn parallel_bundle_search(
             }
         }
 
-        // Parallel scan across sections/*.md using Rayon
+        // Parallel scan across sections/*.md using Rayon (before xref.tsv so section hits aren't drowned out)
         let sections_dir = bundle_dir.join("sections");
         if search_secs && all_hits.len() < limit && sections_dir.exists() {
             let mut md_paths: Vec<PathBuf> = fs::read_dir(&sections_dir)
@@ -1858,7 +2045,52 @@ pub fn parallel_bundle_search(
                 if all_hits.len() >= limit {
                     break;
                 }
-                all_hits.push(hit);
+                if seen_coords.insert((bundle_name.clone(), hit.file.clone(), hit.line)) {
+                    all_hits.push(hit);
+                }
+            }
+        }
+
+        // Search `xref.tsv` last (deduplicating against symbol/type/macro/call coordinates)
+        if search_xrefs && all_hits.len() < limit {
+            let tsv_path = bundle_dir.join("index").join("xref.tsv");
+            if let Ok(content) = fs::read_to_string(&tsv_path) {
+                let has_match = simd_finder
+                    .as_ref()
+                    .is_none_or(|f| f.find(content.as_bytes()).is_some());
+                if has_match {
+                    for raw_line in content.lines().skip(1) {
+                        if all_hits.len() >= limit {
+                            break;
+                        }
+                        if !matches_line(raw_line) {
+                            continue;
+                        }
+                        let cols: Vec<&str> = raw_line.split('\t').collect();
+                        let semantic_match = query_is_path_like
+                            || cols.first().is_some_and(|c| matches_line(c))
+                            || cols.get(3).is_some_and(|c| matches_line(c))
+                            || cols.get(7).is_some_and(|c| matches_line(c));
+                        if !semantic_match {
+                            continue;
+                        }
+                        let file = cols.get(4).copied().unwrap_or("xref.tsv").to_string();
+                        let line = cols
+                            .get(5)
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if !seen_coords.insert((bundle_name.clone(), file.clone(), line)) {
+                            continue;
+                        }
+                        all_hits.push(SearchHit {
+                            bundle_name: bundle_name.clone(),
+                            kind: "xref".to_string(),
+                            file,
+                            line,
+                            snippet: raw_line.replace('\t', " | "),
+                        });
+                    }
+                }
             }
         }
     }
@@ -1968,27 +2200,111 @@ fn bundles_have_exact_symbol(bundles: &[PathBuf], q_trim: &str, q_lower: &str) -
     false
 }
 
+/// Pre-parsed query representation for zero-allocation hardware/code identifier scoring.
+struct QueryHw<'a> {
+    raw: &'a str,
+    canon: String,
+    upper: String,
+    splits: [Option<(&'a str, &'a str)>; 2],
+    hex: Option<String>,
+    is_hex: bool,
+    fast_prefix: String,
+}
+
+impl<'a> QueryHw<'a> {
+    fn new(query: &'a str) -> Self {
+        let raw = query.trim();
+        let lower = raw.to_ascii_lowercase();
+        let hex = normalize_query_hex_literal(raw);
+        let is_hex = hex.is_some() && (lower.starts_with("0x") || lower.ends_with('h'));
+        let mut canon_buf = [0u8; 128];
+        let canon = canon_hw_buf(raw, &mut canon_buf).to_string();
+        let upper = raw.to_ascii_uppercase();
+        let splits = split_periph_reg_array(raw);
+        let fast_prefix = extract_fast_hw_prefix(raw);
+        Self {
+            raw,
+            canon,
+            upper,
+            splits,
+            hex,
+            is_hex,
+            fast_prefix,
+        }
+    }
+}
+
+fn extract_fast_hw_prefix(raw: &str) -> String {
+    let trimmed = raw.trim().trim_start_matches('_');
+    let first_tok: String = trimmed
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if first_tok.len() < 3 {
+        return String::new();
+    }
+    let upper = first_tok.to_ascii_uppercase();
+    let stripped = strip_periph_instance_slice(&upper);
+    if stripped.len() >= 3 {
+        stripped.to_string()
+    } else {
+        upper
+    }
+}
+
+#[inline]
+fn ascii_contains_ignore_case(haystack: &[u8], needle_upper_or_lower: &[u8]) -> bool {
+    let nlen = needle_upper_or_lower.len();
+    if nlen == 0 {
+        return true;
+    }
+    if haystack.len() < nlen {
+        return false;
+    }
+    let first_lo = needle_upper_or_lower[0].to_ascii_lowercase();
+    let first_hi = needle_upper_or_lower[0].to_ascii_uppercase();
+    let max_start = haystack.len() - nlen;
+    let mut i = 0;
+    while i <= max_start {
+        let b = haystack[i];
+        if (b == first_lo || b == first_hi)
+            && haystack[i..i + nlen].eq_ignore_ascii_case(needle_upper_or_lower)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Normalizes and scores hardware/code identifier matches across `PERIPH_REG`, `PERIPH->REG`, `PERIPH.REG`, and `PERIPH::REG`.
+#[cfg(test)]
 fn score_hw_identifier_match(candidate: &str, query: &str) -> u8 {
+    let q_hw = QueryHw::new(query);
+    score_hw_identifier_match_prepared(candidate, &q_hw)
+}
+
+fn score_hw_identifier_match_prepared(candidate: &str, q: &QueryHw<'_>) -> u8 {
     let c_trim = candidate.trim();
-    let q_trim = query.trim();
-    if c_trim.is_empty() || q_trim.is_empty() {
+    if c_trim.is_empty() || q.raw.is_empty() {
         return 0;
     }
 
-    if c_trim.eq_ignore_ascii_case(q_trim) {
+    if c_trim.eq_ignore_ascii_case(q.raw) {
         return 4;
     }
 
-    let c_canon = canonicalize_hw_ident(c_trim);
-    let q_canon = canonicalize_hw_ident(q_trim);
-    if !c_canon.is_empty() && c_canon == q_canon {
+    let mut c_canon_buf = [0u8; 128];
+    let c_canon = canon_hw_buf(c_trim, &mut c_canon_buf);
+    if !c_canon.is_empty() && c_canon == q.canon {
         return 4;
     }
+
+    let c_splits = split_periph_reg_array(c_trim);
 
     // Check peripheral prefix + register suffix splitting (both first and last `_` splits)
-    for (cp, cr) in split_periph_reg_candidates(c_trim) {
-        for (qp, qr) in split_periph_reg_candidates(q_trim) {
+    for (cp, cr) in c_splits.into_iter().flatten() {
+        for (qp, qr) in q.splits.into_iter().flatten() {
             if periph_stems_compatible(cp, qp) && cr.eq_ignore_ascii_case(qr) {
                 return 3;
             }
@@ -1996,79 +2312,95 @@ fn score_hw_identifier_match(candidate: &str, query: &str) -> u8 {
     }
 
     // Check if query is a peripheral name (e.g. "GPIOA" or "GPIO") matching "GPIOA->MODER" or "GPIOA_MODER"
-    for (cp, cr) in split_periph_reg_candidates(c_trim) {
-        if cp.eq_ignore_ascii_case(q_trim) || cr.eq_ignore_ascii_case(q_trim) {
+    for (cp, cr) in c_splits.into_iter().flatten() {
+        if cp.eq_ignore_ascii_case(q.raw) || cr.eq_ignore_ascii_case(q.raw) {
             return 3;
         }
-        if periph_stems_compatible(cp, q_trim) {
+        if periph_stems_compatible(cp, q.raw) {
             return 2;
         }
     }
 
-    let c_upper = c_trim.to_ascii_uppercase();
-    let q_upper = q_trim.to_ascii_uppercase();
-    if c_upper.contains(&q_upper) || c_canon.contains(&q_canon) {
+    if ascii_contains_ignore_case(c_trim.as_bytes(), q.upper.as_bytes())
+        || (!q.canon.is_empty() && c_canon.contains(q.canon.as_str()))
+    {
         return 2;
     }
 
     0
 }
 
-fn canonicalize_hw_ident(s: &str) -> String {
-    s.trim()
-        .trim_start_matches('_')
-        .replace("->", "_")
-        .replace("::", "_")
-        .replace('.', "_")
-        .to_ascii_uppercase()
+fn canon_hw_buf<'a>(s: &str, buf: &'a mut [u8; 128]) -> &'a str {
+    let bytes = s.trim().trim_start_matches('_').as_bytes();
+    let mut len = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() && len < buf.len() {
+        if i + 1 < bytes.len()
+            && ((bytes[i] == b'-' && bytes[i + 1] == b'>')
+                || (bytes[i] == b':' && bytes[i + 1] == b':'))
+        {
+            buf[len] = b'_';
+            len += 1;
+            i += 2;
+        } else if bytes[i] == b'.' {
+            buf[len] = b'_';
+            len += 1;
+            i += 1;
+        } else {
+            buf[len] = bytes[i].to_ascii_uppercase();
+            len += 1;
+            i += 1;
+        }
+    }
+    std::str::from_utf8(&buf[..len]).unwrap_or("")
 }
 
-fn split_periph_reg_candidates(s: &str) -> Vec<(&str, &str)> {
+fn split_periph_reg_array(s: &str) -> [Option<(&str, &str)>; 2] {
     let trimmed = s.trim().trim_start_matches('_');
     if let Some(pair) = trimmed
         .split_once("->")
         .or_else(|| trimmed.split_once('.'))
         .or_else(|| trimmed.split_once("::"))
     {
-        return vec![pair];
+        return [Some(pair), None];
     }
-    let mut out = Vec::new();
-    if let Some(first) = trimmed.split_once('_') {
-        out.push(first);
+    let first = trimmed.split_once('_');
+    let last = trimmed.rsplit_once('_').filter(|&l| Some(l) != first);
+    [first, last]
+}
+
+fn strip_periph_instance_slice(tok: &str) -> &str {
+    if tok.len() >= 4 && tok.ends_with(['X', 'x']) {
+        return &tok[..tok.len() - 1];
     }
-    if let Some(last) = trimmed.rsplit_once('_') {
-        if !out.contains(&last) {
-            out.push(last);
-        }
+    if tok.len() == 5
+        && tok[..4].eq_ignore_ascii_case("GPIO")
+        && tok.as_bytes()[4].is_ascii_alphabetic()
+    {
+        return &tok[..4];
     }
-    out
+    let trimmed = tok.trim_end_matches(|c: char| c.is_ascii_digit());
+    if trimmed.len() >= 3 {
+        trimmed
+    } else {
+        tok
+    }
 }
 
 fn periph_stems_compatible(a: &str, b: &str) -> bool {
-    let au = a.trim().trim_start_matches('_').to_ascii_uppercase();
-    let bu = b.trim().trim_start_matches('_').to_ascii_uppercase();
-    if au == bu {
+    let a_trim = a.trim().trim_start_matches('_');
+    let b_trim = b.trim().trim_start_matches('_');
+    if a_trim.eq_ignore_ascii_case(b_trim) {
         return true;
     }
-    let strip_inst = |tok: &str| -> String {
-        if tok.len() >= 4 && tok.ends_with('X') {
-            return tok[..tok.len() - 1].to_string();
-        }
-        if tok.len() == 5 && tok.starts_with("GPIO") && tok.as_bytes()[4].is_ascii_uppercase() {
-            return "GPIO".to_string();
-        }
-        let trimmed = tok.trim_end_matches(|c: char| c.is_ascii_digit());
-        if trimmed.len() >= 3 {
-            trimmed.to_string()
-        } else {
-            tok.to_string()
-        }
-    };
-    let sa = strip_inst(&au);
-    let sb = strip_inst(&bu);
+    let sa = strip_periph_instance_slice(a_trim);
+    let sb = strip_periph_instance_slice(b_trim);
     sa.len() >= 3
-        && sa == sb
-        && (au == sa || bu == sb || a.ends_with(['x', 'X']) || b.ends_with(['x', 'X']))
+        && sa.eq_ignore_ascii_case(sb)
+        && (a_trim.len() == sa.len()
+            || b_trim.len() == sb.len()
+            || a_trim.ends_with(['x', 'X'])
+            || b_trim.ends_with(['x', 'X']))
 }
 
 /// Caches `source_root` per bundle and file line vectors across hits within a single query
@@ -2162,6 +2494,501 @@ fn bundle_name_from_dir(bundle_dir: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("bundle")
         .to_string()
+}
+
+/// Executes a structured JSON query for `subcommand` (`sym`, `callers`, `callees`, `type`,
+/// `macro`, `section`, `xref`, `path`, `impact`) across `bundles`.
+pub fn query_subcommand_json(
+    subcommand: &str,
+    bundles: &[PathBuf],
+    query: &str,
+    secondary_query: Option<&str>,
+    kind_filter: Option<&str>,
+    max_depth: usize,
+    limit: usize,
+) -> Result<String> {
+    let q_trim = query.trim();
+    let q_lower = q_trim.to_ascii_lowercase();
+
+    match subcommand {
+        "sym" => {
+            let kind_lower = kind_filter.map(|k| k.trim().to_ascii_lowercase());
+            let mut items = Vec::new();
+            for bundle_dir in bundles {
+                let sym_tsv = bundle_dir.join("index").join("symbols.tsv");
+                let Ok(content) = fs::read_to_string(&sym_tsv) else {
+                    continue;
+                };
+                let bundle_name = bundle_name_from_dir(bundle_dir);
+                for line in content.lines().skip(1) {
+                    let cols: Vec<&str> = line.split('\t').collect();
+                    if cols.len() < 14 {
+                        continue;
+                    }
+                    let symbol_id = cols[0];
+                    let name = cols[1];
+                    let kind = cols[2];
+                    if let Some(ref kf) = kind_lower {
+                        if !kind.eq_ignore_ascii_case(kf)
+                            && !kind.to_ascii_lowercase().starts_with(kf)
+                        {
+                            continue;
+                        }
+                    }
+                    let id_view = parse_symbol_id(symbol_id);
+                    let name_lower = name.to_ascii_lowercase();
+                    let scoped_lower = id_view.scoped.to_ascii_lowercase();
+                    let sig_lower = cols[7].to_ascii_lowercase();
+                    let targets_file = query_targets_file(q_trim);
+                    let score = if q_lower.is_empty() {
+                        1u8
+                    } else if name == q_trim
+                        || id_view.scoped == q_trim
+                        || id_view.short == q_trim
+                        || symbol_id == q_trim
+                    {
+                        5
+                    } else if name_lower == q_lower
+                        || scoped_lower == q_lower
+                        || id_view.short.eq_ignore_ascii_case(q_trim)
+                        || (targets_file && symbol_id.eq_ignore_ascii_case(q_trim))
+                    {
+                        4
+                    } else if name_lower.starts_with(&q_lower)
+                        || scoped_lower.ends_with(&format!("::{q_lower}"))
+                        || (targets_file && id_view.file.to_ascii_lowercase().contains(&q_lower))
+                    {
+                        3
+                    } else if name_lower.contains(&q_lower)
+                        || scoped_lower.contains(&q_lower)
+                        || sig_lower.contains(&q_lower)
+                    {
+                        2
+                    } else {
+                        0
+                    };
+                    if score == 0 {
+                        continue;
+                    }
+                    items.push((
+                        score,
+                        serde_json::json!({
+                            "bundle": bundle_name,
+                            "symbol_id": symbol_id,
+                            "name": name,
+                            "kind": kind,
+                            "visibility": cols[3],
+                            "file": cols[4],
+                            "start_line": cols[5].parse::<usize>().unwrap_or(1),
+                            "end_line": cols[6].parse::<usize>().unwrap_or(1),
+                            "signature": cols[7],
+                            "pagerank": cols[8].parse::<f64>().unwrap_or(0.0),
+                            "in_degree": cols[9].parse::<usize>().unwrap_or(0),
+                            "out_degree": cols[10].parse::<usize>().unwrap_or(0),
+                            "arch_layer": cols[11],
+                            "scope": cols[12],
+                            "section_id": cols[13],
+                            "doc_summary": cols.get(14).copied().unwrap_or(""),
+                            "hub_score": cols.get(15).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0),
+                            "authority_score": cols.get(16).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0),
+                        }),
+                    ));
+                }
+            }
+            if items.iter().any(|(s, _)| *s >= 4) {
+                items.retain(|(s, _)| *s >= 3);
+            }
+            items.sort_by_key(|a| std::cmp::Reverse(a.0));
+            let out: Vec<serde_json::Value> =
+                items.into_iter().take(limit).map(|(_, v)| v).collect();
+            Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| "[]".to_string()))
+        }
+        "callers" | "callees" => {
+            let is_callers = subcommand == "callers";
+            let has_exact_sym = bundles_have_exact_symbol(bundles, q_trim, &q_lower);
+            let suffix = format!("::{q_lower}");
+            let mut items = Vec::new();
+            for bundle_dir in bundles {
+                let calls_tsv = bundle_dir.join("index").join("calls.tsv");
+                let Ok(content) = fs::read_to_string(&calls_tsv) else {
+                    continue;
+                };
+                let bundle_name = bundle_name_from_dir(bundle_dir);
+                for line in content.lines().skip(1) {
+                    let cols: Vec<&str> = line.split('\t').collect();
+                    if cols.len() < 8 {
+                        continue;
+                    }
+                    let (target_name, target_id) = if is_callers {
+                        (cols[2], cols[3])
+                    } else {
+                        (cols[1], cols[0])
+                    };
+                    let id_view = parse_symbol_id(target_id);
+                    let t_lower = target_name.to_ascii_lowercase();
+                    let scoped_lower = id_view.scoped.to_ascii_lowercase();
+                    let targets_file = query_targets_file(q_trim);
+                    let score = if target_name == q_trim
+                        || id_view.scoped == q_trim
+                        || id_view.short == q_trim
+                        || target_id == q_trim
+                    {
+                        4u8
+                    } else if t_lower == q_lower
+                        || scoped_lower == q_lower
+                        || id_view.short.eq_ignore_ascii_case(q_trim)
+                        || scoped_lower.ends_with(&suffix)
+                        || (targets_file && id_view.file.to_ascii_lowercase().contains(&q_lower))
+                    {
+                        3
+                    } else if !has_exact_sym
+                        && (t_lower.contains(&q_lower) || scoped_lower.contains(&q_lower))
+                    {
+                        2
+                    } else {
+                        0
+                    };
+                    if score == 0 {
+                        continue;
+                    }
+                    items.push((
+                        score,
+                        serde_json::json!({
+                            "bundle": bundle_name,
+                            "caller_id": cols[0],
+                            "caller_name": cols[1],
+                            "callee_name": cols[2],
+                            "callee_id": cols[3],
+                            "file": cols[4],
+                            "line": cols[5].parse::<usize>().unwrap_or(1),
+                            "tier": cols[6],
+                            "section_id": cols[7],
+                        }),
+                    ));
+                }
+            }
+            if items.iter().any(|(s, _)| *s >= 3) {
+                items.retain(|(s, _)| *s >= 3);
+            }
+            items.sort_by_key(|a| std::cmp::Reverse(a.0));
+            let out: Vec<serde_json::Value> =
+                items.into_iter().take(limit).map(|(_, v)| v).collect();
+            Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| "[]".to_string()))
+        }
+        "type" => {
+            let mut items = Vec::new();
+            for bundle_dir in bundles {
+                let typ_tsv = bundle_dir.join("index").join("types.tsv");
+                let Ok(content) = fs::read_to_string(&typ_tsv) else {
+                    continue;
+                };
+                let bundle_name = bundle_name_from_dir(bundle_dir);
+                for line in content.lines().skip(1) {
+                    let cols: Vec<&str> = line.split('\t').collect();
+                    if cols.len() < 11 {
+                        continue;
+                    }
+                    let type_id = cols[0];
+                    let name = cols[1];
+                    let fields = cols[7];
+                    let id_view = parse_symbol_id(type_id);
+                    let name_lower = name.to_ascii_lowercase();
+                    let scoped_lower = id_view.scoped.to_ascii_lowercase();
+                    let fields_lower = fields.to_ascii_lowercase();
+                    let targets_file = query_targets_file(q_trim);
+                    let score = if q_lower.is_empty() {
+                        1u8
+                    } else if name == q_trim || id_view.scoped == q_trim || type_id == q_trim {
+                        5
+                    } else if name_lower == q_lower
+                        || scoped_lower == q_lower
+                        || (targets_file && type_id.eq_ignore_ascii_case(q_trim))
+                    {
+                        4
+                    } else if name_lower.starts_with(&q_lower)
+                        || (targets_file && id_view.file.to_ascii_lowercase().contains(&q_lower))
+                    {
+                        3
+                    } else if name_lower.contains(&q_lower)
+                        || scoped_lower.contains(&q_lower)
+                        || fields_lower.contains(&q_lower)
+                    {
+                        2
+                    } else {
+                        0
+                    };
+                    if score == 0 {
+                        continue;
+                    }
+                    items.push((
+                        score,
+                        serde_json::json!({
+                            "bundle": bundle_name,
+                            "type_id": type_id,
+                            "name": name,
+                            "kind": cols[2],
+                            "visibility": cols[3],
+                            "file": cols[4],
+                            "start_line": cols[5].parse::<usize>().unwrap_or(1),
+                            "end_line": cols[6].parse::<usize>().unwrap_or(1),
+                            "fields_summary": fields,
+                            "arch_layer": cols[8],
+                            "scope": cols[9],
+                            "section_id": cols[10],
+                            "doc_summary": cols.get(11).copied().unwrap_or(""),
+                        }),
+                    ));
+                }
+            }
+            if items.iter().any(|(s, _)| *s >= 4) {
+                items.retain(|(s, _)| *s >= 3);
+            }
+            items.sort_by_key(|a| std::cmp::Reverse(a.0));
+            let out: Vec<serde_json::Value> =
+                items.into_iter().take(limit).map(|(_, v)| v).collect();
+            Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| "[]".to_string()))
+        }
+        "macro" => {
+            let q_hw = QueryHw::new(q_trim);
+            let mut items = Vec::new();
+            for bundle_dir in bundles {
+                let mac_tsv = bundle_dir.join("index").join("macros.tsv");
+                let Ok(content) = fs::read_to_string(&mac_tsv) else {
+                    continue;
+                };
+                let bundle_name = bundle_name_from_dir(bundle_dir);
+                for line in content.lines().skip(1) {
+                    let cols: Vec<&str> = line.split('\t').collect();
+                    if cols.len() < 10 {
+                        continue;
+                    }
+                    let name = cols[0];
+                    let val = cols[2];
+                    let hex_col = cols[3];
+                    let desc = cols[9];
+                    let row_hex = if hex_col != "-" && !hex_col.is_empty() {
+                        normalize_hex_literal(hex_col)
+                    } else {
+                        normalize_hex_literal(val)
+                    };
+                    let hex_exact = match (&q_hw.hex, &row_hex) {
+                        (Some(qh), Some(rh)) => qh.eq_ignore_ascii_case(rh),
+                        _ => false,
+                    };
+                    let score = if hex_exact {
+                        5u8
+                    } else if q_hw.is_hex {
+                        0
+                    } else {
+                        let id_score = score_hw_identifier_match_prepared(name, &q_hw);
+                        let val_score = if !q_lower.is_empty()
+                            && (ascii_contains_ignore_case(val.as_bytes(), q_lower.as_bytes())
+                                || ascii_contains_ignore_case(desc.as_bytes(), q_lower.as_bytes()))
+                        {
+                            1
+                        } else {
+                            0
+                        };
+                        id_score.max(val_score)
+                    };
+                    if score == 0 {
+                        continue;
+                    }
+                    items.push((
+                        score,
+                        serde_json::json!({
+                            "bundle": bundle_name,
+                            "name": name,
+                            "kind": cols[1],
+                            "value": val,
+                            "hex_addr": hex_col,
+                            "file": cols[4],
+                            "line": cols[5].parse::<usize>().unwrap_or(1),
+                            "arch_layer": cols[6],
+                            "scope": cols[7],
+                            "section_id": cols[8],
+                            "description": desc,
+                        }),
+                    ));
+                }
+            }
+            if items.iter().any(|(s, _)| *s >= 3) {
+                items.retain(|(s, _)| *s >= 2);
+            }
+            items.sort_by_key(|a| std::cmp::Reverse(a.0));
+            let out: Vec<serde_json::Value> =
+                items.into_iter().take(limit).map(|(_, v)| v).collect();
+            Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| "[]".to_string()))
+        }
+        "section" => {
+            let mut items = Vec::new();
+            for bundle_dir in bundles {
+                let sec_tsv = bundle_dir.join("index").join("sections.tsv");
+                let Ok(content) = fs::read_to_string(&sec_tsv) else {
+                    continue;
+                };
+                let bundle_name = bundle_name_from_dir(bundle_dir);
+                for line in content.lines().skip(1) {
+                    let cols: Vec<&str> = line.split('\t').collect();
+                    if cols.len() < 11 {
+                        continue;
+                    }
+                    let section_id = cols[0];
+                    let title = cols[1];
+                    let module_path = cols[2];
+                    let arch_layer = cols[3];
+                    let scope = cols[4];
+                    let sec_lower = section_id.to_ascii_lowercase();
+                    let mod_lower = module_path.to_ascii_lowercase();
+                    let title_lower = title.to_ascii_lowercase();
+                    let layer_lower = arch_layer.to_ascii_lowercase();
+                    let score = if q_lower.is_empty() {
+                        1u8
+                    } else if sec_lower == q_lower || mod_lower == q_lower || layer_lower == q_lower
+                    {
+                        4
+                    } else if sec_lower.ends_with(&format!("-{q_lower}"))
+                        || sec_lower.starts_with(&q_lower)
+                        || mod_lower.contains(&q_lower)
+                    {
+                        3
+                    } else if title_lower.contains(&q_lower)
+                        || scope.to_ascii_lowercase().contains(&q_lower)
+                    {
+                        2
+                    } else {
+                        0
+                    };
+                    if score == 0 {
+                        continue;
+                    }
+                    items.push((
+                        score,
+                        section_id.to_string(),
+                        serde_json::json!({
+                            "bundle": bundle_name,
+                            "section_id": section_id,
+                            "title": title,
+                            "module_path": module_path,
+                            "arch_layer": arch_layer,
+                            "scope": scope,
+                            "file_count": cols[5].parse::<usize>().unwrap_or(0),
+                            "symbol_count": cols[6].parse::<usize>().unwrap_or(0),
+                            "type_count": cols[7].parse::<usize>().unwrap_or(0),
+                            "macro_count": cols[8].parse::<usize>().unwrap_or(0),
+                            "token_estimate": cols[9].parse::<usize>().unwrap_or(0),
+                            "markdown_file": cols[10],
+                        }),
+                    ));
+                }
+            }
+            items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            let out: Vec<serde_json::Value> =
+                items.into_iter().take(limit).map(|(_, _, v)| v).collect();
+            Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| "[]".to_string()))
+        }
+        "xref" => {
+            let q_hw = QueryHw::new(q_trim);
+            let mut items = Vec::new();
+            for bundle_dir in bundles {
+                let xref_tsv = bundle_dir.join("index").join("xref.tsv");
+                let Ok(content) = fs::read_to_string(&xref_tsv) else {
+                    continue;
+                };
+                let bundle_name = bundle_name_from_dir(bundle_dir);
+                for line in content.lines().skip(1) {
+                    if !q_hw.is_hex
+                        && !q_hw.fast_prefix.is_empty()
+                        && !ascii_contains_ignore_case(line.as_bytes(), q_hw.fast_prefix.as_bytes())
+                    {
+                        continue;
+                    }
+                    let cols: Vec<&str> = line.split('\t').collect();
+                    if cols.len() < 8 {
+                        continue;
+                    }
+                    let sym = cols[0];
+                    let target = cols[3];
+                    let context = cols[7];
+                    let hex_match = match &q_hw.hex {
+                        Some(qh) => {
+                            normalize_hex_literal(sym).is_some_and(|sh| sh.eq_ignore_ascii_case(qh))
+                                || normalize_hex_literal(target)
+                                    .is_some_and(|th| th.eq_ignore_ascii_case(qh))
+                                || normalize_hex_literal(context)
+                                    .is_some_and(|ch| ch.eq_ignore_ascii_case(qh))
+                        }
+                        None => false,
+                    };
+                    let score = if hex_match {
+                        5u8
+                    } else if q_hw.is_hex {
+                        0
+                    } else {
+                        let sym_score = score_hw_identifier_match_prepared(sym, &q_hw);
+                        let target_score = score_hw_identifier_match_prepared(target, &q_hw);
+                        let ctx_score = if !q_lower.is_empty()
+                            && ascii_contains_ignore_case(context.as_bytes(), q_lower.as_bytes())
+                        {
+                            1
+                        } else {
+                            0
+                        };
+                        sym_score.max(target_score).max(ctx_score)
+                    };
+                    if score == 0 {
+                        continue;
+                    }
+                    items.push((
+                        score,
+                        serde_json::json!({
+                            "bundle": bundle_name,
+                            "symbol": sym,
+                            "category": cols[1],
+                            "relation": cols[2],
+                            "target": target,
+                            "file": cols[4],
+                            "line": cols[5].parse::<usize>().unwrap_or(1),
+                            "section_id": cols[6],
+                            "context": context,
+                        }),
+                    ));
+                }
+            }
+            if items.iter().any(|(s, _)| *s >= 3) {
+                items.retain(|(s, _)| *s >= 2);
+            }
+            items.sort_by_key(|a| std::cmp::Reverse(a.0));
+            let out: Vec<serde_json::Value> =
+                items.into_iter().take(limit).map(|(_, v)| v).collect();
+            Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| "[]".to_string()))
+        }
+        "path" => {
+            let to_q = secondary_query.unwrap_or("");
+            let text = query_call_path(bundles, query, to_q, max_depth)?;
+            let found = !text.starts_with("No call path found");
+            let payload = serde_json::json!({
+                "from": query,
+                "to": to_q,
+                "max_depth": max_depth,
+                "found": found,
+                "summary": text.trim(),
+            });
+            Ok(serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string()))
+        }
+        "impact" => {
+            let text = query_impact(bundles, query, max_depth, limit)?;
+            let found = !text.starts_with("No symbol or call edges matched");
+            let payload = serde_json::json!({
+                "symbol": query,
+                "max_depth": max_depth,
+                "found": found,
+                "summary": text.trim(),
+            });
+            Ok(serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string()))
+        }
+        _ => Ok("[]".to_string()),
+    }
 }
 
 #[cfg(test)]

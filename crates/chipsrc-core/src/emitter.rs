@@ -1,9 +1,11 @@
 use crate::error::{ChipsrcError, Result};
 use crate::model::{
-    BundleIndexes, BundleMetaFile, ConvertConfig, ExtractedType, FileScope, IncrementalAstCache,
-    RankedSymbol, RepoMetadata, SanityReport, SectionShard,
+    ArchLayer, BundleIndexes, BundleMetaFile, CacheManifest, CacheShardEntry, ConvertConfig,
+    ExtractedType, FileScope, IncrementalAstCache, RankedSymbol, RepoMetadata, SanityReport,
+    SectionShard, SymbolKind, TypeKind, Visibility,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -153,14 +155,14 @@ pub fn emit_bundle(
     }
     write_file(&index_dir.join("sections.tsv"), &sec_tsv)?;
 
-    // 4. Write index/symbols.tsv (includes doc_summary as 15th column)
+    // 4. Write index/symbols.tsv (includes doc_summary as 15th column, plus hub_score and authority_score)
     let mut sym_tsv = String::from(
-        "symbol_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tsignature\tpagerank\tin_deg\tout_deg\tarch_layer\tscope\tsection_id\tdoc_summary\n",
+        "symbol_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tsignature\tpagerank\tin_deg\tout_deg\tarch_layer\tscope\tsection_id\tdoc_summary\thub_score\tauthority_score\n",
     );
     for rs in &indexes.symbols {
         let s = &rs.symbol;
         sym_tsv.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\n",
             sanitize_tsv(&s.symbol_id),
             sanitize_tsv(&s.name),
             s.kind.as_str(),
@@ -176,6 +178,8 @@ pub fn emit_bundle(
             s.scope.as_str(),
             sanitize_tsv(&s.section_id),
             sanitize_tsv(&s.doc_summary),
+            rs.hub_score,
+            rs.authority_score,
         ));
     }
     write_file(&index_dir.join("symbols.tsv"), &sym_tsv)?;
@@ -269,9 +273,8 @@ pub fn emit_bundle(
     let meta_json = serde_json::to_string_pretty(&meta_file)?;
     write_file(&output_dir.join("meta.json"), &meta_json)?;
 
-    // 10. Write cache.json (compact single-line JSON for fast I/O and minimal footprint)
-    let cache_json = serde_json::to_string(cache)?;
-    write_file(&output_dir.join("cache.json"), &cache_json)?;
+    // 10. Write per-file AST cache shards under `cache/` (`cache/manifest.json` + `cache/<blake3>.json`)
+    emit_cache_shards(output_dir, cache)?;
 
     // 11. Optional <repo_name>.md if config.single_file is true
     if config.single_file {
@@ -409,13 +412,23 @@ fn build_master_index_markdown(
     // Entrypoints & Interrupt Service Routines (ISRs)
     lines.push("## Entrypoints & Interrupt Service Routines (ISRs)".to_string());
     lines.push(String::new());
-    let entrypoints_list = select_entrypoints(indexes);
-    if entrypoints_list.is_empty() {
+    let (entrypoints_list, isrs_list) = select_entrypoints(indexes);
+    if entrypoints_list.is_empty() && isrs_list.is_empty() {
         lines.push("_No explicit entrypoints or ISRs detected._".to_string());
     } else {
         lines.push("| Symbol | Kind | Layer | Location | Out-Calls | Signature |".to_string());
         lines.push("| --- | --- | --- | --- | ---: | --- |".to_string());
-        for rs in entrypoints_list.iter().take(25) {
+        let ep_quota = if isrs_list.len() > 17 {
+            8.min(entrypoints_list.len())
+        } else {
+            (25usize.saturating_sub(isrs_list.len())).min(entrypoints_list.len())
+        };
+        let isr_quota = 25usize.saturating_sub(ep_quota).min(isrs_list.len());
+        for rs in entrypoints_list
+            .iter()
+            .take(ep_quota)
+            .chain(isrs_list.iter().take(isr_quota))
+        {
             let s = &rs.symbol;
             lines.push(format!(
                 "| `{}` | `{}` | `{}` | `{}:{}-{}` | {} | `{}` |",
@@ -427,6 +440,12 @@ fn build_master_index_markdown(
                 s.end_line,
                 rs.out_degree,
                 escape_table(&s.signature)
+            ));
+        }
+        if isrs_list.len() > isr_quota {
+            lines.push(format!(
+                "_… +{} more ISRs indexed in `index/symbols.tsv`_",
+                isrs_list.len() - isr_quota
             ));
         }
     }
@@ -579,11 +598,102 @@ fn build_master_index_markdown(
     lines.join("\n")
 }
 
-fn select_entrypoints(indexes: &BundleIndexes) -> Vec<&RankedSymbol> {
-    if !indexes.entrypoints.is_empty() && indexes.entrypoints.iter().any(|r| r.is_entrypoint) {
-        return indexes.entrypoints.iter().collect();
+/// Writes `cache/manifest.json` and per-file `cache/<blake3_hash>.json` shards, deleting
+/// orphaned shards and any legacy `cache.json` file.
+pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Result<()> {
+    let cache_dir = output_dir.join("cache");
+    create_dir(&cache_dir)?;
+
+    let mut manifest_files: BTreeMap<String, CacheShardEntry> = BTreeMap::new();
+    let mut expected_shard_names: FxHashSet<String> = FxHashSet::default();
+
+    for (rel_path, unit) in &cache.files {
+        let hash = &unit.scanned.blake3_hash;
+        let shard_fname = format!("{hash}.json");
+        let shard_rel = format!("cache/{shard_fname}");
+        let shard_path = cache_dir.join(&shard_fname);
+
+        if !shard_path.is_file() {
+            let unit_json = serde_json::to_string(unit)?;
+            fs::write(&shard_path, unit_json.as_bytes())
+                .map_err(|source| ChipsrcError::io(&shard_path, source))?;
+        }
+
+        expected_shard_names.insert(shard_fname);
+        manifest_files.insert(
+            rel_path.clone(),
+            CacheShardEntry {
+                blake3_hash: hash.clone(),
+                shard: shard_rel,
+                structural_digest: unit.structural_digest(),
+            },
+        );
     }
-    indexes.symbols.iter().filter(|r| r.is_entrypoint).collect()
+
+    if let Ok(entries) = fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("json") {
+                let keep = p.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
+                    name == "manifest.json" || expected_shard_names.contains(name)
+                });
+                if !keep {
+                    let _ = fs::remove_file(p);
+                }
+            }
+        }
+    }
+
+    let manifest = CacheManifest {
+        schema_version: cache.schema_version.clone(),
+        repo_root: cache.repo_root.clone(),
+        vendor_mode: cache.vendor_mode,
+        fingerprint: cache.fingerprint.clone(),
+        blueprint_hash: cache.blueprint_hash.clone(),
+        files: manifest_files,
+    };
+    let manifest_json = serde_json::to_string(&manifest)?;
+    write_file(&cache_dir.join("manifest.json"), &manifest_json)?;
+
+    let legacy_cache = output_dir.join("cache.json");
+    if legacy_cache.is_file() {
+        let _ = fs::remove_file(legacy_cache);
+    }
+
+    Ok(())
+}
+
+fn select_entrypoints(indexes: &BundleIndexes) -> (Vec<&RankedSymbol>, Vec<&RankedSymbol>) {
+    let source: Vec<&RankedSymbol> =
+        if !indexes.entrypoints.is_empty() && indexes.entrypoints.iter().any(|r| r.is_entrypoint) {
+            indexes.entrypoints.iter().collect()
+        } else {
+            indexes.symbols.iter().filter(|r| r.is_entrypoint).collect()
+        };
+
+    let mut entrypoints = Vec::new();
+    let mut isrs = Vec::new();
+    for rs in source {
+        if rs.symbol.kind == SymbolKind::Isr {
+            isrs.push(rs);
+        } else {
+            entrypoints.push(rs);
+        }
+    }
+
+    let sort_fn = |a: &&RankedSymbol, b: &&RankedSymbol| {
+        let fp_a = a.symbol.scope != FileScope::FirstParty;
+        let fp_b = b.symbol.scope != FileScope::FirstParty;
+        fp_a.cmp(&fp_b)
+            .then_with(|| b.pagerank.total_cmp(&a.pagerank))
+            .then_with(|| a.symbol.file.cmp(&b.symbol.file))
+            .then_with(|| a.symbol.start_line.cmp(&b.symbol.start_line))
+            .then_with(|| a.symbol.symbol_id.cmp(&b.symbol.symbol_id))
+    };
+    entrypoints.sort_by(sort_fn);
+    isrs.sort_by(sort_fn);
+
+    (entrypoints, isrs)
 }
 
 fn select_god_nodes(indexes: &BundleIndexes) -> Vec<&RankedSymbol> {
@@ -595,27 +705,91 @@ fn select_god_nodes(indexes: &BundleIndexes) -> Vec<&RankedSymbol> {
     nodes
 }
 
+fn is_excluded_std_type_alias(t: &ExtractedType, total_types: usize) -> bool {
+    if total_types <= 5 || t.kind != TypeKind::TypeAlias {
+        return false;
+    }
+    matches!(
+        t.name.as_str(),
+        "Result" | "Error" | "Option" | "Box" | "Rc" | "Arc"
+    ) || t.fields_summary.starts_with("std::")
+        || t.fields_summary.starts_with("core::")
+}
+
 fn select_core_domain_types(indexes: &BundleIndexes) -> Vec<(&ExtractedType, usize)> {
     if indexes.types.is_empty() {
         return Vec::new();
     }
+    let total_types = indexes.types.len();
     let has_first_party = indexes
         .types
         .iter()
         .any(|t| t.scope == FileScope::FirstParty);
 
-    let mut ref_counts: FxHashMap<&str, usize> = FxHashMap::default();
+    let candidate_types: Vec<&ExtractedType> = indexes
+        .types
+        .iter()
+        .filter(|t| {
+            (!has_first_party || t.scope == FileScope::FirstParty)
+                && !is_excluded_std_type_alias(t, total_types)
+        })
+        .collect();
+
+    if candidate_types.is_empty() {
+        return Vec::new();
+    }
+
+    let mut type_files: FxHashMap<&str, &str> = FxHashMap::default();
+    let mut ref_files_by_type: FxHashMap<&str, FxHashSet<&str>> = FxHashMap::default();
+    let mut pub_fn_files_by_type: FxHashMap<&str, FxHashSet<&str>> = FxHashMap::default();
+    let mut facade_pub_fn_counts: FxHashMap<&str, usize> = FxHashMap::default();
+    let mut enclosing_counts: FxHashMap<&str, usize> = FxHashMap::default();
+
+    for t in &candidate_types {
+        type_files.insert(t.name.as_str(), t.file.as_str());
+        ref_files_by_type.insert(t.name.as_str(), FxHashSet::default());
+        pub_fn_files_by_type.insert(t.name.as_str(), FxHashSet::default());
+        facade_pub_fn_counts.insert(t.name.as_str(), 0);
+        enclosing_counts.insert(t.name.as_str(), 0);
+    }
+
+    // Map excluded TypeAliases (e.g. `type Result<T> = std::result::Result<T, ChipsrcError>`)
+    // to any domain candidate types referenced in their definition so `Result<...>` in signatures
+    // credits the underlying domain error/type (`ChipsrcError`).
+    let mut alias_forwards: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
     for t in &indexes.types {
-        if has_first_party && t.scope != FileScope::FirstParty {
-            continue;
+        if is_excluded_std_type_alias(t, total_types) {
+            let mut targets = Vec::new();
+            for tok in t
+                .fields_summary
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|s| !s.is_empty() && *s != t.name)
+            {
+                if let Some(&canon_name) = type_files.keys().find(|&&k| k == tok) {
+                    targets.push(canon_name);
+                }
+            }
+            if !targets.is_empty() {
+                alias_forwards.insert(t.name.as_str(), targets);
+            }
         }
-        ref_counts.entry(t.name.as_str()).or_insert(0);
     }
 
     for rs in &indexes.symbols {
+        if has_first_party && rs.symbol.scope == FileScope::Test {
+            continue;
+        }
+        let sym_file = rs.symbol.file.as_str();
+        let is_pub_free_fn =
+            rs.symbol.visibility == Visibility::Public && rs.symbol.enclosing_type.is_none();
         if let Some(et) = rs.symbol.enclosing_type.as_deref() {
-            if let Some(cnt) = ref_counts.get_mut(et) {
-                *cnt += 1;
+            if let Some(cnt) = enclosing_counts.get_mut(et) {
+                if rs.symbol.name != "as_str" {
+                    *cnt += 1;
+                }
+            }
+            if let Some(fset) = ref_files_by_type.get_mut(et) {
+                fset.insert(sym_file);
             }
         }
         for tok in rs
@@ -624,46 +798,126 @@ fn select_core_domain_types(indexes: &BundleIndexes) -> Vec<(&ExtractedType, usi
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .filter(|s| !s.is_empty())
         {
-            if let Some(cnt) = ref_counts.get_mut(tok) {
-                *cnt += 1;
+            if let Some(fset) = ref_files_by_type.get_mut(tok) {
+                fset.insert(sym_file);
+            }
+            if is_pub_free_fn {
+                if let Some(pfset) = pub_fn_files_by_type.get_mut(tok) {
+                    pfset.insert(sym_file);
+                }
+                if sym_file.ends_with("/lib.rs") || sym_file == "src/lib.rs" || sym_file == "lib.rs"
+                {
+                    if let Some(c) = facade_pub_fn_counts.get_mut(tok) {
+                        *c += 1;
+                    }
+                }
+            }
+            if let Some(forwarded) = alias_forwards.get(tok) {
+                for &target_ty in forwarded {
+                    if let Some(fset) = ref_files_by_type.get_mut(target_ty) {
+                        fset.insert(sym_file);
+                    }
+                    if is_pub_free_fn {
+                        if let Some(pfset) = pub_fn_files_by_type.get_mut(target_ty) {
+                            pfset.insert(sym_file);
+                        }
+                    }
+                }
             }
         }
     }
 
     for t in &indexes.types {
+        let t_file = t.file.as_str();
         for tok in t
             .fields_summary
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .filter(|s| !s.is_empty() && *s != t.name)
         {
-            if let Some(cnt) = ref_counts.get_mut(tok) {
-                *cnt += 1;
+            if let Some(fset) = ref_files_by_type.get_mut(tok) {
+                fset.insert(t_file);
             }
         }
     }
 
-    let mut ranked: Vec<(&ExtractedType, usize)> = indexes
-        .types
-        .iter()
-        .filter(|t| !has_first_party || t.scope == FileScope::FirstParty)
+    for x in &indexes.xrefs {
+        if has_first_party && (x.file.contains("/tests/") || x.file.starts_with("tests/")) {
+            continue;
+        }
+        if matches!(
+            x.category.as_str(),
+            "import" | "type_ref" | "field_read" | "field_write"
+        ) {
+            let sym_head = x
+                .symbol
+                .split_once("::")
+                .map(|(h, _)| h)
+                .unwrap_or(x.symbol.as_str());
+            if let Some(fset) = ref_files_by_type.get_mut(sym_head) {
+                fset.insert(x.file.as_str());
+            }
+        }
+    }
+
+    let mut ranked: Vec<(&ExtractedType, usize, usize, bool)> = candidate_types
+        .into_iter()
         .map(|t| {
-            let refs = ref_counts.get(t.name.as_str()).copied().unwrap_or(0);
-            (t, refs)
+            let t_name = t.name.as_str();
+            let fset = ref_files_by_type.get(t_name);
+            let distinct_files = fset.map_or(0, |s| s.len());
+            let mut raw_weighted = enclosing_counts.get(t_name).copied().unwrap_or(0);
+            if let Some(files) = fset {
+                for &f in files {
+                    if f != t.file.as_str() {
+                        raw_weighted += 2;
+                    } else {
+                        raw_weighted += 1;
+                    }
+                }
+            }
+            if let Some(pfiles) = pub_fn_files_by_type.get(t_name) {
+                for &f in pfiles {
+                    if f != t.file.as_str() {
+                        raw_weighted += 2;
+                    } else {
+                        raw_weighted += 1;
+                    }
+                }
+            }
+            raw_weighted += facade_pub_fn_counts.get(t_name).copied().unwrap_or(0) * 4;
+            if t.kind == TypeKind::Struct && !t.fields_summary.is_empty() {
+                raw_weighted += 2;
+            }
+            let weighted_refs = if t.arch_layer == ArchLayer::Domain {
+                (raw_weighted * 5).div_ceil(4)
+            } else {
+                raw_weighted
+            };
+            let is_public_aggregate = t.visibility == Visibility::Public
+                && matches!(
+                    t.kind,
+                    TypeKind::Struct
+                        | TypeKind::Enum
+                        | TypeKind::Trait
+                        | TypeKind::Interface
+                        | TypeKind::Class
+                );
+            (t, weighted_refs, distinct_files, is_public_aggregate)
         })
         .collect();
 
-    ranked.sort_by(|(ta, ra), (tb, rb)| {
-        rb.cmp(ra)
-            .then_with(|| {
-                tb.fields_summary
-                    .is_empty()
-                    .cmp(&ta.fields_summary.is_empty())
-                    .reverse()
-            })
-            .then_with(|| ta.file.cmp(&tb.file))
-            .then_with(|| ta.start_line.cmp(&tb.start_line))
+    ranked.sort_by(|(ta, wa, da, pub_a), (tb, wb, db, pub_b)| {
+        pub_b
+            .cmp(pub_a)
+            .then_with(|| wb.cmp(wa))
+            .then_with(|| db.cmp(da))
+            .then_with(|| ta.name.cmp(&tb.name))
     });
+
     ranked
+        .into_iter()
+        .map(|(t, weighted_refs, _, _)| (t, weighted_refs))
+        .collect()
 }
 
 fn escape_table(s: &str) -> String {
