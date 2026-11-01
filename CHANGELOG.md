@@ -43,6 +43,10 @@ All notable changes to this project are listed here. Versions follow
 
 ### Fixed
 
+- **Bundle Artifact Integrity Gate, Missing-Table Self-Heal & Explicit `--no-sync` Errors (`error.rs`, `model.rs`, `scanner.rs`, `query.rs`, `lib.rs`, `main.rs`)**:
+  - Added `scanner::bundle_artifacts_complete` and `scanner::first_missing_bundle_artifact` verifying `meta.json`, `INDEX.md`, all six `index/*.tsv` tables, every `sections/*.md` referenced in column 11 of `index/sections.tsv`, `cache/manifest.json`, and every listed per-file cache shard.
+  - Wired artifact completeness into `convert_repo`, `auto_refresh_bundles`, `workspace_status` (`is_fresh = false` with a `reason` naming the missing artifact in both JSON and human output), and both hooks so incomplete bundles self-heal automatically.
+  - Replaced silent TSV reads in `query.rs` with `load_index_table` returning `ChipsrcError::IncompleteBundle { bundle, missing }` so `--no-sync` queries on incomplete bundles exit non-zero naming the missing table on stderr instead of returning `[]`.
 - **Sub-Second `mtime_nanos` Freshness Stamps & Cache Schema `2.1.0` (`model.rs`, `scanner.rs`, `emitter.rs`, `query.rs`, `lib.rs`, `main.rs`)**:
   - Added `#[serde(default)] mtime_nanos: u32` (`d.subsec_nanos()`) to `ScannedFile` and `FileStamp` and updated `scanner::stamp_check` to require `(size_bytes, mtime_secs, mtime_nanos)` equality so same-size edits within the same second are detected by `status --check`, `convert`, `ensure`, `hook post-edit`, and query auto-refresh.
   - Bumped `CACHE_SCHEMA_VERSION` from `"2.0.0"` to `"2.1.0"` and invalidated legacy `2.0.0` manifests and `meta.json` stamps lacking `mtime_nanos` so existing bundles rebuild once and hit cache on subsequent runs.

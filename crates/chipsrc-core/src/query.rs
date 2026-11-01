@@ -2,8 +2,9 @@ use crate::error::{ChipsrcError, Result};
 use crate::mmio::{normalize_hex_literal, normalize_query_hex_literal};
 use crate::model::{BundleStatusEntry, LanguageKind, SearchHit, DEFAULT_MAX_FILE_BYTES};
 use crate::scanner::{
-    canonical_repo_root_and_name, check_files_changed, check_meta_files_changed, has_bundle_cache,
-    load_cache_file, load_meta_file, scan_repository,
+    canonical_repo_root_and_name, check_files_changed, check_meta_files_changed,
+    first_missing_bundle_artifact, has_bundle_cache, load_cache_file,
+    load_cache_manifest_any_version, load_meta_file, scan_repository,
 };
 use memchr::memmem;
 use rayon::prelude::*;
@@ -191,7 +192,35 @@ pub fn workspace_status(workspace: &Path) -> Result<Vec<BundleStatusEntry>> {
 
     let mut entries = Vec::with_capacity(bundles.len());
     for bundle_dir in bundles {
+        let missing_artifact = first_missing_bundle_artifact(&bundle_dir);
         let Some(meta_file) = load_meta_file(&bundle_dir) else {
+            let fallback_manifest = load_cache_manifest_any_version(&bundle_dir);
+            let bundle_name = bundle_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("bundle")
+                .to_string();
+            let source_root = fallback_manifest
+                .as_ref()
+                .map(|m| m.repo_root.clone())
+                .unwrap_or_default();
+            let total_files = fallback_manifest
+                .as_ref()
+                .map(|m| m.files.len().max(1))
+                .unwrap_or(1);
+            let reason = missing_artifact
+                .map(|m| format!("missing {m}"))
+                .unwrap_or_else(|| "missing or invalid meta.json".to_string());
+            entries.push(BundleStatusEntry {
+                bundle_name,
+                bundle_dir,
+                source_root,
+                is_fresh: false,
+                changed_files_count: total_files,
+                symbol_count: 0,
+                section_count: 0,
+                reason: Some(reason),
+            });
             continue;
         };
         let meta = meta_file.metadata;
@@ -226,19 +255,51 @@ pub fn workspace_status(workspace: &Path) -> Result<Vec<BundleStatusEntry>> {
             0
         };
 
+        let is_fresh = changed_files_count == 0 && missing_artifact.is_none();
+        let reason = if let Some(ref missing) = missing_artifact {
+            Some(format!("missing {missing}"))
+        } else if !has_bundle_cache(&bundle_dir) {
+            Some("missing or outdated cache/manifest.json".to_string())
+        } else if meta.file_stamps.is_empty() {
+            Some("missing file_stamps in meta.json".to_string())
+        } else if changed_files_count > 0 {
+            Some(format!("{changed_files_count} files changed"))
+        } else {
+            None
+        };
+
         entries.push(BundleStatusEntry {
             bundle_name,
             bundle_dir,
             source_root: meta.source_root,
-            is_fresh: changed_files_count == 0,
+            is_fresh,
             changed_files_count,
             symbol_count: meta.symbol_count,
             section_count: meta.section_count,
+            reason,
         });
     }
 
     entries.sort_by(|a, b| a.bundle_name.cmp(&b.bundle_name));
     Ok(entries)
+}
+
+/// Loads a required `index/<name>` TSV table from `bundle_dir`, returning
+/// [`ChipsrcError::IncompleteBundle`] if the table is missing or empty.
+pub fn load_index_table(bundle_dir: &Path, name: &str) -> Result<String> {
+    let rel = if name.starts_with("index/") {
+        name.to_string()
+    } else {
+        format!("index/{name}")
+    };
+    let path = bundle_dir.join(&rel);
+    match fs::read_to_string(&path) {
+        Ok(content) if !content.is_empty() => Ok(content),
+        _ => Err(ChipsrcError::IncompleteBundle {
+            bundle: bundle_dir.to_path_buf(),
+            missing: rel,
+        }),
+    }
 }
 
 /// Queries functions, methods, constructors, entrypoints, and ISRs across bundles (`index/symbols.tsv`).
@@ -278,10 +339,7 @@ pub fn query_symbols(
     let mut hits: Vec<SymHit> = Vec::new();
 
     for bundle_dir in bundles {
-        let sym_tsv = bundle_dir.join("index").join("symbols.tsv");
-        let Ok(content) = fs::read_to_string(&sym_tsv) else {
-            continue;
-        };
+        let content = load_index_table(bundle_dir, "symbols.tsv")?;
         let bundle_name = bundle_name_from_dir(bundle_dir);
 
         for line in content.lines().skip(1) {
@@ -456,10 +514,7 @@ pub fn query_callers(
     let suffix = format!("::{q_lower}");
 
     for bundle_dir in bundles {
-        let calls_tsv = bundle_dir.join("index").join("calls.tsv");
-        let Ok(content) = fs::read_to_string(&calls_tsv) else {
-            continue;
-        };
+        let content = load_index_table(bundle_dir, "calls.tsv")?;
         let bundle_name = bundle_name_from_dir(bundle_dir);
 
         for line in content.lines().skip(1) {
@@ -604,10 +659,7 @@ pub fn query_callees(
     let suffix = format!("::{q_lower}");
 
     for bundle_dir in bundles {
-        let calls_tsv = bundle_dir.join("index").join("calls.tsv");
-        let Ok(content) = fs::read_to_string(&calls_tsv) else {
-            continue;
-        };
+        let content = load_index_table(bundle_dir, "calls.tsv")?;
         let bundle_name = bundle_name_from_dir(bundle_dir);
 
         for line in content.lines().skip(1) {
@@ -759,10 +811,7 @@ pub fn query_types(
     let mut hits = Vec::new();
 
     for bundle_dir in bundles {
-        let typ_tsv = bundle_dir.join("index").join("types.tsv");
-        let Ok(content) = fs::read_to_string(&typ_tsv) else {
-            continue;
-        };
+        let content = load_index_table(bundle_dir, "types.tsv")?;
         let bundle_name = bundle_name_from_dir(bundle_dir);
 
         for line in content.lines().skip(1) {
@@ -923,10 +972,7 @@ pub fn query_macros(
     let mut hits = Vec::new();
 
     for bundle_dir in bundles {
-        let mac_tsv = bundle_dir.join("index").join("macros.tsv");
-        let Ok(content) = fs::read_to_string(&mac_tsv) else {
-            continue;
-        };
+        let content = load_index_table(bundle_dir, "macros.tsv")?;
         let bundle_name = bundle_name_from_dir(bundle_dir);
 
         for line in content.lines().skip(1) {
@@ -1083,10 +1129,7 @@ pub fn query_sections(
     let mut hits = Vec::new();
 
     for bundle_dir in bundles {
-        let sec_tsv = bundle_dir.join("index").join("sections.tsv");
-        let Ok(content) = fs::read_to_string(&sec_tsv) else {
-            continue;
-        };
+        let content = load_index_table(bundle_dir, "sections.tsv")?;
         let bundle_name = bundle_name_from_dir(bundle_dir);
 
         for line in content.lines().skip(1) {
@@ -1232,10 +1275,7 @@ pub fn query_xref(bundles: &[PathBuf], query: &str, limit: usize) -> Result<Stri
     let mut hits = Vec::new();
 
     for bundle_dir in bundles {
-        let xref_tsv = bundle_dir.join("index").join("xref.tsv");
-        let Ok(content) = fs::read_to_string(&xref_tsv) else {
-            continue;
-        };
+        let content = load_index_table(bundle_dir, "xref.tsv")?;
         let bundle_name = bundle_name_from_dir(bundle_dir);
 
         for line in content.lines().skip(1) {
@@ -1379,92 +1419,88 @@ struct GraphCallEdge {
 
 fn load_bundle_call_graph(
     bundle_dir: &Path,
-) -> (FxHashMap<String, GraphSymMeta>, Vec<GraphCallEdge>) {
+) -> Result<(FxHashMap<String, GraphSymMeta>, Vec<GraphCallEdge>)> {
     let mut syms: FxHashMap<String, GraphSymMeta> = FxHashMap::default();
-    let syms_tsv = bundle_dir.join("index").join("symbols.tsv");
-    if let Ok(content) = fs::read_to_string(&syms_tsv) {
-        for line in content.lines().skip(1) {
-            let cols: Vec<&str> = line.split('\t').collect();
-            if cols.len() < 14 {
-                continue;
-            }
-            let symbol_id = cols[0].to_string();
-            syms.insert(
-                symbol_id.clone(),
-                GraphSymMeta {
-                    symbol_id,
-                    name: cols[1].to_string(),
-                    kind: cols[2].to_string(),
-                    file: cols[4].to_string(),
-                    start_line: cols[5].parse().unwrap_or(1),
-                    arch_layer: cols[11].to_string(),
-                    scope: cols[12].to_string(),
-                    section_id: cols[13].to_string(),
-                },
-            );
+    let sym_content = load_index_table(bundle_dir, "symbols.tsv")?;
+    for line in sym_content.lines().skip(1) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 14 {
+            continue;
         }
+        let symbol_id = cols[0].to_string();
+        syms.insert(
+            symbol_id.clone(),
+            GraphSymMeta {
+                symbol_id,
+                name: cols[1].to_string(),
+                kind: cols[2].to_string(),
+                file: cols[4].to_string(),
+                start_line: cols[5].parse().unwrap_or(1),
+                arch_layer: cols[11].to_string(),
+                scope: cols[12].to_string(),
+                section_id: cols[13].to_string(),
+            },
+        );
     }
 
     let mut edges: Vec<GraphCallEdge> = Vec::new();
-    let calls_tsv = bundle_dir.join("index").join("calls.tsv");
-    if let Ok(content) = fs::read_to_string(&calls_tsv) {
-        for line in content.lines().skip(1) {
-            let cols: Vec<&str> = line.split('\t').collect();
-            if cols.len() < 8 {
-                continue;
-            }
-            let caller_id = cols[0].to_string();
-            let caller_name = cols[1].to_string();
-            let callee_name = cols[2].to_string();
-            let callee_id = cols[3].to_string();
-            let file = cols[4].to_string();
-            let call_line: usize = cols[5].parse().unwrap_or(1);
-            let tier = cols[6].to_string();
-            let section_id = cols[7].to_string();
-
-            // Skip unresolved external/macro pseudo-nodes when building call/impact BFS graph (Bug 8)
-            if callee_id.starts_with("external::") || tier == "external_or_macro" {
-                continue;
-            }
-
-            syms.entry(caller_id.clone())
-                .or_insert_with(|| GraphSymMeta {
-                    symbol_id: caller_id.clone(),
-                    name: caller_name.clone(),
-                    kind: "fn".to_string(),
-                    file: file.clone(),
-                    start_line: call_line,
-                    arch_layer: "other".to_string(),
-                    scope: "first_party".to_string(),
-                    section_id: section_id.clone(),
-                });
-
-            syms.entry(callee_id.clone())
-                .or_insert_with(|| GraphSymMeta {
-                    symbol_id: callee_id.clone(),
-                    name: callee_name.clone(),
-                    kind: "fn".to_string(),
-                    file: file.clone(),
-                    start_line: call_line,
-                    arch_layer: "other".to_string(),
-                    scope: "first_party".to_string(),
-                    section_id: section_id.clone(),
-                });
-
-            edges.push(GraphCallEdge {
-                caller_id,
-                caller_name,
-                callee_name,
-                callee_id,
-                file,
-                line: call_line,
-                tier,
-                section_id,
-            });
+    let calls_content = load_index_table(bundle_dir, "calls.tsv")?;
+    for line in calls_content.lines().skip(1) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 8 {
+            continue;
         }
+        let caller_id = cols[0].to_string();
+        let caller_name = cols[1].to_string();
+        let callee_name = cols[2].to_string();
+        let callee_id = cols[3].to_string();
+        let file = cols[4].to_string();
+        let call_line: usize = cols[5].parse().unwrap_or(1);
+        let tier = cols[6].to_string();
+        let section_id = cols[7].to_string();
+
+        // Skip unresolved external/macro pseudo-nodes when building call/impact BFS graph (Bug 8)
+        if callee_id.starts_with("external::") || tier == "external_or_macro" {
+            continue;
+        }
+
+        syms.entry(caller_id.clone())
+            .or_insert_with(|| GraphSymMeta {
+                symbol_id: caller_id.clone(),
+                name: caller_name.clone(),
+                kind: "fn".to_string(),
+                file: file.clone(),
+                start_line: call_line,
+                arch_layer: "other".to_string(),
+                scope: "first_party".to_string(),
+                section_id: section_id.clone(),
+            });
+
+        syms.entry(callee_id.clone())
+            .or_insert_with(|| GraphSymMeta {
+                symbol_id: callee_id.clone(),
+                name: callee_name.clone(),
+                kind: "fn".to_string(),
+                file: file.clone(),
+                start_line: call_line,
+                arch_layer: "other".to_string(),
+                scope: "first_party".to_string(),
+                section_id: section_id.clone(),
+            });
+
+        edges.push(GraphCallEdge {
+            caller_id,
+            caller_name,
+            callee_name,
+            callee_id,
+            file,
+            line: call_line,
+            tier,
+            section_id,
+        });
     }
 
-    (syms, edges)
+    Ok((syms, edges))
 }
 
 fn match_symbol_ids_for_query(syms: &FxHashMap<String, GraphSymMeta>, query: &str) -> Vec<String> {
@@ -1530,7 +1566,7 @@ pub fn query_call_path(
     let max_hops = max_depth.max(1);
 
     for bundle_dir in bundles {
-        let (syms, edges) = load_bundle_call_graph(bundle_dir);
+        let (syms, edges) = load_bundle_call_graph(bundle_dir)?;
         if syms.is_empty() {
             continue;
         }
@@ -1669,7 +1705,7 @@ pub fn query_impact(
     let mut any_seed_found = false;
 
     for bundle_dir in bundles {
-        let (syms, edges) = load_bundle_call_graph(bundle_dir);
+        let (syms, edges) = load_bundle_call_graph(bundle_dir)?;
         if syms.is_empty() {
             continue;
         }
@@ -1926,10 +1962,7 @@ pub fn parallel_bundle_search(
             if !enabled || all_hits.len() >= limit {
                 continue;
             }
-            let tsv_path = bundle_dir.join("index").join(filename);
-            let Ok(content) = fs::read_to_string(&tsv_path) else {
-                continue;
-            };
+            let content = load_index_table(bundle_dir, filename)?;
             if let Some(ref finder) = simd_finder {
                 if finder.find(content.as_bytes()).is_none() {
                     continue;
@@ -2055,43 +2088,41 @@ pub fn parallel_bundle_search(
 
         // Search `xref.tsv` last (deduplicating against symbol/type/macro/call coordinates)
         if search_xrefs && all_hits.len() < limit {
-            let tsv_path = bundle_dir.join("index").join("xref.tsv");
-            if let Ok(content) = fs::read_to_string(&tsv_path) {
-                let has_match = simd_finder
-                    .as_ref()
-                    .is_none_or(|f| f.find(content.as_bytes()).is_some());
-                if has_match {
-                    for raw_line in content.lines().skip(1) {
-                        if all_hits.len() >= limit {
-                            break;
-                        }
-                        if !matches_line(raw_line) {
-                            continue;
-                        }
-                        let cols: Vec<&str> = raw_line.split('\t').collect();
-                        let semantic_match = query_is_path_like
-                            || cols.first().is_some_and(|c| matches_line(c))
-                            || cols.get(3).is_some_and(|c| matches_line(c))
-                            || cols.get(7).is_some_and(|c| matches_line(c));
-                        if !semantic_match {
-                            continue;
-                        }
-                        let file = cols.get(4).copied().unwrap_or("xref.tsv").to_string();
-                        let line = cols
-                            .get(5)
-                            .and_then(|s| s.parse::<usize>().ok())
-                            .unwrap_or(0);
-                        if !seen_coords.insert((bundle_name.clone(), file.clone(), line)) {
-                            continue;
-                        }
-                        all_hits.push(SearchHit {
-                            bundle_name: bundle_name.clone(),
-                            kind: "xref".to_string(),
-                            file,
-                            line,
-                            snippet: raw_line.replace('\t', " | "),
-                        });
+            let content = load_index_table(bundle_dir, "xref.tsv")?;
+            let has_match = simd_finder
+                .as_ref()
+                .is_none_or(|f| f.find(content.as_bytes()).is_some());
+            if has_match {
+                for raw_line in content.lines().skip(1) {
+                    if all_hits.len() >= limit {
+                        break;
                     }
+                    if !matches_line(raw_line) {
+                        continue;
+                    }
+                    let cols: Vec<&str> = raw_line.split('\t').collect();
+                    let semantic_match = query_is_path_like
+                        || cols.first().is_some_and(|c| matches_line(c))
+                        || cols.get(3).is_some_and(|c| matches_line(c))
+                        || cols.get(7).is_some_and(|c| matches_line(c));
+                    if !semantic_match {
+                        continue;
+                    }
+                    let file = cols.get(4).copied().unwrap_or("xref.tsv").to_string();
+                    let line = cols
+                        .get(5)
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if !seen_coords.insert((bundle_name.clone(), file.clone(), line)) {
+                        continue;
+                    }
+                    all_hits.push(SearchHit {
+                        bundle_name: bundle_name.clone(),
+                        kind: "xref".to_string(),
+                        file,
+                        line,
+                        snippet: raw_line.replace('\t', " | "),
+                    });
                 }
             }
         }
@@ -2482,7 +2513,15 @@ impl SourceSnippetCache {
 }
 
 fn is_valid_bundle_dir(dir: &Path) -> bool {
-    dir.is_dir() && dir.join("meta.json").is_file() && dir.join("INDEX.md").is_file()
+    dir.is_dir()
+        && ((dir.join("meta.json").is_file()
+            && (dir.join("INDEX.md").is_file()
+                || dir.join("index").is_dir()
+                || dir.join("sections").is_dir()
+                || dir.join("cache").is_dir()))
+            || (dir.join("INDEX.md").is_file()
+                && dir.join("index").is_dir()
+                && dir.join("cache").is_dir()))
 }
 
 fn bundle_name_from_dir(bundle_dir: &Path) -> String {
@@ -2517,10 +2556,7 @@ pub fn query_subcommand_json(
             let kind_lower = kind_filter.map(|k| k.trim().to_ascii_lowercase());
             let mut items = Vec::new();
             for bundle_dir in bundles {
-                let sym_tsv = bundle_dir.join("index").join("symbols.tsv");
-                let Ok(content) = fs::read_to_string(&sym_tsv) else {
-                    continue;
-                };
+                let content = load_index_table(bundle_dir, "symbols.tsv")?;
                 let bundle_name = bundle_name_from_dir(bundle_dir);
                 for line in content.lines().skip(1) {
                     let cols: Vec<&str> = line.split('\t').collect();
@@ -2611,10 +2647,7 @@ pub fn query_subcommand_json(
             let suffix = format!("::{q_lower}");
             let mut items = Vec::new();
             for bundle_dir in bundles {
-                let calls_tsv = bundle_dir.join("index").join("calls.tsv");
-                let Ok(content) = fs::read_to_string(&calls_tsv) else {
-                    continue;
-                };
+                let content = load_index_table(bundle_dir, "calls.tsv")?;
                 let bundle_name = bundle_name_from_dir(bundle_dir);
                 for line in content.lines().skip(1) {
                     let cols: Vec<&str> = line.split('\t').collect();
@@ -2680,10 +2713,7 @@ pub fn query_subcommand_json(
         "type" => {
             let mut items = Vec::new();
             for bundle_dir in bundles {
-                let typ_tsv = bundle_dir.join("index").join("types.tsv");
-                let Ok(content) = fs::read_to_string(&typ_tsv) else {
-                    continue;
-                };
+                let content = load_index_table(bundle_dir, "types.tsv")?;
                 let bundle_name = bundle_name_from_dir(bundle_dir);
                 for line in content.lines().skip(1) {
                     let cols: Vec<&str> = line.split('\t').collect();
@@ -2754,10 +2784,7 @@ pub fn query_subcommand_json(
             let q_hw = QueryHw::new(q_trim);
             let mut items = Vec::new();
             for bundle_dir in bundles {
-                let mac_tsv = bundle_dir.join("index").join("macros.tsv");
-                let Ok(content) = fs::read_to_string(&mac_tsv) else {
-                    continue;
-                };
+                let content = load_index_table(bundle_dir, "macros.tsv")?;
                 let bundle_name = bundle_name_from_dir(bundle_dir);
                 for line in content.lines().skip(1) {
                     let cols: Vec<&str> = line.split('\t').collect();
@@ -2825,10 +2852,7 @@ pub fn query_subcommand_json(
         "section" => {
             let mut items = Vec::new();
             for bundle_dir in bundles {
-                let sec_tsv = bundle_dir.join("index").join("sections.tsv");
-                let Ok(content) = fs::read_to_string(&sec_tsv) else {
-                    continue;
-                };
+                let content = load_index_table(bundle_dir, "sections.tsv")?;
                 let bundle_name = bundle_name_from_dir(bundle_dir);
                 for line in content.lines().skip(1) {
                     let cols: Vec<&str> = line.split('\t').collect();
@@ -2893,10 +2917,7 @@ pub fn query_subcommand_json(
             let q_hw = QueryHw::new(q_trim);
             let mut items = Vec::new();
             for bundle_dir in bundles {
-                let xref_tsv = bundle_dir.join("index").join("xref.tsv");
-                let Ok(content) = fs::read_to_string(&xref_tsv) else {
-                    continue;
-                };
+                let content = load_index_table(bundle_dir, "xref.tsv")?;
                 let bundle_name = bundle_name_from_dir(bundle_dir);
                 for line in content.lines().skip(1) {
                     if !q_hw.is_hex
@@ -3082,6 +3103,26 @@ REG_CTRL\tmmio_addr\t0x41C00004UL\t0x41C00004\tsrc/drv.c\t1\tdrvs\tfirst_party\t
 MASK_ALL\tbitmask\t0xFFFFFFFFUL\t0xFFFFFFFF\tsrc/drv.c\t1\tdrvs\tfirst_party\t01-src\tAll bits\n\
 GPIOA->MODER\treg_access\tGPIOA->MODER = id;\t-\tsrc/drv.c\t3\tdrvs\tfirst_party\t01-src\tRegister access\n";
         fs::write(index_dir.join("macros.tsv"), macros_tsv).unwrap();
+        fs::write(
+            index_dir.join("types.tsv"),
+            "type_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tfields_summary\tarch_layer\tscope\tsection_id\tdoc_summary\n",
+        )
+        .unwrap();
+        fs::write(
+            index_dir.join("calls.tsv"),
+            "caller_id\tcaller_name\tcallee_name\tcallee_id\tfile\tline\ttier\tsection_id\n",
+        )
+        .unwrap();
+        fs::write(
+            index_dir.join("sections.tsv"),
+            "section_id\ttitle\tmodule_path\tarch_layer\tscope\tfile_count\tsymbol_count\ttype_count\tmacro_count\ttoken_estimate\tmd_file\n",
+        )
+        .unwrap();
+        fs::write(
+            index_dir.join("xref.tsv"),
+            "symbol\tcategory\trelation\ttarget\tfile\tline\tsection_id\tcontext\n",
+        )
+        .unwrap();
 
         let bundles = resolve_bundles(&bundle_dir).unwrap();
         assert_eq!(bundles.len(), 1);

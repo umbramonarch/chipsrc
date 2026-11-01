@@ -160,6 +160,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         && meta_path.is_file()
         && index_md_path.is_file()
         && scanner::has_bundle_cache(&config.output_dir)
+        && scanner::bundle_artifacts_complete(&config.output_dir)
         && (!config.single_file || single_md_path.is_file());
 
     let existing_meta_opt = if bundle_ready {
@@ -701,43 +702,66 @@ pub fn auto_refresh_bundles(bundles: &[PathBuf]) -> Result<usize> {
     let mut refreshed = 0usize;
 
     for bundle_dir in bundles {
-        let Some(meta_file) = scanner::load_meta_file(bundle_dir) else {
-            continue;
-        };
-        let meta = meta_file.metadata;
-        let source_path = Path::new(&meta.source_root);
+        let meta_opt = scanner::load_meta_file(bundle_dir);
+        let (source_root_str, vendor_mode, repo_name, file_stamps_empty) =
+            if let Some(ref mf) = meta_opt {
+                (
+                    mf.metadata.source_root.clone(),
+                    mf.metadata.vendor_mode,
+                    mf.metadata.repo_name.clone(),
+                    mf.metadata.file_stamps.is_empty(),
+                )
+            } else if let Some(manifest) = scanner::load_cache_manifest_any_version(bundle_dir) {
+                let name = bundle_dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("repo")
+                    .to_string();
+                (manifest.repo_root, manifest.vendor_mode, name, true)
+            } else {
+                continue;
+            };
+        let source_path = Path::new(&source_root_str);
         if !source_path.is_dir() {
             continue;
         }
 
         // Fast-path: check `meta.file_stamps` directly from `meta.json` (~2 KB) without loading
         // the multi-megabyte `cache.json` when no source files have changed (Issue #41).
-        let needs_refresh = if !scanner::has_bundle_cache(bundle_dir) || meta.file_stamps.is_empty()
+        let needs_refresh = if !scanner::has_bundle_cache(bundle_dir)
+            || file_stamps_empty
+            || !scanner::bundle_artifacts_complete(bundle_dir)
         {
             true
-        } else if let Some(count) =
-            scanner::check_meta_files_changed(source_path, &meta, DEFAULT_MAX_FILE_BYTES)
-        {
-            count > 0
-        } else if let Some(mut cache) = scanner::load_cache_file(bundle_dir) {
-            if cache.fingerprint.is_empty() {
-                cache.fingerprint = meta.fingerprint.clone();
+        } else if let Some(ref mf) = meta_opt {
+            let meta = &mf.metadata;
+            if let Some(count) =
+                scanner::check_meta_files_changed(source_path, meta, DEFAULT_MAX_FILE_BYTES)
+            {
+                count > 0
+            } else if let Some(mut cache) = scanner::load_cache_file(bundle_dir) {
+                if cache.fingerprint.is_empty() {
+                    cache.fingerprint = meta.fingerprint.clone();
+                }
+                scanner::check_files_changed(source_path, &cache, DEFAULT_MAX_FILE_BYTES)
+                    .unwrap_or(0)
+                    > 0
+            } else if let Ok((_, fp)) =
+                scanner::scan_repository(source_path, meta.vendor_mode, DEFAULT_MAX_FILE_BYTES)
+            {
+                fp != meta.fingerprint
+            } else {
+                false
             }
-            scanner::check_files_changed(source_path, &cache, DEFAULT_MAX_FILE_BYTES).unwrap_or(0)
-                > 0
-        } else if let Ok((_, fp)) =
-            scanner::scan_repository(source_path, meta.vendor_mode, DEFAULT_MAX_FILE_BYTES)
-        {
-            fp != meta.fingerprint
         } else {
-            false
+            true
         };
 
         if needs_refresh {
             let mut cfg = ConvertConfig::new(source_path.to_path_buf(), bundle_dir.clone());
-            cfg.vendor_mode = meta.vendor_mode;
+            cfg.vendor_mode = vendor_mode;
             cfg.force = false;
-            cfg.single_file = bundle_dir.join(format!("{}.md", meta.repo_name)).is_file();
+            cfg.single_file = bundle_dir.join(format!("{repo_name}.md")).is_file();
             convert_repo(&cfg)?;
             refreshed += 1;
         }

@@ -20,6 +20,9 @@ pub enum ChipsrcError {
     #[error("Bundle not found at {0}")]
     BundleNotFound(PathBuf),
 
+    #[error("Incomplete bundle at {}: missing required artifact '{missing}' (run `chipsrc ensure` or omit `--no-sync` to repair)", bundle.display())]
+    IncompleteBundle { bundle: PathBuf, missing: String },
+
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 

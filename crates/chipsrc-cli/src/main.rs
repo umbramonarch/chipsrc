@@ -578,6 +578,8 @@ fn main() -> Result<()> {
                 for entry in &entries {
                     let freshness = if entry.is_fresh {
                         "FRESH".to_string()
+                    } else if let Some(ref reason) = entry.reason {
+                        format!("STALE ({reason})")
                     } else {
                         format!("STALE ({} files changed)", entry.changed_files_count)
                     };
@@ -1290,10 +1292,26 @@ fn run_post_edit_hook() -> Result<()> {
         if !child.is_dir() {
             continue;
         }
-        let Some(meta_file) = chipsrc_core::scanner::load_meta_file(&child) else {
-            continue;
-        };
-        let src_path = Path::new(&meta_file.metadata.source_root);
+        let (source_root, vendor_mode, repo_name) =
+            if let Some(meta_file) = chipsrc_core::scanner::load_meta_file(&child) {
+                (
+                    meta_file.metadata.source_root,
+                    meta_file.metadata.vendor_mode,
+                    meta_file.metadata.repo_name,
+                )
+            } else if let Some(manifest) =
+                chipsrc_core::scanner::load_cache_manifest_any_version(&child)
+            {
+                let name = child
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("repo")
+                    .to_string();
+                (manifest.repo_root, manifest.vendor_mode, name)
+            } else {
+                continue;
+            };
+        let src_path = Path::new(&source_root);
         let (src_canon, _) = chipsrc_core::scanner::canonical_repo_root_and_name(src_path);
         let prefix = format!("{}/", src_canon.trim_end_matches('/'));
         if edited_canon.eq_ignore_ascii_case(&src_canon)
@@ -1302,11 +1320,9 @@ fn run_post_edit_hook() -> Result<()> {
                 .starts_with(&prefix.to_ascii_lowercase())
         {
             let mut cfg = ConvertConfig::new(src_path.to_path_buf(), child.clone());
-            cfg.vendor_mode = meta_file.metadata.vendor_mode;
+            cfg.vendor_mode = vendor_mode;
             cfg.force = false;
-            cfg.single_file = child
-                .join(format!("{}.md", meta_file.metadata.repo_name))
-                .is_file();
+            cfg.single_file = child.join(format!("{repo_name}.md")).is_file();
             let _ = convert_repo(&cfg);
         }
     }

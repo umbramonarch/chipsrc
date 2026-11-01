@@ -8,7 +8,7 @@ use crate::model::{
 };
 use ignore::WalkBuilder;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -515,13 +515,19 @@ pub fn load_meta_file(bundle_dir: &Path) -> Option<BundleMetaFile> {
 
 /// Loads `cache/manifest.json` from `bundle_dir` if present and matching `CACHE_SCHEMA_VERSION`.
 pub fn load_cache_manifest(bundle_dir: &Path) -> Option<CacheManifest> {
-    let manifest_path = bundle_dir.join("cache").join("manifest.json");
-    let bytes = fs::read(manifest_path).ok()?;
-    let manifest: CacheManifest = serde_json::from_slice(&bytes).ok()?;
+    let manifest = load_cache_manifest_any_version(bundle_dir)?;
     if manifest.schema_version != CACHE_SCHEMA_VERSION {
         return None;
     }
     Some(manifest)
+}
+
+/// Loads `cache/manifest.json` from `bundle_dir` regardless of `schema_version` (used to recover
+/// `repo_root` and `vendor_mode` when `meta.json` is missing or truncated).
+pub fn load_cache_manifest_any_version(bundle_dir: &Path) -> Option<CacheManifest> {
+    let manifest_path = bundle_dir.join("cache").join("manifest.json");
+    let bytes = fs::read(manifest_path).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Loads a single per-file AST cache shard (`cache/<blake3_hash>.json`) from `bundle_dir`.
@@ -534,6 +540,123 @@ pub fn load_cache_shard(bundle_dir: &Path, shard_rel: &str) -> Option<ParsedFile
 /// Returns `true` when `bundle_dir` has a valid `cache/manifest.json` matching `CACHE_SCHEMA_VERSION`.
 pub fn has_bundle_cache(bundle_dir: &Path) -> bool {
     load_cache_manifest(bundle_dir).is_some()
+}
+
+/// Returns the relative path of the first missing or invalid required bundle artifact in `bundle_dir`,
+/// or `None` when the bundle is complete (`meta.json`, `INDEX.md`, all six `index/*.tsv` tables,
+/// every `md_file` listed in column 11 of `index/sections.tsv`, `cache/manifest.json`, and every
+/// shard listed in `cache/manifest.json`).
+pub fn first_missing_bundle_artifact(bundle_dir: &Path) -> Option<String> {
+    if !bundle_dir.is_dir() {
+        return Some("bundle directory".to_string());
+    }
+    if !bundle_dir.join("meta.json").is_file() || load_meta_file(bundle_dir).is_none() {
+        return Some("meta.json".to_string());
+    }
+    if !bundle_dir.join("INDEX.md").is_file() {
+        return Some("INDEX.md".to_string());
+    }
+
+    const REQUIRED_TSVS: [&str; 6] = [
+        "index/sections.tsv",
+        "index/symbols.tsv",
+        "index/types.tsv",
+        "index/calls.tsv",
+        "index/macros.tsv",
+        "index/xref.tsv",
+    ];
+    for rel in REQUIRED_TSVS {
+        if !bundle_dir.join(rel).is_file() {
+            return Some(rel.to_string());
+        }
+    }
+
+    let Ok(sections_tsv) = fs::read_to_string(bundle_dir.join("index/sections.tsv")) else {
+        return Some("index/sections.tsv".to_string());
+    };
+    let mut sec_lines = sections_tsv.lines();
+    if sec_lines.next().is_none() {
+        return Some("index/sections.tsv".to_string());
+    }
+
+    let sections_dir = bundle_dir.join("sections");
+    let existing_sections: FxHashSet<String> = fs::read_dir(&sections_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+
+    for line in sec_lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut cols = line.split('\t');
+        let Some(md_col_raw) = cols.nth(10) else {
+            return Some("index/sections.tsv".to_string());
+        };
+        let md_col = md_col_raw.trim();
+        if md_col.is_empty() {
+            return Some("index/sections.tsv".to_string());
+        }
+        let rel_md = if md_col.starts_with("sections/") {
+            md_col.to_string()
+        } else {
+            format!("sections/{md_col}")
+        };
+        let fname = rel_md.strip_prefix("sections/").unwrap_or(&rel_md);
+        let present = if !fname.contains('/') && !fname.contains('\\') {
+            existing_sections.contains(fname)
+        } else {
+            bundle_dir.join(&rel_md).is_file()
+        };
+        if !present {
+            return Some(rel_md);
+        }
+    }
+
+    let Some(manifest) = load_cache_manifest(bundle_dir) else {
+        return Some("cache/manifest.json".to_string());
+    };
+    if manifest.files.is_empty() {
+        return Some("cache/manifest.json".to_string());
+    }
+
+    let cache_dir = bundle_dir.join("cache");
+    let existing_shards: FxHashSet<String> = fs::read_dir(&cache_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+
+    for entry in manifest.files.values() {
+        if entry.shard.is_empty() {
+            return Some("cache/manifest.json".to_string());
+        }
+        let shard_fname = entry.shard.strip_prefix("cache/").unwrap_or(&entry.shard);
+        let present = if !shard_fname.contains('/') && !shard_fname.contains('\\') {
+            existing_shards.contains(shard_fname)
+        } else {
+            bundle_dir.join(&entry.shard).is_file()
+        };
+        if !present {
+            return Some(entry.shard.clone());
+        }
+    }
+
+    None
+}
+
+/// Returns `true` when `bundle_dir` contains all required bundle artifacts (`meta.json`, `INDEX.md`,
+/// all six `index/*.tsv` tables, every `sections/*.md` referenced by `index/sections.tsv`,
+/// `cache/manifest.json`, and every per-file cache shard listed in the manifest).
+pub fn bundle_artifacts_complete(bundle_dir: &Path) -> bool {
+    first_missing_bundle_artifact(bundle_dir).is_none()
 }
 
 /// Loads the incremental AST cache from `bundle_dir/cache/manifest.json` + `cache/*.json` shards
@@ -1848,5 +1971,102 @@ mod tests {
         );
         assert_eq!(sc_dirty.changed_count, 1);
         assert_eq!(sc_dirty.suspects.len(), 1);
+    }
+
+    #[test]
+    fn test_bundle_artifacts_complete_detects_missing_artifacts() {
+        let tmp = TestTempDir::new("chipsrc_scanner_bundle_complete");
+        let repo_dir = tmp.path().join("repo");
+        let bundle_dir = tmp.path().join("bundle");
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::write(
+            repo_dir.join("src/main.c"),
+            "int compute_value(int x) { return x + 1; }\n",
+        )
+        .unwrap();
+
+        let cfg = crate::model::ConvertConfig::new(repo_dir, bundle_dir.clone());
+        crate::convert_repo(&cfg).expect("initial convert_repo");
+
+        assert!(bundle_artifacts_complete(&bundle_dir));
+        assert_eq!(first_missing_bundle_artifact(&bundle_dir), None);
+
+        // 1. Delete each required TSV one by one
+        for tsv in [
+            "index/sections.tsv",
+            "index/symbols.tsv",
+            "index/types.tsv",
+            "index/calls.tsv",
+            "index/macros.tsv",
+            "index/xref.tsv",
+        ] {
+            let p = bundle_dir.join(tsv);
+            let saved = std::fs::read(&p).unwrap();
+            std::fs::remove_file(&p).unwrap();
+            assert!(
+                !bundle_artifacts_complete(&bundle_dir),
+                "Expected incomplete when {tsv} is missing"
+            );
+            assert_eq!(
+                first_missing_bundle_artifact(&bundle_dir).as_deref(),
+                Some(tsv)
+            );
+            std::fs::write(&p, saved).unwrap();
+            assert!(bundle_artifacts_complete(&bundle_dir));
+        }
+
+        // 2. Delete a sections/*.md referenced in index/sections.tsv col 11
+        let sec_tsv = std::fs::read_to_string(bundle_dir.join("index/sections.tsv")).unwrap();
+        let md_rel = sec_tsv
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split('\t')
+            .nth(10)
+            .unwrap()
+            .to_string();
+        let full_md_rel = if md_rel.starts_with("sections/") {
+            md_rel
+        } else {
+            format!("sections/{md_rel}")
+        };
+        let md_path = bundle_dir.join(&full_md_rel);
+        let saved_md = std::fs::read(&md_path).unwrap();
+        std::fs::remove_file(&md_path).unwrap();
+        assert!(!bundle_artifacts_complete(&bundle_dir));
+        assert_eq!(
+            first_missing_bundle_artifact(&bundle_dir).as_deref(),
+            Some(full_md_rel.as_str())
+        );
+        std::fs::write(&md_path, saved_md).unwrap();
+        assert!(bundle_artifacts_complete(&bundle_dir));
+
+        // 3. Delete a cache/<hash>.json shard referenced in cache/manifest.json
+        let manifest = load_cache_manifest(&bundle_dir).expect("manifest");
+        let shard_rel = manifest.files.values().next().unwrap().shard.clone();
+        let shard_path = bundle_dir.join(&shard_rel);
+        let saved_shard = std::fs::read(&shard_path).unwrap();
+        std::fs::remove_file(&shard_path).unwrap();
+        assert!(!bundle_artifacts_complete(&bundle_dir));
+        assert_eq!(
+            first_missing_bundle_artifact(&bundle_dir).as_deref(),
+            Some(shard_rel.as_str())
+        );
+        std::fs::write(&shard_path, saved_shard).unwrap();
+        assert!(bundle_artifacts_complete(&bundle_dir));
+
+        // 4. Delete INDEX.md and meta.json
+        for top in ["INDEX.md", "meta.json"] {
+            let p = bundle_dir.join(top);
+            let saved = std::fs::read(&p).unwrap();
+            std::fs::remove_file(&p).unwrap();
+            assert!(!bundle_artifacts_complete(&bundle_dir));
+            assert_eq!(
+                first_missing_bundle_artifact(&bundle_dir).as_deref(),
+                Some(top)
+            );
+            std::fs::write(&p, saved).unwrap();
+            assert!(bundle_artifacts_complete(&bundle_dir));
+        }
     }
 }

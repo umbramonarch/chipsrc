@@ -928,3 +928,102 @@ fn same_second_edit_is_detected_end_to_end() {
     let b_after_meta = convert_repo(&cfg).expect("warm after mtime_nanos upgrade");
     assert!(b_after_meta.cache_hit);
 }
+
+#[test]
+fn incomplete_bundle_self_heals_and_no_sync_queries_error() {
+    let tmp = TestTempDir::new("incomplete_bundle_e2e");
+    let repo_dir = tmp.0.join("repo");
+    let out_root = tmp.0.join("out");
+    create_synthetic_repo(&repo_dir);
+
+    let b1 = ensure_repo(&repo_dir, &out_root, false, VendorMode::Active).expect("initial ensure");
+    assert!(!b1.cache_hit);
+    let bundle_dir = b1.output_dir.clone();
+    assert!(chipsrc_core::scanner::bundle_artifacts_complete(
+        &bundle_dir
+    ));
+
+    let sym_tsv_path = bundle_dir.join("index/symbols.tsv");
+    let saved_sym_tsv = fs::read(&sym_tsv_path).expect("read symbols.tsv");
+
+    // 1. Delete index/symbols.tsv -> workspace_status reports is_fresh=false with reason naming symbols.tsv
+    fs::remove_file(&sym_tsv_path).unwrap();
+    let status = workspace_status(&bundle_dir).expect("workspace_status");
+    assert_eq!(status.len(), 1);
+    assert!(
+        !status[0].is_fresh,
+        "Expected incomplete bundle to be stale"
+    );
+    let reason = status[0]
+        .reason
+        .as_deref()
+        .expect("Expected non-empty reason on incomplete bundle");
+    assert!(
+        reason.contains("symbols.tsv"),
+        "Expected reason to name symbols.tsv, got: {reason}"
+    );
+
+    // 2. Direct query (simulating --no-sync) fails with IncompleteBundle naming symbols.tsv
+    let err = query_symbols(
+        std::slice::from_ref(&bundle_dir),
+        "motor_set_duty",
+        None,
+        false,
+        10,
+    )
+    .expect_err("Expected query_symbols on missing symbols.tsv to fail");
+    assert!(
+        err.to_string().contains("symbols.tsv"),
+        "Expected error message to name symbols.tsv, got: {err}"
+    );
+
+    // 3. ensure_repo repairs the missing TSV identically and next ensure_repo is CACHE HIT
+    let b_repaired =
+        ensure_repo(&repo_dir, &out_root, false, VendorMode::Active).expect("repair ensure");
+    assert!(
+        !b_repaired.cache_hit,
+        "Repair run must not report CACHE HIT"
+    );
+    assert_eq!(
+        fs::read(&sym_tsv_path).expect("restored symbols.tsv"),
+        saved_sym_tsv
+    );
+
+    let b_warm = ensure_repo(&repo_dir, &out_root, false, VendorMode::Active).expect("warm ensure");
+    assert!(
+        b_warm.cache_hit,
+        "Run following repair must be a CACHE HIT (no permanent rebuild loop)"
+    );
+
+    // 4. Delete a cache/<hash>.json shard -> ensure repairs and next run is CACHE HIT
+    let manifest = chipsrc_core::scanner::load_cache_manifest(&bundle_dir).expect("manifest");
+    let shard_rel = manifest.files.values().next().unwrap().shard.clone();
+    fs::remove_file(bundle_dir.join(&shard_rel)).unwrap();
+    assert!(!chipsrc_core::scanner::bundle_artifacts_complete(
+        &bundle_dir
+    ));
+
+    let b_shard_repair =
+        ensure_repo(&repo_dir, &out_root, false, VendorMode::Active).expect("shard repair");
+    assert!(!b_shard_repair.cache_hit);
+    assert!(bundle_dir.join(&shard_rel).is_file());
+    let b_shard_warm =
+        ensure_repo(&repo_dir, &out_root, false, VendorMode::Active).expect("shard warm");
+    assert!(b_shard_warm.cache_hit);
+
+    // 5. Delete index/symbols.tsv -> auto_refresh_bundles repairs it before querying
+    fs::remove_file(&sym_tsv_path).unwrap();
+    let refreshed =
+        auto_refresh_bundles(std::slice::from_ref(&bundle_dir)).expect("auto_refresh_bundles");
+    assert_eq!(refreshed, 1);
+    assert!(sym_tsv_path.is_file());
+    let sym_out = query_symbols(
+        std::slice::from_ref(&bundle_dir),
+        "motor_set_duty",
+        None,
+        false,
+        10,
+    )
+    .expect("query after auto_refresh");
+    assert!(sym_out.contains("motor_set_duty"));
+}

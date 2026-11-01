@@ -872,4 +872,6 @@ pub struct BundleStatusEntry {
     pub changed_files_count: usize,
     pub symbol_count: usize,
     pub section_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
