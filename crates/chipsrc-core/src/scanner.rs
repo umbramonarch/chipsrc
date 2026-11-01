@@ -287,14 +287,28 @@ pub fn scan_repository(
     let blueprint_opt = load_repo_blueprint(repo_path);
     let custom_ignore_dirs: Vec<String> = blueprint_opt
         .as_ref()
-        .map(|(bp, _)| bp.ignore_dirs.clone())
+        .map(|(bp, _)| {
+            bp.ignore_dirs
+                .iter()
+                .map(|ig| {
+                    ig.replace('\\', "/")
+                        .trim_start_matches("./")
+                        .trim_end_matches("/**")
+                        .trim_end_matches("/*")
+                        .trim_matches('/')
+                        .to_string()
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut walker = WalkBuilder::new(repo_path);
     walker
+        .parents(false)
         .git_ignore(true)
-        .git_global(true)
+        .git_global(false)
         .git_exclude(true)
+        .require_git(false)
         .ignore(true)
         .hidden(true)
         .add_custom_ignore_filename(".claudeignore")
@@ -304,20 +318,13 @@ pub fn scan_repository(
             }
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if let Some(name) = entry.file_name().to_str() {
-                    let lower = name.to_ascii_lowercase();
-                    if IGNORED_DIRS.contains(&lower.as_str()) {
+                    if IGNORED_DIRS.iter().any(|&ig| ig.eq_ignore_ascii_case(name)) {
                         return false;
                     }
-                    if custom_ignore_dirs.iter().any(|ig| {
-                        let clean = ig
-                            .replace('\\', "/")
-                            .trim_start_matches("./")
-                            .trim_end_matches("/**")
-                            .trim_end_matches("/*")
-                            .trim_matches('/')
-                            .to_string();
-                        clean.eq_ignore_ascii_case(name)
-                    }) {
+                    if custom_ignore_dirs
+                        .iter()
+                        .any(|clean| clean.eq_ignore_ascii_case(name))
+                    {
                         return false;
                     }
                 }
@@ -577,6 +584,22 @@ pub fn has_valid_tsv_header(rel: &str, content: &str) -> bool {
     first_line.starts_with(expected_prefix)
 }
 
+fn read_tsv_header_line(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let mut buf = [0u8; 512];
+    let n = file.read(&mut buf).ok()?;
+    if n == 0 {
+        return None;
+    }
+    let slice = &buf[..n];
+    let line_end = memchr::memchr(b'\n', slice).unwrap_or(n);
+    let line_bytes = slice[..line_end]
+        .strip_suffix(b"\r")
+        .unwrap_or(&slice[..line_end]);
+    std::str::from_utf8(line_bytes).ok().map(|s| s.to_string())
+}
+
 /// Returns the relative path of the first missing or invalid required bundle artifact in `bundle_dir`,
 /// or `None` when the bundle is complete (`meta.json`, `INDEX.md`, all six `index/*.tsv` tables
 /// with non-empty header lines, every `md_file` listed in column 11 of `index/sections.tsv`,
@@ -585,33 +608,36 @@ pub fn first_missing_bundle_artifact(bundle_dir: &Path) -> Option<String> {
     if !bundle_dir.is_dir() {
         return Some("bundle directory".to_string());
     }
-    if !bundle_dir.join("meta.json").is_file() || load_meta_file(bundle_dir).is_none() {
+    if load_meta_file(bundle_dir).is_none() {
         return Some("meta.json".to_string());
     }
     if !bundle_dir.join("INDEX.md").is_file() {
         return Some("INDEX.md".to_string());
     }
 
-    const REQUIRED_TSVS: [&str; 6] = [
-        "index/sections.tsv",
+    let Ok(sections_tsv) = fs::read_to_string(bundle_dir.join("index/sections.tsv")) else {
+        return Some("index/sections.tsv".to_string());
+    };
+    if !has_valid_tsv_header("index/sections.tsv", &sections_tsv) {
+        return Some("index/sections.tsv".to_string());
+    }
+
+    const HEADER_CHECK_TSVS: [&str; 5] = [
         "index/symbols.tsv",
         "index/types.tsv",
         "index/calls.tsv",
         "index/macros.tsv",
         "index/xref.tsv",
     ];
-    for rel in REQUIRED_TSVS {
-        let Ok(content) = fs::read_to_string(bundle_dir.join(rel)) else {
+    for rel in HEADER_CHECK_TSVS {
+        let Some(header_line) = read_tsv_header_line(&bundle_dir.join(rel)) else {
             return Some(rel.to_string());
         };
-        if !has_valid_tsv_header(rel, &content) {
+        if !has_valid_tsv_header(rel, &header_line) {
             return Some(rel.to_string());
         }
     }
 
-    let Ok(sections_tsv) = fs::read_to_string(bundle_dir.join("index/sections.tsv")) else {
-        return Some("index/sections.tsv".to_string());
-    };
     let mut sec_lines = sections_tsv.lines();
     if sec_lines.next().is_none() {
         return Some("index/sections.tsv".to_string());
@@ -789,14 +815,28 @@ pub fn stamp_check(
 
     let custom_ignore_dirs: Vec<String> = blueprint_opt
         .as_ref()
-        .map(|(bp, _)| bp.ignore_dirs.clone())
+        .map(|(bp, _)| {
+            bp.ignore_dirs
+                .iter()
+                .map(|ig| {
+                    ig.replace('\\', "/")
+                        .trim_start_matches("./")
+                        .trim_end_matches("/**")
+                        .trim_end_matches("/*")
+                        .trim_matches('/')
+                        .to_string()
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut walker = WalkBuilder::new(repo_path);
     walker
+        .parents(false)
         .git_ignore(true)
-        .git_global(true)
+        .git_global(false)
         .git_exclude(true)
+        .require_git(false)
         .ignore(true)
         .hidden(true)
         .add_custom_ignore_filename(".claudeignore")
@@ -806,20 +846,13 @@ pub fn stamp_check(
             }
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if let Some(name) = entry.file_name().to_str() {
-                    let lower = name.to_ascii_lowercase();
-                    if IGNORED_DIRS.contains(&lower.as_str()) {
+                    if IGNORED_DIRS.iter().any(|&ig| ig.eq_ignore_ascii_case(name)) {
                         return false;
                     }
-                    if custom_ignore_dirs.iter().any(|ig| {
-                        let clean = ig
-                            .replace('\\', "/")
-                            .trim_start_matches("./")
-                            .trim_end_matches("/**")
-                            .trim_end_matches("/*")
-                            .trim_matches('/')
-                            .to_string();
-                        clean.eq_ignore_ascii_case(name)
-                    }) {
+                    if custom_ignore_dirs
+                        .iter()
+                        .any(|clean| clean.eq_ignore_ascii_case(name))
+                    {
                         return false;
                     }
                 }
@@ -833,7 +866,8 @@ pub fn stamp_check(
         .map(|s| (s.rel_path.as_str(), s))
         .collect();
 
-    let mut seen_paths: HashSet<String> = HashSet::with_capacity(meta.file_stamps.len());
+    let mut seen_stamps: FxHashSet<&str> =
+        FxHashSet::with_capacity_and_hasher(meta.file_stamps.len(), Default::default());
     let mut suspects = Vec::new();
     let mut suspect_rel_paths = Vec::new();
     let mut touched_mtimes = BTreeMap::new();
@@ -887,7 +921,7 @@ pub fn stamp_check(
         }
 
         if let Some(&stamp) = stamp_map.get(rel_path.as_str()) {
-            seen_paths.insert(rel_path.clone());
+            seen_stamps.insert(stamp.rel_path.as_str());
             if !blueprint_changed
                 && stamp.size_bytes == size_bytes
                 && stamp.mtime_secs == mtime_secs
@@ -990,19 +1024,13 @@ pub fn stamp_check(
                     }
                 }
             }
-            seen_paths.insert(rel_path.clone());
             suspects.push(abs_path);
             suspect_rel_paths.push(rel_path);
             added += 1;
         }
     }
 
-    let mut deleted = 0usize;
-    for cached_rel_path in stamp_map.keys() {
-        if !seen_paths.contains(*cached_rel_path) {
-            deleted += 1;
-        }
-    }
+    let deleted = stamp_map.len().saturating_sub(seen_stamps.len());
 
     let mut changed_count = added + deleted + modified;
     if changed_count == 0 && blueprint_changed {

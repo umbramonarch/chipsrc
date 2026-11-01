@@ -6,6 +6,15 @@ All notable changes to this project are listed here. Versions follow
 
 ## [Unreleased]
 
+### Performance
+
+- **Zero-Alloc `sanitize_tsv`, Pre-Sized Parallel TSV Emission, Uncapped Content-Compare Write Skip & Incremental Sync Hot-Path Optimization (`emitter.rs`, `scanner.rs`, `resolver.rs`, `sharder.rs`, `graph.rs`, `lib.rs`, `main.rs`)**:
+  - Changed `emitter::sanitize_tsv(&str) -> Cow<'_, str>` (and `escape_table`) to use a byte-scan fast path (`is_clean_tsv_str`) that returns `Cow::Borrowed` when no control characters, tabs/newlines, leading/trailing spaces, or consecutive spaces are present, and a single-pass `String::with_capacity` builder otherwise.
+  - Pre-sized all six `index/*.tsv` buffers in `emit_bundle`, formatted `calls.tsv` and `xref.tsv` with direct string/integer pushes (`push_usize`) and `sections.tsv`/`symbols.tsv`/`types.tsv`/`macros.tsv` with `std::fmt::Write`, and parallelized in-memory Markdown/TSV formatting and output writes via `rayon::join`.
+  - Updated `emit_cache_shards` to read `cache/` once via `fs::read_dir`, reuse `structural_digest` from the previous `cache/manifest.json` when `blake3_hash` and `shard` match, write only missing or changed shards, and prune orphaned `.json` shards from the directory set.
+  - Removed the 256 KB size cap in `write_file` so unchanged large tables (`calls.tsv`, `xref.tsv`) compare existing bytes whenever `fs::metadata` length matches and skip redundant disk writes (preserving file mtime), and eliminated the duplicate `meta.json` write inside `emit_bundle` so `meta.json` is written once per conversion with final timings.
+  - Replaced full-file TSV reads in `scanner::first_missing_bundle_artifact` with 512-byte header-line reads (`read_tsv_header_line`), deferred full bundle-completeness checks to cache-hit/short-circuit gates, disabled parent/global git-config walking in `WalkBuilder`, and precomputed symbol/import path metadata with parallel per-unit resolution in `resolver::resolve_and_link` and `sharder::build_section_shards`, reducing 123-file `smart_locker` incremental structural sync from `477 ms` (`emit = 265 ms`) to `85–95 ms` median (`emit = 21–25 ms`).
+
 ### Added
 
 - **Parameterized In-Repo Black-Box QA Harness (`qa/qa_blackbox.py`, `qa/lib/`, `qa/suites/`, `qa/oracles/`, `qa/fixtures/`, `qa/README.md`)**:

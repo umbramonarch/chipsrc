@@ -3,6 +3,7 @@ use crate::model::{
     MacroKind, ParsedFileUnit, ResolutionTier, ResolvedCallEdge, SymbolKind, VendorSurfaceSummary,
     Visibility, XrefEntry,
 };
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -80,347 +81,485 @@ pub fn resolve_and_link(
         by_file_name_line.insert((sym.file.as_str(), sym.name.as_str(), sym.start_line), idx);
     }
 
-    // 3. Resolve every RawCallSite and function-pointer candidate across units
-    let mut calls: Vec<ResolvedCallEdge> = Vec::new();
-    let mut promoted_fn_ptr_xrefs: Vec<XrefEntry> = Vec::new();
-
-    // File -> language lookup used to keep cross-language name collisions from resolving.
+    // 3. Resolve every RawCallSite and function-pointer candidate across units in parallel
     let mut file_languages: FxHashMap<&str, LanguageKind> = FxHashMap::default();
     file_languages.reserve(units.len());
     for unit in units {
         file_languages.insert(unit.scanned.rel_path.as_str(), unit.scanned.language);
     }
 
-    for unit in units {
-        let unit_sec_id = infer_unit_section_id(unit);
-        let unit_language = unit.scanned.language;
-        let mut direct_call_sites: FxHashSet<(usize, &str)> = FxHashSet::default();
-
-        for raw in &unit.raw_calls {
-            direct_call_sites.insert((raw.call_line, raw.callee_name.as_str()));
-            let caller_idx = by_file_name_line
-                .get(&(
-                    raw.caller_file.as_str(),
-                    raw.caller_name.as_str(),
-                    raw.caller_start_line,
-                ))
-                .copied()
-                .or_else(|| {
-                    by_file_name
-                        .get(&(raw.caller_file.as_str(), raw.caller_name.as_str()))
-                        .copied()
-                });
-
-            let (caller_id, caller_section_id, caller_enclosing_type) = match caller_idx {
-                Some(idx) => (
-                    symbols[idx].symbol_id.clone(),
-                    symbols[idx].section_id.clone(),
-                    symbols[idx].enclosing_type.as_deref(),
-                ),
-                None => (
-                    format!("{}::{}", raw.caller_file, raw.caller_name),
-                    unit_sec_id.clone(),
-                    None,
-                ),
-            };
-
-            let short_callee = raw
-                .callee_name
-                .rsplit_once("::")
-                .or_else(|| raw.callee_name.rsplit_once("?."))
-                .or_else(|| raw.callee_name.rsplit_once('.'))
-                .or_else(|| raw.callee_name.rsplit_once("->"))
-                .map(|(_, s)| s)
-                .unwrap_or(raw.callee_name.as_str());
-            direct_call_sites.insert((raw.call_line, short_callee));
-
-            let candidates = by_name
-                .get(raw.callee_name.as_str())
-                .or_else(|| by_name.get(short_callee));
-
-            // Language-family compatibility: a caller may only resolve to a symbol defined in a
-            // compatible language family. This keeps e.g. Python `session.commit()` from binding
-            // to a JavaScript `commit()` helper that merely shares the same leaf name.
-            let candidate_indices: Vec<usize> = candidates
-                .map(|indices| {
-                    indices
-                        .iter()
-                        .copied()
-                        .filter(|&idx| {
-                            languages_compatible(
-                                Some(unit_language),
-                                resolve_file_language(symbols[idx].file.as_str(), &file_languages),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let (callee_id, tier) = resolve_callee_candidates(
-                CallerSite {
-                    file: raw.caller_file.as_str(),
-                    section_id: &caller_section_id,
-                    language: Some(unit_language),
-                    scope: caller_idx
-                        .map(|i| symbols[i].scope)
-                        .unwrap_or(unit.scanned.scope),
-                    enclosing_type: caller_enclosing_type,
-                },
-                raw.callee_name.as_str(),
-                short_callee,
-                raw.receiver_or_qualifier.as_deref(),
-                &unit.imports,
-                &candidate_indices,
-                &symbols,
-            );
-
-            if tier == ResolutionTier::ExternalOrMacro
-                && unit_language == LanguageKind::Rust
-                && is_noisy_rust_external_call(
-                    raw.callee_name.as_str(),
-                    short_callee,
-                    raw.receiver_or_qualifier.as_deref(),
-                )
-            {
-                continue;
+    // Precompute normalized path metadata and language per symbol once across all units
+    let sym_files: Vec<PrecomputedSymFile> = symbols
+        .iter()
+        .map(|sym| {
+            let def_norm = sym.file.replace('\\', "/");
+            let def_stem = Path::new(&def_norm)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let def_without_ext = strip_source_extension(&def_norm);
+            let language = resolve_file_language(sym.file.as_str(), &file_languages);
+            PrecomputedSymFile {
+                def_without_ext,
+                def_stem,
+                language,
             }
+        })
+        .collect();
 
-            calls.push(ResolvedCallEdge {
-                caller_id,
-                caller_name: raw.caller_name.clone(),
-                callee_name: raw.callee_name.clone(),
-                callee_id,
-                file: raw.caller_file.clone(),
-                line: raw.call_line,
-                tier,
-                section_id: caller_section_id,
-            });
-        }
-
-        // Idea 4: Precision-filter `fn_ptr_candidate` raw xrefs against known repository symbols.
-        // Only candidates that resolve to an actual function/method/ISR/entrypoint in a compatible
-        // language family are promoted to `fn_ptr_ref` xrefs and synthesized `ResolvedCallEdge`s.
-        for rx in &unit.raw_xrefs {
-            if rx.category != "fn_ptr_candidate" {
-                continue;
-            }
-            let target_name = rx.target_name.as_str();
-            if direct_call_sites.contains(&(rx.line, target_name))
-                || is_language_builtin(target_name, Some(unit_language))
-                || is_ubiquitous_member_name(target_name)
-            {
-                continue;
-            }
-
-            let Some(candidates) = by_name.get(target_name) else {
-                continue;
-            };
-            let candidate_indices: Vec<usize> = candidates
+    let per_unit_results: Vec<(Vec<ResolvedCallEdge>, Vec<XrefEntry>, bool)> = units
+        .par_iter()
+        .map(|unit| {
+            let unit_sec_id = infer_unit_section_id(unit);
+            let unit_language = unit.scanned.language;
+            let precomputed_imports: Vec<PrecomputedImport<'_>> = unit
+                .imports
                 .iter()
-                .copied()
-                .filter(|&idx| {
+                .map(|imp| PrecomputedImport::new(&unit.scanned.rel_path, imp))
+                .collect();
+            let mut direct_call_sites: FxHashSet<(usize, &str)> =
+                FxHashSet::with_capacity_and_hasher(unit.raw_calls.len() * 2, Default::default());
+            let mut unit_calls: Vec<ResolvedCallEdge> = Vec::with_capacity(unit.raw_calls.len());
+            let mut unit_fn_ptr_xrefs: Vec<XrefEntry> = Vec::new();
+            let mut candidate_indices: Vec<usize> = Vec::new();
+
+            for raw in &unit.raw_calls {
+                direct_call_sites.insert((raw.call_line, raw.callee_name.as_str()));
+                let caller_idx = by_file_name_line
+                    .get(&(
+                        raw.caller_file.as_str(),
+                        raw.caller_name.as_str(),
+                        raw.caller_start_line,
+                    ))
+                    .copied()
+                    .or_else(|| {
+                        by_file_name
+                            .get(&(raw.caller_file.as_str(), raw.caller_name.as_str()))
+                            .copied()
+                    });
+
+                let (caller_section_id_str, caller_enclosing_type) = match caller_idx {
+                    Some(idx) => (
+                        symbols[idx].section_id.as_str(),
+                        symbols[idx].enclosing_type.as_deref(),
+                    ),
+                    None => (unit_sec_id.as_str(), None),
+                };
+
+                let short_callee = raw
+                    .callee_name
+                    .rsplit_once("::")
+                    .or_else(|| raw.callee_name.rsplit_once("?."))
+                    .or_else(|| raw.callee_name.rsplit_once('.'))
+                    .or_else(|| raw.callee_name.rsplit_once("->"))
+                    .map(|(_, s)| s)
+                    .unwrap_or(raw.callee_name.as_str());
+                direct_call_sites.insert((raw.call_line, short_callee));
+
+                let candidates = by_name
+                    .get(raw.callee_name.as_str())
+                    .or_else(|| by_name.get(short_callee));
+
+                candidate_indices.clear();
+                if let Some(indices) = candidates {
+                    candidate_indices.extend(indices.iter().copied().filter(|&idx| {
+                        languages_compatible(Some(unit_language), sym_files[idx].language)
+                    }));
+                }
+
+                let (callee_id, tier) = if candidate_indices.is_empty() {
+                    (
+                        format!("external::{short_callee}"),
+                        ResolutionTier::ExternalOrMacro,
+                    )
+                } else {
+                    resolve_callee_candidates(
+                        CallerSite {
+                            file: raw.caller_file.as_str(),
+                            section_id: caller_section_id_str,
+                            language: Some(unit_language),
+                            scope: caller_idx
+                                .map(|i| symbols[i].scope)
+                                .unwrap_or(unit.scanned.scope),
+                            enclosing_type: caller_enclosing_type,
+                        },
+                        raw.callee_name.as_str(),
+                        short_callee,
+                        raw.receiver_or_qualifier.as_deref(),
+                        &precomputed_imports,
+                        &candidate_indices,
+                        &symbols,
+                        &sym_files,
+                    )
+                };
+
+                if tier == ResolutionTier::ExternalOrMacro
+                    && unit_language == LanguageKind::Rust
+                    && is_noisy_rust_external_call(
+                        raw.callee_name.as_str(),
+                        short_callee,
+                        raw.receiver_or_qualifier.as_deref(),
+                    )
+                {
+                    continue;
+                }
+
+                let caller_id = match caller_idx {
+                    Some(idx) => symbols[idx].symbol_id.clone(),
+                    None => format!("{}::{}", raw.caller_file, raw.caller_name),
+                };
+
+                unit_calls.push(ResolvedCallEdge {
+                    caller_id,
+                    caller_name: raw.caller_name.clone(),
+                    callee_name: raw.callee_name.clone(),
+                    callee_id,
+                    file: raw.caller_file.clone(),
+                    line: raw.call_line,
+                    tier,
+                    section_id: caller_section_id_str.to_string(),
+                });
+            }
+
+            // Idea 4: Precision-filter `fn_ptr_candidate` raw xrefs against known repository symbols.
+            for rx in &unit.raw_xrefs {
+                if rx.category != "fn_ptr_candidate" {
+                    continue;
+                }
+                let target_name = rx.target_name.as_str();
+                if direct_call_sites.contains(&(rx.line, target_name))
+                    || is_language_builtin(target_name, Some(unit_language))
+                    || is_ubiquitous_member_name(target_name)
+                {
+                    continue;
+                }
+
+                let Some(candidates) = by_name.get(target_name) else {
+                    continue;
+                };
+                candidate_indices.clear();
+                candidate_indices.extend(candidates.iter().copied().filter(|&idx| {
                     let sym = &symbols[idx];
                     !(sym.file == rx.file && rx.line == sym.start_line)
-                        && languages_compatible(
-                            Some(unit_language),
-                            resolve_file_language(sym.file.as_str(), &file_languages),
-                        )
-                })
-                .collect();
-            if candidate_indices.is_empty() {
-                continue;
+                        && languages_compatible(Some(unit_language), sym_files[idx].language)
+                }));
+                if candidate_indices.is_empty() {
+                    continue;
+                }
+
+                let caller_name = rx.enclosing_symbol.as_deref().unwrap_or("<module_init>");
+                let caller_idx = by_file_name.get(&(rx.file.as_str(), caller_name)).copied();
+                let (caller_id, caller_section_id, caller_enclosing_type) = match caller_idx {
+                    Some(idx) => (
+                        symbols[idx].symbol_id.clone(),
+                        symbols[idx].section_id.clone(),
+                        symbols[idx].enclosing_type.as_deref(),
+                    ),
+                    None => (
+                        format!("{}::{}", rx.file, caller_name),
+                        unit_sec_id.clone(),
+                        None,
+                    ),
+                };
+
+                let (callee_id, tier) = resolve_callee_candidates(
+                    CallerSite {
+                        file: rx.file.as_str(),
+                        section_id: &caller_section_id,
+                        language: Some(unit_language),
+                        scope: caller_idx
+                            .map(|i| symbols[i].scope)
+                            .unwrap_or(unit.scanned.scope),
+                        enclosing_type: caller_enclosing_type,
+                    },
+                    target_name,
+                    target_name,
+                    None,
+                    &precomputed_imports,
+                    &candidate_indices,
+                    &symbols,
+                    &sym_files,
+                );
+
+                if !tier.is_high_confidence() {
+                    continue;
+                }
+
+                unit_calls.push(ResolvedCallEdge {
+                    caller_id: caller_id.clone(),
+                    caller_name: caller_name.to_string(),
+                    callee_name: rx.target_name.clone(),
+                    callee_id,
+                    file: rx.file.clone(),
+                    line: rx.line,
+                    tier,
+                    section_id: caller_section_id.clone(),
+                });
+
+                unit_fn_ptr_xrefs.push(XrefEntry {
+                    symbol: rx.target_name.clone(),
+                    category: "fn_ptr_ref".to_string(),
+                    relation: "dispatches_fn".to_string(),
+                    target: caller_id,
+                    file: rx.file.clone(),
+                    line: rx.line,
+                    section_id: caller_section_id,
+                    context: rx.context.clone(),
+                });
             }
 
-            let caller_name = rx.enclosing_symbol.as_deref().unwrap_or("<module_init>");
-            let caller_idx = by_file_name.get(&(rx.file.as_str(), caller_name)).copied();
-            let (caller_id, caller_section_id, caller_enclosing_type) = match caller_idx {
-                Some(idx) => (
-                    symbols[idx].symbol_id.clone(),
-                    symbols[idx].section_id.clone(),
-                    symbols[idx].enclosing_type.as_deref(),
-                ),
-                None => (
-                    format!("{}::{}", rx.file, caller_name),
-                    unit_sec_id.clone(),
-                    None,
-                ),
-            };
+            unit_calls.sort_by(|a, b| {
+                a.file
+                    .cmp(&b.file)
+                    .then_with(|| a.line.cmp(&b.line))
+                    .then_with(|| a.caller_id.cmp(&b.caller_id))
+                    .then_with(|| a.callee_name.cmp(&b.callee_name))
+                    .then_with(|| a.callee_id.cmp(&b.callee_id))
+            });
+            unit_calls.dedup_by(|a, b| {
+                a.file == b.file
+                    && a.line == b.line
+                    && a.caller_id == b.caller_id
+                    && a.callee_name == b.callee_name
+                    && a.callee_id == b.callee_id
+            });
 
-            let (callee_id, tier) = resolve_callee_candidates(
-                CallerSite {
-                    file: rx.file.as_str(),
-                    section_id: &caller_section_id,
-                    language: Some(unit_language),
-                    scope: caller_idx
-                        .map(|i| symbols[i].scope)
-                        .unwrap_or(unit.scanned.scope),
-                    enclosing_type: caller_enclosing_type,
-                },
-                target_name,
-                target_name,
-                None,
-                &unit.imports,
-                &candidate_indices,
-                &symbols,
+            // 4. Build and sort per-unit XrefEntry list in parallel
+            let mut unit_xrefs: Vec<XrefEntry> = Vec::with_capacity(
+                unit_calls.len()
+                    + unit_fn_ptr_xrefs.len()
+                    + unit.raw_xrefs.len()
+                    + unit.types.len()
+                    + unit.macros.len(),
             );
 
-            if !tier.is_high_confidence() {
-                continue;
+            for edge in &unit_calls {
+                let mut context =
+                    String::with_capacity(edge.caller_name.len() + 4 + edge.callee_id.len());
+                context.push_str(&edge.caller_name);
+                context.push_str(" -> ");
+                context.push_str(&edge.callee_id);
+                unit_xrefs.push(XrefEntry {
+                    symbol: edge.callee_name.clone(),
+                    category: "call".to_string(),
+                    relation: edge.tier.as_str().to_string(),
+                    target: edge.caller_id.clone(),
+                    file: edge.file.clone(),
+                    line: edge.line,
+                    section_id: edge.section_id.clone(),
+                    context,
+                });
             }
 
-            calls.push(ResolvedCallEdge {
-                caller_id: caller_id.clone(),
-                caller_name: caller_name.to_string(),
-                callee_name: rx.target_name.clone(),
-                callee_id,
-                file: rx.file.clone(),
-                line: rx.line,
-                tier,
-                section_id: caller_section_id.clone(),
-            });
+            unit_xrefs.extend(unit_fn_ptr_xrefs);
 
-            promoted_fn_ptr_xrefs.push(XrefEntry {
-                symbol: rx.target_name.clone(),
-                category: "fn_ptr_ref".to_string(),
-                relation: "dispatches_fn".to_string(),
-                target: caller_id,
-                file: rx.file.clone(),
-                line: rx.line,
-                section_id: caller_section_id,
-                context: rx.context.clone(),
-            });
-        }
-    }
+            for rx in &unit.raw_xrefs {
+                if rx.category == "fn_ptr_candidate" {
+                    continue;
+                }
+                let relation = match rx.category.as_str() {
+                    "mmio_write" => "writes_reg",
+                    "mmio_read" => "reads_reg",
+                    "mmio_access" => "accesses_reg",
+                    "field_write" => "writes_field",
+                    "field_read" => "reads_field",
+                    "fn_ptr_ref" => "dispatches_fn",
+                    "import" => "imports",
+                    "type_ref" => "references_type",
+                    "macro_ref" => "expands_macro",
+                    other => other,
+                }
+                .to_string();
 
-    calls.sort_by(|a, b| {
-        a.file
-            .cmp(&b.file)
-            .then_with(|| a.line.cmp(&b.line))
-            .then_with(|| a.caller_id.cmp(&b.caller_id))
-            .then_with(|| a.callee_name.cmp(&b.callee_name))
-            .then_with(|| a.callee_id.cmp(&b.callee_id))
-    });
-    calls.dedup_by(|a, b| {
-        a.file == b.file
-            && a.line == b.line
-            && a.caller_id == b.caller_id
-            && a.callee_name == b.callee_name
-            && a.callee_id == b.callee_id
-    });
-
-    // 4. Build unified XrefEntry list
-    let mut xrefs: Vec<XrefEntry> = Vec::with_capacity(
-        calls.len() + promoted_fn_ptr_xrefs.len() + types.len() + macros.len() + units.len() * 4,
-    );
-
-    for edge in &calls {
-        xrefs.push(XrefEntry {
-            symbol: edge.callee_name.clone(),
-            category: "call".to_string(),
-            relation: edge.tier.as_str().to_string(),
-            target: edge.caller_id.clone(),
-            file: edge.file.clone(),
-            line: edge.line,
-            section_id: edge.section_id.clone(),
-            context: format!("{} -> {}", edge.caller_name, edge.callee_id),
-        });
-    }
-
-    xrefs.extend(promoted_fn_ptr_xrefs);
-
-    for unit in units {
-        let unit_sec_id = infer_unit_section_id(unit);
-        for rx in &unit.raw_xrefs {
-            if rx.category == "fn_ptr_candidate" {
-                continue;
+                unit_xrefs.push(XrefEntry {
+                    symbol: rx.target_name.clone(),
+                    category: rx.category.clone(),
+                    relation,
+                    target: rx
+                        .enclosing_symbol
+                        .clone()
+                        .unwrap_or_else(|| rx.file.clone()),
+                    file: rx.file.clone(),
+                    line: rx.line,
+                    section_id: unit_sec_id.clone(),
+                    context: rx.context.clone(),
+                });
             }
-            let relation = match rx.category.as_str() {
-                "mmio_write" => "writes_reg",
-                "mmio_read" => "reads_reg",
-                "mmio_access" => "accesses_reg",
-                "field_write" => "writes_field",
-                "field_read" => "reads_field",
-                "fn_ptr_ref" => "dispatches_fn",
-                "import" => "imports",
-                "type_ref" => "references_type",
-                "macro_ref" => "expands_macro",
-                other => other,
+
+            for t in &unit.types {
+                unit_xrefs.push(XrefEntry {
+                    symbol: t.name.clone(),
+                    category: "type_def".to_string(),
+                    relation: t.kind.as_str().to_string(),
+                    target: t.type_id.clone(),
+                    file: t.file.clone(),
+                    line: t.start_line,
+                    section_id: t.section_id.clone(),
+                    context: t.fields_summary.clone(),
+                });
             }
-            .to_string();
 
-            xrefs.push(XrefEntry {
-                symbol: rx.target_name.clone(),
-                category: rx.category.clone(),
-                relation,
-                target: rx
-                    .enclosing_symbol
-                    .clone()
-                    .unwrap_or_else(|| rx.file.clone()),
-                file: rx.file.clone(),
-                line: rx.line,
-                section_id: unit_sec_id.clone(),
-                context: rx.context.clone(),
+            for m in &unit.macros {
+                let context = if m.description.is_empty() {
+                    m.value_or_args.clone()
+                } else if m.value_or_args.is_empty() {
+                    m.description.clone()
+                } else {
+                    format!("{} ({})", m.value_or_args, m.description)
+                };
+                unit_xrefs.push(XrefEntry {
+                    symbol: m.name.clone(),
+                    category: "macro_def".to_string(),
+                    relation: m.kind.as_str().to_string(),
+                    target: m
+                        .hex_addr
+                        .clone()
+                        .unwrap_or_else(|| m.value_or_args.clone()),
+                    file: m.file.clone(),
+                    line: m.line,
+                    section_id: m.section_id.clone(),
+                    context,
+                });
+            }
+
+            unit_xrefs.sort_by(|a, b| {
+                a.file
+                    .cmp(&b.file)
+                    .then_with(|| a.line.cmp(&b.line))
+                    .then_with(|| a.symbol.cmp(&b.symbol))
+                    .then_with(|| a.category.cmp(&b.category))
+                    .then_with(|| a.relation.cmp(&b.relation))
+                    .then_with(|| a.target.cmp(&b.target))
             });
-        }
+            unit_xrefs.dedup_by(|a, b| {
+                a.file == b.file
+                    && a.line == b.line
+                    && a.symbol == b.symbol
+                    && a.category == b.category
+                    && a.target == b.target
+            });
+
+            let rel_path_str = unit.scanned.rel_path.as_str();
+            let all_local = unit_calls.iter().all(|c| c.file == rel_path_str)
+                && unit_xrefs.iter().all(|x| x.file == rel_path_str);
+
+            (unit_calls, unit_xrefs, all_local)
+        })
+        .collect();
+
+    let total_calls: usize = per_unit_results.iter().map(|(c, _, _)| c.len()).sum();
+    let total_xrefs: usize = per_unit_results.iter().map(|(_, x, _)| x.len()).sum();
+    let all_units_local = per_unit_results.iter().all(|(_, _, ok)| *ok);
+    let mut calls: Vec<ResolvedCallEdge> = Vec::with_capacity(total_calls);
+    let mut xrefs: Vec<XrefEntry> = Vec::with_capacity(total_xrefs);
+    for (uc, ux, _) in per_unit_results {
+        calls.extend(uc);
+        xrefs.extend(ux);
     }
 
-    for t in &types {
-        xrefs.push(XrefEntry {
-            symbol: t.name.clone(),
-            category: "type_def".to_string(),
-            relation: t.kind.as_str().to_string(),
-            target: t.type_id.clone(),
-            file: t.file.clone(),
-            line: t.start_line,
-            section_id: t.section_id.clone(),
-            context: t.fields_summary.clone(),
+    let units_sorted_by_file = units
+        .windows(2)
+        .all(|w| w[0].scanned.rel_path < w[1].scanned.rel_path);
+    if !units_sorted_by_file || !all_units_local {
+        calls.sort_by(|a, b| {
+            a.file
+                .cmp(&b.file)
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.caller_id.cmp(&b.caller_id))
+                .then_with(|| a.callee_name.cmp(&b.callee_name))
+                .then_with(|| a.callee_id.cmp(&b.callee_id))
+        });
+        calls.dedup_by(|a, b| {
+            a.file == b.file
+                && a.line == b.line
+                && a.caller_id == b.caller_id
+                && a.callee_name == b.callee_name
+                && a.callee_id == b.callee_id
+        });
+        xrefs.sort_by(|a, b| {
+            a.file
+                .cmp(&b.file)
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.symbol.cmp(&b.symbol))
+                .then_with(|| a.category.cmp(&b.category))
+                .then_with(|| a.relation.cmp(&b.relation))
+                .then_with(|| a.target.cmp(&b.target))
+        });
+        xrefs.dedup_by(|a, b| {
+            a.file == b.file
+                && a.line == b.line
+                && a.symbol == b.symbol
+                && a.category == b.category
+                && a.target == b.target
         });
     }
-
-    for m in &macros {
-        let context = if m.description.is_empty() {
-            m.value_or_args.clone()
-        } else if m.value_or_args.is_empty() {
-            m.description.clone()
-        } else {
-            format!("{} ({})", m.value_or_args, m.description)
-        };
-        xrefs.push(XrefEntry {
-            symbol: m.name.clone(),
-            category: "macro_def".to_string(),
-            relation: m.kind.as_str().to_string(),
-            target: m
-                .hex_addr
-                .clone()
-                .unwrap_or_else(|| m.value_or_args.clone()),
-            file: m.file.clone(),
-            line: m.line,
-            section_id: m.section_id.clone(),
-            context,
-        });
-    }
-
-    xrefs.sort_by(|a, b| {
-        a.file
-            .cmp(&b.file)
-            .then_with(|| a.line.cmp(&b.line))
-            .then_with(|| a.symbol.cmp(&b.symbol))
-            .then_with(|| a.category.cmp(&b.category))
-            .then_with(|| a.relation.cmp(&b.relation))
-            .then_with(|| a.target.cmp(&b.target))
-    });
-    xrefs.dedup_by(|a, b| {
-        a.file == b.file
-            && a.line == b.line
-            && a.symbol == b.symbol
-            && a.category == b.category
-            && a.target == b.target
-    });
 
     // 5. Compute VendorSurfaceSummary
     let vendor_surface = compute_vendor_surface(units, &symbols, &types, &macros, &calls);
 
     (symbols, types, macros, calls, xrefs, vendor_surface)
+}
+
+/// Precomputed path metadata and language for a defined symbol.
+struct PrecomputedSymFile {
+    def_without_ext: String,
+    def_stem: String,
+    language: Option<LanguageKind>,
+}
+
+/// Precomputed normalized path metadata for a single import statement within a caller file.
+struct PrecomputedImport<'a> {
+    raw_norm: String,
+    first_segment: Option<String>,
+    last_segment: Option<String>,
+    rel_resolved: Option<String>,
+    imp_without_ext: String,
+    imp_stem: String,
+    implicit_header_or_module_import: bool,
+    is_std_stem: bool,
+    imported_names: &'a [String],
+}
+
+impl<'a> PrecomputedImport<'a> {
+    fn new(caller_file: &str, imp: &'a ExtractedImport) -> Self {
+        let raw_norm = normalize_import_path(&imp.raw_path);
+        let mut seg_iter = raw_norm
+            .split(['/', '.', ':'])
+            .filter(|segment| !segment.is_empty());
+        let first_segment = seg_iter.next().map(|s| s.to_string());
+        let last_segment = seg_iter
+            .next_back()
+            .map(|s| s.to_string())
+            .or_else(|| first_segment.clone());
+        let rel_resolved = resolve_relative_import_path(caller_file, &imp.raw_path);
+        let imp_without_ext =
+            strip_source_extension(raw_norm.trim_start_matches("../").trim_start_matches("./"));
+        let imp_stem = Path::new(&imp_without_ext)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        let names_module_stem = !imp_stem.is_empty()
+            && imp
+                .imported_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&imp_stem));
+        let implicit_header_or_module_import = imp.imported_names.is_empty() || names_module_stem;
+        let is_std_stem = imp_stem.eq_ignore_ascii_case("std");
+
+        Self {
+            raw_norm,
+            first_segment,
+            last_segment,
+            rel_resolved,
+            imp_without_ext,
+            imp_stem,
+            implicit_header_or_module_import,
+            is_std_stem,
+            imported_names: &imp.imported_names,
+        }
+    }
 }
 
 /// Caller-side context needed to resolve a single call site.
@@ -432,14 +571,16 @@ struct CallerSite<'a> {
     enclosing_type: Option<&'a str>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_callee_candidates(
     caller: CallerSite<'_>,
     raw_callee_name: &str,
     callee_name: &str,
     receiver_or_qualifier: Option<&str>,
-    imports: &[ExtractedImport],
+    imports: &[PrecomputedImport<'_>],
     candidate_indices: &[usize],
     symbols: &[ExtractedSymbol],
+    sym_files: &[PrecomputedSymFile],
 ) -> (String, ResolutionTier) {
     let caller_file = caller.file;
     let caller_section_id = caller.section_id;
@@ -541,13 +682,7 @@ fn resolve_callee_candidates(
         // repository (e.g. `import subprocess; subprocess.run(...)`, `time.sleep(...)`).
         Some(qual) => {
             if !is_self_or_class_receiver(qual)
-                && is_external_module_qualifier(
-                    caller_file,
-                    qual,
-                    imports,
-                    candidate_indices,
-                    symbols,
-                )
+                && is_external_module_qualifier(qual, imports, candidate_indices, sym_files)
             {
                 return unresolved();
             }
@@ -580,9 +715,7 @@ fn resolve_callee_candidates(
             // Unqualified call cannot invoke a method of an unrelated type across files.
             continue;
         }
-        if let Some(score) =
-            match_import_for_candidate(caller_file, callee_name, &def.file, imports)
-        {
+        if let Some(score) = match_import_for_candidate(callee_name, &sym_files[idx], imports) {
             import_matches.push((score, idx));
         }
     }
@@ -1467,6 +1600,12 @@ fn is_noisy_rust_external_call(
             | "hash"
             | "to_hex"
             | "finalize"
+            | "Borrowed"
+            | "Owned"
+            | "next_back"
+            | "is_some_and"
+            | "is_none_or"
+            | "eq_ignore_ascii_case"
     ) {
         return true;
     }
@@ -1478,11 +1617,13 @@ fn is_noisy_rust_external_call(
                 | "Vec"
                 | "Option"
                 | "Result"
+                | "Cow"
                 | "Box"
                 | "Arc"
                 | "Rc"
                 | "Path"
                 | "PathBuf"
+                | "File"
                 | "BTreeMap"
                 | "BTreeSet"
                 | "HashMap"
@@ -1494,12 +1635,15 @@ fn is_noisy_rust_external_call(
                 | "RwLock"
                 | "Instant"
                 | "SystemTime"
+                | "Duration"
                 | "mem"
                 | "str"
                 | "fs"
                 | "env"
                 | "io"
                 | "fmt"
+                | "thread"
+                | "rayon"
                 | "serde_json"
                 | "blake3"
                 | "regex"
@@ -1530,12 +1674,13 @@ fn qualifier_leaf(qualifier: &str) -> &str {
 
 /// True when the qualifier is directly the instance/class receiver (`self`, `cls`, `this`, `super`)
 /// rather than a member attribute chain (`self._queue`), variable, or module name.
+#[inline]
 fn is_self_or_class_receiver(qualifier: &str) -> bool {
     let trimmed = qualifier.trim();
-    matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "self" | "cls" | "this" | "super"
-    )
+    trimmed.eq_ignore_ascii_case("self")
+        || trimmed.eq_ignore_ascii_case("cls")
+        || trimmed.eq_ignore_ascii_case("this")
+        || trimmed.eq_ignore_ascii_case("super")
 }
 
 /// True when `qualifier` names a module/file stem, so `qualifier.member()` may legitimately refer
@@ -1546,9 +1691,8 @@ fn module_qualifier_matches(qualifier: &str, def_file: &str) -> bool {
         return false;
     }
 
-    let normalized = def_file.replace('\\', "/");
-    let mut segments = normalized.rsplit('/');
-    let file_name = segments.next().unwrap_or(normalized.as_str());
+    let mut segments = def_file.rsplit(['/', '\\']);
+    let file_name = segments.next().unwrap_or(def_file);
     let stem = file_name
         .rsplit_once('.')
         .map(|(s, _)| s)
@@ -1656,55 +1800,67 @@ fn resolve_relative_import_path(caller_file: &str, raw_import: &str) -> Option<S
     Some(strip_source_extension(&joined))
 }
 
+#[inline]
+fn strip_mod_suffix_matches(haystack: &str, base: &str, suffix: &str) -> bool {
+    haystack
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| prefix == base)
+}
+
+#[inline]
+fn ends_with_slash_segment(haystack: &str, seg: &str) -> bool {
+    haystack
+        .strip_suffix(seg)
+        .is_some_and(|prefix| prefix.ends_with('/'))
+}
+
+#[inline]
+fn ends_with_slash_segment_suffix(haystack: &str, seg: &str, suffix: &str) -> bool {
+    haystack
+        .strip_suffix(suffix)
+        .and_then(|s| s.strip_suffix(seg))
+        .is_some_and(|prefix| prefix.ends_with('/'))
+}
+
 /// True when the import path names the given repository source file.
-fn import_references_file(caller_file: &str, import_path: &str, def_file: &str) -> bool {
-    let def = strip_source_extension(&def_file.replace('\\', "/"));
-    if def.is_empty() {
+fn import_references_file(imp: &PrecomputedImport<'_>, def: &PrecomputedSymFile) -> bool {
+    let def_we = def.def_without_ext.as_str();
+    if def_we.is_empty() {
         return false;
     }
-    if let Some(resolved_rel) = resolve_relative_import_path(caller_file, import_path) {
+    if let Some(resolved_rel) = imp.rel_resolved.as_deref() {
         if !resolved_rel.is_empty()
-            && (def == resolved_rel
-                || def == format!("{resolved_rel}/index")
-                || def == format!("{resolved_rel}/mod")
-                || def == format!("{resolved_rel}/__init__"))
+            && (def_we == resolved_rel
+                || strip_mod_suffix_matches(def_we, resolved_rel, "/index")
+                || strip_mod_suffix_matches(def_we, resolved_rel, "/mod")
+                || strip_mod_suffix_matches(def_we, resolved_rel, "/__init__"))
         {
             return true;
         }
     }
-    let raw = strip_source_extension(
-        normalize_import_path(import_path)
-            .trim_start_matches("../")
-            .trim_start_matches("./"),
-    );
+    let raw = imp.imp_without_ext.as_str();
     if raw.is_empty() {
         return false;
     }
-    def == raw
-        || def.ends_with(&format!("/{raw}"))
-        || def.ends_with(&format!("/{raw}/mod"))
-        || def.ends_with(&format!("/{raw}/index"))
-        || def.ends_with(&format!("/{raw}/__init__"))
+    def_we == raw
+        || ends_with_slash_segment(def_we, raw)
+        || ends_with_slash_segment_suffix(def_we, raw, "/mod")
+        || ends_with_slash_segment_suffix(def_we, raw, "/index")
+        || ends_with_slash_segment_suffix(def_we, raw, "/__init__")
 }
 
-fn import_mentions_name(imp: &ExtractedImport, qualifier: &str, leaf: &str) -> bool {
-    let normalized = normalize_import_path(&imp.raw_path);
-    let segments: Vec<&str> = normalized
-        .split(['/', '.', ':'])
-        .filter(|segment| !segment.is_empty())
-        .collect();
-
-    let matches = |segment: &&str| {
+fn import_mentions_name(imp: &PrecomputedImport<'_>, qualifier: &str, leaf: &str) -> bool {
+    let matches = |segment: &str| {
         segment.eq_ignore_ascii_case(leaf) || segment.eq_ignore_ascii_case(qualifier)
     };
 
-    if let Some(top) = segments.first() {
+    if let Some(top) = imp.first_segment.as_deref() {
         if matches(top) {
             return true;
         }
     }
 
-    if let Some(last) = segments.last() {
+    if let Some(last) = imp.last_segment.as_deref() {
         if matches(last) {
             return true;
         }
@@ -1718,11 +1874,10 @@ fn import_mentions_name(imp: &ExtractedImport, qualifier: &str, leaf: &str) -> b
 /// True when `qualifier` is an imported module/symbol that does not resolve to any repository
 /// candidate file (e.g. `import subprocess` or `import time` in a Python module).
 fn is_external_module_qualifier(
-    caller_file: &str,
     qualifier: &str,
-    imports: &[ExtractedImport],
+    imports: &[PrecomputedImport<'_>],
     candidate_indices: &[usize],
-    symbols: &[ExtractedSymbol],
+    sym_files: &[PrecomputedSymFile],
 ) -> bool {
     let leaf = qualifier_leaf(qualifier);
     if leaf.is_empty() {
@@ -1735,7 +1890,7 @@ fn is_external_module_qualifier(
         }
         let references_repo_file = candidate_indices
             .iter()
-            .any(|&idx| import_references_file(caller_file, &imp.raw_path, &symbols[idx].file));
+            .any(|&idx| import_references_file(imp, &sym_files[idx]));
         if !references_repo_file {
             return true;
         }
@@ -1745,17 +1900,12 @@ fn is_external_module_qualifier(
 }
 
 fn match_import_for_candidate(
-    caller_file: &str,
     callee_name: &str,
-    def_file: &str,
-    imports: &[ExtractedImport],
+    def: &PrecomputedSymFile,
+    imports: &[PrecomputedImport<'_>],
 ) -> Option<usize> {
-    let def_norm = def_file.replace('\\', "/");
-    let def_stem = Path::new(&def_norm)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    let def_without_ext = strip_source_extension(&def_norm);
+    let def_stem = def.def_stem.as_str();
+    let def_without_ext = def.def_without_ext.as_str();
 
     let mut best_score: Option<usize> = None;
 
@@ -1765,31 +1915,26 @@ fn match_import_for_candidate(
             .iter()
             .any(|n| n == callee_name || n == "*");
 
-        let rel_resolved = resolve_relative_import_path(caller_file, &imp.raw_path);
-        let exact_rel_match = rel_resolved.as_ref().is_some_and(|rel| {
+        let exact_rel_match = imp.rel_resolved.as_deref().is_some_and(|rel| {
             !rel.is_empty()
-                && (def_without_ext == *rel || def_without_ext == format!("{rel}/index"))
+                && (def_without_ext == rel
+                    || strip_mod_suffix_matches(def_without_ext, rel, "/index"))
         });
 
-        let raw_norm = normalize_import_path(&imp.raw_path);
-        let imp_without_ext =
-            strip_source_extension(raw_norm.trim_start_matches("../").trim_start_matches("./"));
-        let imp_stem = Path::new(&imp_without_ext)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let imp_without_ext = imp.imp_without_ext.as_str();
+        let imp_stem = imp.imp_stem.as_str();
 
         // When the import is a relative path (`./...` or `../...`), only match the resolved
         // relative target path rather than unrelated files that happen to share the same stem.
-        let path_matches = if rel_resolved.is_some() {
+        let path_matches = if imp.rel_resolved.is_some() {
             exact_rel_match
         } else if !imp_without_ext.is_empty() && !def_without_ext.is_empty() {
             def_without_ext == imp_without_ext
-                || def_without_ext.ends_with(&format!("/{imp_without_ext}"))
-                || def_without_ext.ends_with(&format!("/{imp_without_ext}/mod"))
-                || def_without_ext.ends_with(&format!("/{imp_without_ext}/index"))
-                || def_without_ext.ends_with(&format!("/{imp_without_ext}/__init__"))
-                || imp_without_ext.ends_with(&def_without_ext)
+                || ends_with_slash_segment(def_without_ext, imp_without_ext)
+                || ends_with_slash_segment_suffix(def_without_ext, imp_without_ext, "/mod")
+                || ends_with_slash_segment_suffix(def_without_ext, imp_without_ext, "/index")
+                || ends_with_slash_segment_suffix(def_without_ext, imp_without_ext, "/__init__")
+                || imp_without_ext.ends_with(def_without_ext)
                 || (!imp_stem.is_empty()
                     && !def_stem.is_empty()
                     && imp_stem.eq_ignore_ascii_case(def_stem))
@@ -1797,24 +1942,13 @@ fn match_import_for_candidate(
             false
         };
 
-        // If an import statement explicitly lists imported symbols (e.g. `import { LIMITS } from './kontakt'`)
-        // and does not import the module stem itself as a namespace, only symbols in `imported_names`
-        // are imported by that statement.
-        let names_module_stem = !imp_stem.is_empty()
-            && imp
-                .imported_names
-                .iter()
-                .any(|n| n.eq_ignore_ascii_case(imp_stem));
-        let implicit_header_or_module_import = imp.imported_names.is_empty() || names_module_stem;
-
         let score = match (explicit_name, exact_rel_match, path_matches) {
             (true, true, _) => Some(5),
-            (false, true, _) if implicit_header_or_module_import => Some(4),
+            (false, true, _) if imp.implicit_header_or_module_import => Some(4),
             (true, false, true) => Some(3),
-            (false, false, true) if implicit_header_or_module_import => Some(2),
+            (false, false, true) if imp.implicit_header_or_module_import => Some(2),
             (true, false, false)
-                if rel_resolved.is_none()
-                    && (raw_norm.is_empty() || !imp_stem.eq_ignore_ascii_case("std")) =>
+                if imp.rel_resolved.is_none() && (imp.raw_norm.is_empty() || !imp.is_std_stem) =>
             {
                 Some(1)
             }
@@ -1864,14 +1998,18 @@ fn strip_source_extension(path: &str) -> String {
 }
 
 fn common_dir_prefix_len(path_a: &str, path_b: &str) -> usize {
-    let a_parts: Vec<&str> = path_a.split(['/', '\\']).collect();
-    let b_parts: Vec<&str> = path_b.split(['/', '\\']).collect();
-    let a_dir = &a_parts[..a_parts.len().saturating_sub(1)];
-    let b_dir = &b_parts[..b_parts.len().saturating_sub(1)];
+    let Some(a_idx) = path_a.rfind(['/', '\\']) else {
+        return 0;
+    };
+    let Some(b_idx) = path_b.rfind(['/', '\\']) else {
+        return 0;
+    };
+    let a_dir = &path_a[..a_idx];
+    let b_dir = &path_b[..b_idx];
 
     a_dir
-        .iter()
-        .zip(b_dir.iter())
+        .split(['/', '\\'])
+        .zip(b_dir.split(['/', '\\']))
         .take_while(|(x, y)| x == y)
         .count()
 }
@@ -2100,23 +2238,31 @@ fn compute_vendor_surface(
         }
     }
 
-    // Check resolved calls from first-party files
-    for call in calls {
-        if !first_party_files.contains(call.file.as_str()) {
-            continue;
-        }
-        if GENERIC_BIT_MACROS.contains(&call.callee_name.as_str()) {
-            continue;
-        }
-        if let Some(&vname) = vendor_sym_ids.get(call.callee_id.as_str()) {
-            active_vendor_symbols.insert(vname.to_string());
-        } else if vendor_sym_names.contains(call.callee_name.as_str())
-            || vendor_macro_names.contains(call.callee_name.as_str())
-        {
-            active_vendor_symbols.insert(call.callee_name.clone());
-        }
-        if vendor_mmio_names.contains(call.callee_name.as_str()) {
-            active_mmio_registers.insert(call.callee_name.clone());
+    let has_any_vendor = total_vendor_files > 0
+        || total_vendor_symbols > 0
+        || !vendor_type_names.is_empty()
+        || !vendor_macro_names.is_empty()
+        || !vendor_mmio_names.is_empty();
+
+    if has_any_vendor {
+        // Check resolved calls from first-party files
+        for call in calls {
+            if !first_party_files.contains(call.file.as_str()) {
+                continue;
+            }
+            if GENERIC_BIT_MACROS.contains(&call.callee_name.as_str()) {
+                continue;
+            }
+            if let Some(&vname) = vendor_sym_ids.get(call.callee_id.as_str()) {
+                active_vendor_symbols.insert(vname.to_string());
+            } else if vendor_sym_names.contains(call.callee_name.as_str())
+                || vendor_macro_names.contains(call.callee_name.as_str())
+            {
+                active_vendor_symbols.insert(call.callee_name.clone());
+            }
+            if vendor_mmio_names.contains(call.callee_name.as_str()) {
+                active_mmio_registers.insert(call.callee_name.clone());
+            }
         }
     }
 
@@ -2135,6 +2281,9 @@ fn compute_vendor_surface(
                 "mmio_access" | "mmio_write" | "mmio_read"
             ) {
                 active_mmio_registers.insert(rx.target_name.clone());
+            }
+            if !has_any_vendor {
+                continue;
             }
             if vendor_sym_names.contains(target)
                 || vendor_type_names.contains(target)
@@ -2157,6 +2306,10 @@ fn compute_vendor_surface(
                     active_mmio_registers.insert(combined);
                 }
             }
+        }
+
+        if !has_any_vendor {
+            continue;
         }
 
         for imp in &unit.imports {

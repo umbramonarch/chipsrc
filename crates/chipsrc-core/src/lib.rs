@@ -154,22 +154,15 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
     let (source_root, repo_name) = scanner::canonical_repo_root_and_name(&config.repo_path);
 
     let meta_path = config.output_dir.join("meta.json");
-    let index_md_path = config.output_dir.join("INDEX.md");
     let single_md_path = config.output_dir.join(format!("{repo_name}.md"));
-    let bundle_ready = !config.force
-        && meta_path.is_file()
-        && index_md_path.is_file()
-        && scanner::has_bundle_cache(&config.output_dir)
-        && scanner::bundle_artifacts_complete(&config.output_dir)
-        && (!config.single_file || single_md_path.is_file());
-
-    let existing_meta_opt = if bundle_ready {
-        scanner::load_meta_file(&config.output_dir).filter(|m| {
-            m.metadata.vendor_mode == config.vendor_mode && !m.metadata.file_stamps.is_empty()
-        })
-    } else {
-        None
-    };
+    let mut existing_meta_opt =
+        if !config.force && (!config.single_file || single_md_path.is_file()) {
+            scanner::load_meta_file(&config.output_dir).filter(|m| {
+                m.metadata.vendor_mode == config.vendor_mode && !m.metadata.file_stamps.is_empty()
+            })
+        } else {
+            None
+        };
 
     // 1. Stat-only fast-path check against `meta.file_stamps` (zero source-file reads when clean)
     let mut pre_scanned: Option<(Vec<ScannedFile>, String)> = None;
@@ -180,44 +173,48 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
             config.max_file_bytes,
         ) {
             if sc.unchanged {
-                let claudeignore_updated =
-                    emitter::ensure_claudeignore_entry(&config.repo_path, &config.output_dir)
-                        .unwrap_or(false);
-                let elapsed = start.elapsed().as_millis() as u64;
-                existing_meta.metadata.scan_ms = elapsed;
-                existing_meta.metadata.parse_ms = 0;
-                existing_meta.metadata.link_ms = 0;
-                existing_meta.metadata.graph_ms = 0;
-                existing_meta.metadata.shard_ms = 0;
-                existing_meta.metadata.emit_ms = 0;
-                existing_meta.metadata.elapsed_ms = elapsed;
-                existing_meta.metadata.incremental_reparsed_files = 0;
-                existing_meta.metadata.incremental_reused_files =
-                    existing_meta.metadata.total_files;
+                if scanner::bundle_artifacts_complete(&config.output_dir) {
+                    let claudeignore_updated =
+                        emitter::ensure_claudeignore_entry(&config.repo_path, &config.output_dir)
+                            .unwrap_or(false);
+                    let elapsed = start.elapsed().as_millis() as u64;
+                    existing_meta.metadata.scan_ms = elapsed;
+                    existing_meta.metadata.parse_ms = 0;
+                    existing_meta.metadata.link_ms = 0;
+                    existing_meta.metadata.graph_ms = 0;
+                    existing_meta.metadata.shard_ms = 0;
+                    existing_meta.metadata.emit_ms = 0;
+                    existing_meta.metadata.elapsed_ms = elapsed;
+                    existing_meta.metadata.incremental_reparsed_files = 0;
+                    existing_meta.metadata.incremental_reused_files =
+                        existing_meta.metadata.total_files;
 
-                if !sc.touched_mtimes.is_empty() {
-                    for stamp in &mut existing_meta.metadata.file_stamps {
-                        if let Some(&(new_mtime, new_nanos)) =
-                            sc.touched_mtimes.get(&stamp.rel_path)
-                        {
-                            stamp.mtime_secs = new_mtime;
-                            stamp.mtime_nanos = new_nanos;
+                    if !sc.touched_mtimes.is_empty() {
+                        for stamp in &mut existing_meta.metadata.file_stamps {
+                            if let Some(&(new_mtime, new_nanos)) =
+                                sc.touched_mtimes.get(&stamp.rel_path)
+                            {
+                                stamp.mtime_secs = new_mtime;
+                                stamp.mtime_nanos = new_nanos;
+                            }
+                        }
+                        if let Ok(json_str) = serde_json::to_string_pretty(&existing_meta) {
+                            let _ = fs::write(&meta_path, format!("{json_str}\n"));
                         }
                     }
-                    if let Ok(json_str) = serde_json::to_string_pretty(&existing_meta) {
-                        let _ = fs::write(&meta_path, format!("{json_str}\n"));
-                    }
-                }
 
-                return Ok(ConversionBundle {
-                    output_dir: config.output_dir.clone(),
-                    metadata: existing_meta.metadata,
-                    sanity: existing_meta.sanity,
-                    sections: Vec::new(),
-                    indexes: BundleIndexes::default(),
-                    cache_hit: true,
-                    claudeignore_updated,
-                });
+                    return Ok(ConversionBundle {
+                        output_dir: config.output_dir.clone(),
+                        metadata: existing_meta.metadata,
+                        sanity: existing_meta.sanity,
+                        sections: Vec::new(),
+                        indexes: BundleIndexes::default(),
+                        cache_hit: true,
+                        claudeignore_updated,
+                    });
+                } else {
+                    existing_meta_opt = None;
+                }
             }
             if let Some(files) = sc.scanned_files {
                 pre_scanned = Some((files, sc.fingerprint));
@@ -244,29 +241,34 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         if existing_meta.metadata.fingerprint == fingerprint
             && existing_meta.metadata.vendor_mode == config.vendor_mode
         {
-            let claudeignore_updated =
-                emitter::ensure_claudeignore_entry(&config.repo_path, &config.output_dir)
-                    .unwrap_or(false);
-            let elapsed = start.elapsed().as_millis() as u64;
-            existing_meta.metadata.scan_ms = scan_ms;
-            existing_meta.metadata.parse_ms = 0;
-            existing_meta.metadata.link_ms = 0;
-            existing_meta.metadata.graph_ms = 0;
-            existing_meta.metadata.shard_ms = 0;
-            existing_meta.metadata.emit_ms = 0;
-            existing_meta.metadata.elapsed_ms = elapsed;
-            existing_meta.metadata.incremental_reparsed_files = 0;
-            existing_meta.metadata.incremental_reused_files = existing_meta.metadata.total_files;
+            if scanner::bundle_artifacts_complete(&config.output_dir) {
+                let claudeignore_updated =
+                    emitter::ensure_claudeignore_entry(&config.repo_path, &config.output_dir)
+                        .unwrap_or(false);
+                let elapsed = start.elapsed().as_millis() as u64;
+                existing_meta.metadata.scan_ms = scan_ms;
+                existing_meta.metadata.parse_ms = 0;
+                existing_meta.metadata.link_ms = 0;
+                existing_meta.metadata.graph_ms = 0;
+                existing_meta.metadata.shard_ms = 0;
+                existing_meta.metadata.emit_ms = 0;
+                existing_meta.metadata.elapsed_ms = elapsed;
+                existing_meta.metadata.incremental_reparsed_files = 0;
+                existing_meta.metadata.incremental_reused_files =
+                    existing_meta.metadata.total_files;
 
-            return Ok(ConversionBundle {
-                output_dir: config.output_dir.clone(),
-                metadata: existing_meta.metadata,
-                sanity: existing_meta.sanity,
-                sections: Vec::new(),
-                indexes: BundleIndexes::default(),
-                cache_hit: true,
-                claudeignore_updated,
-            });
+                return Ok(ConversionBundle {
+                    output_dir: config.output_dir.clone(),
+                    metadata: existing_meta.metadata,
+                    sanity: existing_meta.sanity,
+                    sections: Vec::new(),
+                    indexes: BundleIndexes::default(),
+                    cache_hit: true,
+                    claudeignore_updated,
+                });
+            } else {
+                existing_meta_opt = None;
+            }
         }
     }
 
@@ -346,7 +348,9 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                         .get(u.scanned.rel_path.as_str())
                         .is_some_and(|s| s.line_count == u.scanned.line_count)
                 });
-            let can_short_circuit = digest_and_coords_unchanged && line_counts_unchanged;
+            let can_short_circuit = digest_and_coords_unchanged
+                && line_counts_unchanged
+                && scanner::bundle_artifacts_complete(&config.output_dir);
 
             if can_short_circuit {
                 let parse_ms = t_parse.elapsed().as_millis() as u64;
@@ -513,7 +517,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
     // Synchronize numbered section_ids and post-compaction retention onto god_nodes,
     // entrypoints, and vendor_surface (Bug 9)
     {
-        let sym_map: BTreeMap<&str, &RankedSymbol> = ranked_symbols
+        let sym_map: rustc_hash::FxHashMap<&str, &RankedSymbol> = ranked_symbols
             .iter()
             .map(|rs| (rs.symbol.symbol_id.as_str(), rs))
             .collect();
@@ -534,47 +538,51 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
             }
         });
 
-        let retained_vendor_files: BTreeSet<&str> = ranked_symbols
-            .iter()
-            .filter(|s| s.symbol.scope == FileScope::VendorSdk)
-            .map(|s| s.symbol.file.as_str())
-            .chain(
-                types
-                    .iter()
-                    .filter(|t| t.scope == FileScope::VendorSdk)
-                    .map(|t| t.file.as_str()),
-            )
-            .chain(
-                macros
-                    .iter()
-                    .filter(|m| m.scope == FileScope::VendorSdk)
-                    .map(|m| m.file.as_str()),
-            )
-            .collect();
-        vendor_surface
-            .active_vendor_headers
-            .retain(|f| retained_vendor_files.contains(f.as_str()));
+        if !vendor_surface.active_vendor_headers.is_empty()
+            || !vendor_surface.active_vendor_symbols.is_empty()
+        {
+            let retained_vendor_files: BTreeSet<&str> = ranked_symbols
+                .iter()
+                .filter(|s| s.symbol.scope == FileScope::VendorSdk)
+                .map(|s| s.symbol.file.as_str())
+                .chain(
+                    types
+                        .iter()
+                        .filter(|t| t.scope == FileScope::VendorSdk)
+                        .map(|t| t.file.as_str()),
+                )
+                .chain(
+                    macros
+                        .iter()
+                        .filter(|m| m.scope == FileScope::VendorSdk)
+                        .map(|m| m.file.as_str()),
+                )
+                .collect();
+            vendor_surface
+                .active_vendor_headers
+                .retain(|f| retained_vendor_files.contains(f.as_str()));
 
-        let retained_vendor_names: BTreeSet<&str> = ranked_symbols
-            .iter()
-            .filter(|s| s.symbol.scope == FileScope::VendorSdk)
-            .map(|s| s.symbol.name.as_str())
-            .chain(
-                types
-                    .iter()
-                    .filter(|t| t.scope == FileScope::VendorSdk)
-                    .map(|t| t.name.as_str()),
-            )
-            .chain(
-                macros
-                    .iter()
-                    .filter(|m| m.scope == FileScope::VendorSdk)
-                    .map(|m| m.name.as_str()),
-            )
-            .collect();
-        vendor_surface
-            .active_vendor_symbols
-            .retain(|n| retained_vendor_names.contains(n.as_str()));
+            let retained_vendor_names: BTreeSet<&str> = ranked_symbols
+                .iter()
+                .filter(|s| s.symbol.scope == FileScope::VendorSdk)
+                .map(|s| s.symbol.name.as_str())
+                .chain(
+                    types
+                        .iter()
+                        .filter(|t| t.scope == FileScope::VendorSdk)
+                        .map(|t| t.name.as_str()),
+                )
+                .chain(
+                    macros
+                        .iter()
+                        .filter(|m| m.scope == FileScope::VendorSdk)
+                        .map(|m| m.name.as_str()),
+                )
+                .collect();
+            vendor_surface
+                .active_vendor_symbols
+                .retain(|n| retained_vendor_names.contains(n.as_str()));
+        }
     }
 
     let indexes = BundleIndexes {
@@ -673,14 +681,14 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
     metadata.emit_ms = t_emit.elapsed().as_millis() as u64;
     metadata.elapsed_ms = start.elapsed().as_millis() as u64;
 
-    // Persist final emit_ms and elapsed_ms in meta.json
+    // Persist final emit_ms and elapsed_ms in meta.json (single write per convert)
     let meta_file = BundleMetaFile {
         metadata: metadata.clone(),
         sanity: sanity.clone(),
     };
-    if let Ok(meta_json) = serde_json::to_string_pretty(&meta_file) {
-        let _ = fs::write(&meta_path, format!("{meta_json}\n"));
-    }
+    let meta_json = serde_json::to_string_pretty(&meta_file)?;
+    fs::write(&meta_path, format!("{meta_json}\n"))
+        .map_err(|source| ChipsrcError::io(&meta_path, source))?;
 
     Ok(ConversionBundle {
         output_dir: config.output_dir.clone(),

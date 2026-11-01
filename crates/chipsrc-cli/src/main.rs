@@ -470,10 +470,8 @@ fn main() -> Result<()> {
             cfg.vendor_mode = vmode;
 
             let had_existing_bundle = !cfg.force
-                && chipsrc_core::scanner::has_bundle_cache(&cfg.output_dir)
-                && chipsrc_core::scanner::load_meta_file(&cfg.output_dir).is_some_and(|m| {
-                    m.metadata.vendor_mode == cfg.vendor_mode && !m.metadata.file_stamps.is_empty()
-                });
+                && cfg.output_dir.join("meta.json").is_file()
+                && cfg.output_dir.join("cache/manifest.json").is_file();
 
             let bundle = convert_repo(&cfg)
                 .with_context(|| format!("Failed to index repository '{}'", repo.display()))?;
@@ -497,10 +495,8 @@ fn main() -> Result<()> {
             for repo in targets {
                 let out_dir = output_root.join(derive_repo_stem(&repo));
                 let had_existing_bundle = !force
-                    && chipsrc_core::scanner::has_bundle_cache(&out_dir)
-                    && chipsrc_core::scanner::load_meta_file(&out_dir).is_some_and(|m| {
-                        m.metadata.vendor_mode == vmode && !m.metadata.file_stamps.is_empty()
-                    });
+                    && out_dir.join("meta.json").is_file()
+                    && out_dir.join("cache/manifest.json").is_file();
                 let bundle = ensure_repo(&repo, &output_root, force, vmode)
                     .with_context(|| format!("Failed to ensure repository '{}'", repo.display()))?;
                 let tag = if bundle.cache_hit {

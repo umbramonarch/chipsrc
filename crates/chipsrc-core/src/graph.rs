@@ -399,14 +399,20 @@ fn compute_hits(
     let mut next_hub = vec![0.0_f64; n];
     let mut next_auth = vec![0.0_f64; n];
 
+    let caller_damps: Vec<f64> = (0..n)
+        .map(|u| {
+            let u_out = adj[u].len().max(1) as f64;
+            if rev_adj[u].is_empty() || symbols[u].arch_layer == ArchLayer::Cli {
+                0.35 / u_out.sqrt()
+            } else {
+                1.0 / u_out.sqrt()
+            }
+        })
+        .collect();
+
     let edge_weight = |u: usize, v: usize| -> f64 {
         let cross_file = symbols[u].file != symbols[v].file;
-        let u_out = adj[u].len().max(1) as f64;
-        let caller_damp = if rev_adj[u].is_empty() || symbols[u].arch_layer == ArchLayer::Cli {
-            0.35 / u_out.sqrt()
-        } else {
-            1.0 / u_out.sqrt()
-        };
+        let caller_damp = caller_damps[u];
         let v_out = adj[v].len();
         if v_out == 0 {
             let v_in = rev_adj[v].len().max(1) as f64;

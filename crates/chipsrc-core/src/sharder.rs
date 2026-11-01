@@ -3,6 +3,7 @@ use crate::model::{
     ResolvedCallEdge, SectionShard, SectionSummary, SymbolKind, VendorMode, VendorSurfaceSummary,
     XrefEntry,
 };
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -210,11 +211,13 @@ pub fn build_section_shards(
         .flat_map(|g| g.units.iter().map(|u| u.scanned.rel_path.as_str()))
         .collect();
 
-    ranked_symbols.retain(|rs| surviving_files.contains(rs.symbol.file.as_str()));
-    types.retain(|t| surviving_files.contains(t.file.as_str()));
-    macros.retain(|m| surviving_files.contains(m.file.as_str()));
-    calls.retain(|c| surviving_files.contains(c.file.as_str()));
-    xrefs.retain(|x| surviving_files.contains(x.file.as_str()));
+    if surviving_files.len() < units.len() {
+        ranked_symbols.retain(|rs| surviving_files.contains(rs.symbol.file.as_str()));
+        types.retain(|t| surviving_files.contains(t.file.as_str()));
+        macros.retain(|m| surviving_files.contains(m.file.as_str()));
+        calls.retain(|c| surviving_files.contains(c.file.as_str()));
+        xrefs.retain(|x| surviving_files.contains(x.file.as_str()));
+    }
 
     // 3. Assign numbered section IDs (01-<slug>, 02-<slug>, ...) and build file/slug -> numbered maps
     let mut slug_to_numbered: FxHashMap<String, String> = FxHashMap::default();
@@ -290,11 +293,33 @@ pub fn build_section_shards(
             }
         }
     }
-    for c in calls.iter_mut() {
-        c.section_id = resolve_numbered(&c.section_id, &c.file);
+    {
+        let mut last_file = "";
+        let mut last_sec = String::new();
+        for c in calls.iter_mut() {
+            if !last_file.is_empty() && c.file == last_file {
+                c.section_id = last_sec.clone();
+            } else {
+                let sec = resolve_numbered(&c.section_id, &c.file);
+                last_file = c.file.as_str();
+                last_sec.clone_from(&sec);
+                c.section_id = sec;
+            }
+        }
     }
-    for x in xrefs.iter_mut() {
-        x.section_id = resolve_numbered(&x.section_id, &x.file);
+    {
+        let mut last_file = "";
+        let mut last_sec = String::new();
+        for x in xrefs.iter_mut() {
+            if !last_file.is_empty() && x.file == last_file {
+                x.section_id = last_sec.clone();
+            } else {
+                let sec = resolve_numbered(&x.section_id, &x.file);
+                last_file = x.file.as_str();
+                last_sec.clone_from(&sec);
+                x.section_id = sec;
+            }
+        }
     }
 
     // 4. Compute inter-section dependencies from resolved cross-section calls
@@ -358,12 +383,26 @@ pub fn build_section_shards(
             .push(m);
     }
 
-    // 5. Render each shard's markdown_body and assemble SectionSummary + SectionShard
-    let mut summaries = Vec::with_capacity(groups.len());
-    let mut shards = Vec::with_capacity(groups.len());
+    // 5. Prepare each shard's sorted symbols/types/macros, then render markdown_body in parallel
+    let mut any_vendor_compacted = false;
     let mut kept_symbol_keys: FxHashSet<(String, usize, String)> = FxHashSet::default();
     let mut kept_type_keys: FxHashSet<(String, usize, String)> = FxHashSet::default();
     let mut kept_macro_keys: FxHashSet<(String, usize, String)> = FxHashSet::default();
+
+    struct PreparedShard<'a> {
+        section_id: String,
+        md_file: String,
+        group: RawShardGroup<'a>,
+        files: Vec<String>,
+        shard_symbols: Vec<&'a RankedSymbol>,
+        shard_types: Vec<&'a ExtractedType>,
+        shard_macros: Vec<&'a ExtractedMacro>,
+        depends_on_sections: Vec<String>,
+        depended_by_sections: Vec<String>,
+        compact_vendor: bool,
+    }
+
+    let mut prepared_shards: Vec<PreparedShard<'_>> = Vec::with_capacity(groups.len());
 
     for (idx, mut group) in groups.into_iter().enumerate() {
         let clean_slug = strip_numeric_prefix(&group.raw_slug);
@@ -431,6 +470,7 @@ pub fn build_section_shards(
         // first-party code actually references; when nothing in a category is active, the
         // retained-files list is kept and the renderer caps it instead.
         if compact_vendor {
+            any_vendor_compacted = true;
             let retained_files: FxHashSet<&str> = files.iter().map(|s| s.as_str()).collect();
             shard_symbols.retain(|rs| retained_files.contains(rs.symbol.file.as_str()));
             shard_types.retain(|t| retained_files.contains(t.file.as_str()));
@@ -445,20 +485,20 @@ pub fn build_section_shards(
             shard_macros = filter_active_vendor_items(shard_macros, |m: &ExtractedMacro| {
                 active_vendor_set.contains(m.name.as_str())
             });
-        }
 
-        for rs in &shard_symbols {
-            kept_symbol_keys.insert((
-                rs.symbol.file.clone(),
-                rs.symbol.start_line,
-                rs.symbol.symbol_id.clone(),
-            ));
-        }
-        for t in &shard_types {
-            kept_type_keys.insert((t.file.clone(), t.start_line, t.type_id.clone()));
-        }
-        for m in &shard_macros {
-            kept_macro_keys.insert((m.file.clone(), m.line, m.name.clone()));
+            for rs in &shard_symbols {
+                kept_symbol_keys.insert((
+                    rs.symbol.file.clone(),
+                    rs.symbol.start_line,
+                    rs.symbol.symbol_id.clone(),
+                ));
+            }
+            for t in &shard_types {
+                kept_type_keys.insert((t.file.clone(), t.start_line, t.type_id.clone()));
+            }
+            for m in &shard_macros {
+                kept_macro_keys.insert((m.file.clone(), m.line, m.name.clone()));
+            }
         }
 
         let depends_on_sections: Vec<String> = depends_on_map
@@ -470,67 +510,93 @@ pub fn build_section_shards(
             .map(|s| s.into_iter().collect())
             .unwrap_or_default();
 
-        let markdown_body = render_shard_markdown(
-            &repo_name,
-            &section_id,
-            &group,
-            &shard_symbols,
-            &shard_types,
-            &shard_macros,
-            &depends_on_sections,
-            &depended_by_sections,
-            &callees_by_caller,
-            &active_vendor_set,
-            compact_vendor,
-        );
-
-        let token_estimate = markdown_body.len().div_ceil(4);
-
-        let summary = SectionSummary {
-            section_id: section_id.clone(),
-            title: group.title.clone(),
-            module_path: group.module_path.clone(),
-            arch_layer: group.arch_layer.as_str().to_string(),
-            scope: group.scope.as_str().to_string(),
-            file_count: files.len(),
-            symbol_count: shard_symbols.len(),
-            type_count: shard_types.len(),
-            macro_count: shard_macros.len(),
-            token_estimate,
+        prepared_shards.push(PreparedShard {
+            section_id,
             md_file,
-        };
-
-        summaries.push(summary.clone());
-        shards.push(SectionShard {
-            summary,
+            group,
             files,
+            shard_symbols,
+            shard_types,
+            shard_macros,
             depends_on_sections,
             depended_by_sections,
-            markdown_body,
+            compact_vendor,
         });
+    }
+
+    let rendered: Vec<(SectionSummary, SectionShard)> = prepared_shards
+        .into_par_iter()
+        .map(|ps| {
+            let markdown_body = render_shard_markdown(
+                &repo_name,
+                &ps.section_id,
+                &ps.group,
+                &ps.shard_symbols,
+                &ps.shard_types,
+                &ps.shard_macros,
+                &ps.depends_on_sections,
+                &ps.depended_by_sections,
+                &callees_by_caller,
+                &active_vendor_set,
+                ps.compact_vendor,
+            );
+
+            let token_estimate = markdown_body.len().div_ceil(4);
+
+            let summary = SectionSummary {
+                section_id: ps.section_id,
+                title: ps.group.title,
+                module_path: ps.group.module_path,
+                arch_layer: ps.group.arch_layer.as_str().to_string(),
+                scope: ps.group.scope.as_str().to_string(),
+                file_count: ps.files.len(),
+                symbol_count: ps.shard_symbols.len(),
+                type_count: ps.shard_types.len(),
+                macro_count: ps.shard_macros.len(),
+                token_estimate,
+                md_file: ps.md_file,
+            };
+
+            let shard = SectionShard {
+                summary: summary.clone(),
+                files: ps.files,
+                depends_on_sections: ps.depends_on_sections,
+                depended_by_sections: ps.depended_by_sections,
+                markdown_body,
+            };
+            (summary, shard)
+        })
+        .collect();
+
+    let mut summaries = Vec::with_capacity(rendered.len());
+    let mut shards = Vec::with_capacity(rendered.len());
+    for (summary, shard) in rendered {
+        summaries.push(summary);
+        shards.push(shard);
     }
 
     // Synchronize index tables with the exact per-shard retained sets so
     // `Σ section_summaries.{symbol,type,macro}_count == index/*.tsv` always holds.
-    if compact_vendor_occurred(vendor_mode, has_non_vendor) {
+    if any_vendor_compacted {
         ranked_symbols.retain(|rs| {
-            kept_symbol_keys.contains(&(
-                rs.symbol.file.clone(),
-                rs.symbol.start_line,
-                rs.symbol.symbol_id.clone(),
-            ))
+            rs.symbol.scope != FileScope::VendorSdk
+                || kept_symbol_keys.contains(&(
+                    rs.symbol.file.clone(),
+                    rs.symbol.start_line,
+                    rs.symbol.symbol_id.clone(),
+                ))
         });
         types.retain(|t| {
-            kept_type_keys.contains(&(t.file.clone(), t.start_line, t.type_id.clone()))
+            t.scope != FileScope::VendorSdk
+                || kept_type_keys.contains(&(t.file.clone(), t.start_line, t.type_id.clone()))
         });
-        macros.retain(|m| kept_macro_keys.contains(&(m.file.clone(), m.line, m.name.clone())));
+        macros.retain(|m| {
+            m.scope != FileScope::VendorSdk
+                || kept_macro_keys.contains(&(m.file.clone(), m.line, m.name.clone()))
+        });
     }
 
     (summaries, shards)
-}
-
-fn compact_vendor_occurred(vendor_mode: VendorMode, has_non_vendor: bool) -> bool {
-    vendor_mode == VendorMode::Active && has_non_vendor
 }
 
 #[allow(clippy::too_many_arguments)]
