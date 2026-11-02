@@ -1367,3 +1367,435 @@ def duplicate_probe(value: int) -> int:
     );
     assert_eq!(comment_inc_hashes, collect_bundle_artifact_hashes(&dup_out));
 }
+
+// ============================================================================
+// Coordinate-shift incremental tier (Tier 3) end-to-end invariants
+// ============================================================================
+
+fn bump_file_mtime(path: &Path) {
+    let modified =
+        fs::metadata(path).unwrap().modified().unwrap() + std::time::Duration::from_secs(2);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+}
+
+/// SHA-256 of `index/*`, `sections/*`, and `INDEX.md` keyed by bundle-relative path.
+fn artifact_sha_map(bundle_dir: &Path) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for sub in ["index", "sections"] {
+        let dir = bundle_dir.join(sub);
+        for entry in fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let rel = format!(
+                "{sub}/{}",
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+            );
+            map.insert(
+                rel,
+                blake3::hash(&fs::read(&path).unwrap()).to_hex().to_string(),
+            );
+        }
+    }
+    let index_md = bundle_dir.join("INDEX.md");
+    map.insert(
+        "INDEX.md".to_string(),
+        blake3::hash(&fs::read(&index_md).unwrap())
+            .to_hex()
+            .to_string(),
+    );
+    map
+}
+
+fn symbol_coords(bundle: &ConversionBundle, name: &str) -> (usize, usize) {
+    let row = bundle
+        .indexes
+        .symbols
+        .iter()
+        .find(|rs| rs.symbol.name == name)
+        .unwrap_or_else(|| panic!("symbol {name} missing from bundle"));
+    (row.symbol.start_line, row.symbol.end_line)
+}
+
+#[test]
+fn test_coordinate_shift_tier_skips_link_and_graph_and_matches_force() {
+    let tmp = TestTempDir::new("coord_shift");
+    let repo = tmp.path().join("repo");
+    let out = tmp.path().join("bundle");
+    fs::create_dir_all(repo.join("domain")).unwrap();
+
+    let ident = repo.join("domain/identifiers.py");
+    fs::write(
+        &ident,
+        "def normalize_pm(value: str) -> str:\n    return value.strip().lower()\n\n\ndef pm_match_key(value: str) -> str:\n    return normalize_pm(value).casefold()\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("domain/helpers.py"),
+        "def compute_checksum(data: str) -> int:\n    return len(data)\n",
+    )
+    .unwrap();
+
+    let cfg = ConvertConfig::new(repo.clone(), out.clone());
+    let cold = convert_repo(&cfg).unwrap();
+    assert_eq!(cold.metadata.incremental_tier, "structural");
+    assert!(
+        out.join("cache/graph_state.json").is_file(),
+        "structural conversion must persist cache/graph_state.json"
+    );
+    let (s0, e0) = symbol_coords(&cold, "pm_match_key");
+
+    // Prepend 5 comment lines (coordinate-only shift).
+    let body = fs::read_to_string(&ident).unwrap();
+    let mut shifted = String::new();
+    for i in 1..=5 {
+        shifted.push_str(&format!("# perf shift pad {i}\n"));
+    }
+    shifted.push_str(&body);
+    fs::write(&ident, shifted).unwrap();
+    bump_file_mtime(&ident);
+
+    let inc = convert_repo(&cfg).unwrap();
+    assert!(!inc.cache_hit, "coordinate shift must not report CACHE HIT");
+    assert_eq!(
+        inc.metadata.incremental_tier, "coordinate_shift",
+        "digest-stable coordinate shift must select Tier 3"
+    );
+    assert_eq!(inc.metadata.link_ms, 0, "resolve_and_link must be skipped");
+    assert_eq!(inc.metadata.graph_ms, 0, "analyze_graph must be skipped");
+    assert_eq!(inc.metadata.incremental_reparsed_files, 1);
+    assert_eq!(inc.metadata.incremental_reused_files, 1);
+    assert_eq!(symbol_coords(&inc, "pm_match_key"), (s0 + 5, e0 + 5));
+
+    let shifted_coord = format!("identifiers.py:{}-{}", s0 + 5, e0 + 5);
+    let mut section_text = String::new();
+    for entry in fs::read_dir(out.join("sections")).unwrap().flatten() {
+        if entry.path().extension().and_then(|e| e.to_str()) == Some("md") {
+            section_text.push_str(&fs::read_to_string(entry.path()).unwrap());
+        }
+    }
+    assert!(
+        section_text.contains(&shifted_coord),
+        "sections must render the shifted coordinate {shifted_coord}"
+    );
+
+    let incremental_hashes = artifact_sha_map(&out);
+    let mut force_cfg = cfg.clone();
+    force_cfg.force = true;
+    let forced = convert_repo(&force_cfg).unwrap();
+    assert_eq!(forced.metadata.incremental_tier, "structural");
+    assert_eq!(symbol_coords(&forced, "pm_match_key"), (s0 + 5, e0 + 5));
+    assert_eq!(
+        incremental_hashes,
+        artifact_sha_map(&out),
+        "Tier 3 index/, sections/, and INDEX.md must be byte-identical to --force"
+    );
+    assert!(
+        out.join("cache/graph_state.json").is_file(),
+        "Tier 3 must rewrite graph state for the next shift"
+    );
+
+    // A docstring-only edit keeps the digest but changes rendered documentation; it also belongs
+    // to the coordinate-shift tier and must propagate.
+    let current = fs::read_to_string(&ident).unwrap();
+    fs::write(
+        &ident,
+        current.replace(
+            "def pm_match_key(value: str) -> str:",
+            "def pm_match_key(value: str) -> str:\n    \"\"\"QA revised match key.\"\"\"",
+        ),
+    )
+    .unwrap();
+    bump_file_mtime(&ident);
+
+    let doc_inc = convert_repo(&cfg).unwrap();
+    assert_eq!(doc_inc.metadata.incremental_tier, "coordinate_shift");
+    assert_eq!(doc_inc.metadata.link_ms, 0);
+    assert_eq!(doc_inc.metadata.graph_ms, 0);
+    let doc_hashes = artifact_sha_map(&out);
+    let doc_forced = convert_repo(&force_cfg).unwrap();
+    assert_eq!(
+        doc_hashes,
+        artifact_sha_map(&out),
+        "docstring shift must match --force"
+    );
+    assert_eq!(symbol_coords(&doc_forced, "pm_match_key"), (s0 + 5, e0 + 6));
+}
+
+#[test]
+fn test_coordinate_shift_threshold_crossing_falls_back_to_full_path() {
+    let tmp = TestTempDir::new("coord_threshold");
+    let repo = tmp.path().join("repo");
+    let out = tmp.path().join("bundle");
+    fs::create_dir_all(repo.join("threshold")).unwrap();
+
+    let mut content = String::new();
+    for i in 0..1394 {
+        content.push_str(&format!("# pad line {i}\n"));
+    }
+    content.push_str(
+        "def qa_threshold_target(x: int) -> int:\n    \"\"\"Doc.\"\"\"\n    return x + 1\n\n",
+    );
+    let file = repo.join("threshold/threshold.py");
+    fs::write(&file, &content).unwrap();
+    assert_eq!(count_source_lines(content.as_bytes()), 1398);
+
+    let cfg = ConvertConfig::new(repo.clone(), out.clone());
+    let cold = convert_repo(&cfg).unwrap();
+    let (s0, e0) = symbol_coords(&cold, "qa_threshold_target");
+
+    let mut grown = String::new();
+    for i in 0..100 {
+        grown.push_str(&format!("# grow {i}\n"));
+    }
+    grown.push_str(&content);
+    fs::write(&file, &grown).unwrap();
+    bump_file_mtime(&file);
+    assert_eq!(count_source_lines(grown.as_bytes()), 1498);
+
+    let inc = convert_repo(&cfg).unwrap();
+    assert_eq!(
+        inc.metadata.incremental_tier, "structural",
+        "a dirty file crossing 1,400 lines must take the full structural path"
+    );
+    assert_eq!(
+        symbol_coords(&inc, "qa_threshold_target"),
+        (s0 + 100, e0 + 100)
+    );
+    let incremental_hashes = artifact_sha_map(&out);
+
+    let mut force_cfg = cfg.clone();
+    force_cfg.force = true;
+    let forced = convert_repo(&force_cfg).unwrap();
+    assert_eq!(
+        symbol_coords(&forced, "qa_threshold_target"),
+        (s0 + 100, e0 + 100)
+    );
+    assert_eq!(
+        incremental_hashes,
+        artifact_sha_map(&out),
+        "threshold fallback must still be byte-identical to --force"
+    );
+}
+
+#[test]
+fn test_truncated_graph_state_falls_back_and_next_shift_self_heals() {
+    let tmp = TestTempDir::new("coord_truncated_graph");
+    let repo = tmp.path().join("repo");
+    let out = tmp.path().join("bundle");
+    fs::create_dir_all(repo.join("domain")).unwrap();
+    let file = repo.join("domain/identifiers.py");
+    let original = "def normalize_pm(value: str) -> str:\n    return value.strip().lower()\n\n\ndef pm_match_key(value: str) -> str:\n    return normalize_pm(value).casefold()\n";
+    fs::write(&file, original).unwrap();
+
+    let cfg = ConvertConfig::new(repo.clone(), out.clone());
+    let cold = convert_repo(&cfg).unwrap();
+    let (s0, e0) = symbol_coords(&cold, "pm_match_key");
+
+    // Truncate the persisted graph state (tolerated: disables the fast path only).
+    let graph_state = out.join("cache/graph_state.json");
+    fs::write(&graph_state, br#"{"schema_version":"2.1.0","symbols":["#).unwrap();
+    fs::write(&file, format!("# one more\n{original}")).unwrap();
+    bump_file_mtime(&file);
+
+    let inc = convert_repo(&cfg).unwrap();
+    assert_eq!(inc.metadata.incremental_tier, "structural");
+    assert_eq!(symbol_coords(&inc, "pm_match_key"), (s0 + 1, e0 + 1));
+    let incremental_hashes = artifact_sha_map(&out);
+    assert!(
+        chipsrc_core::emitter::load_graph_state(&out).is_some(),
+        "full rebuild must restore a parseable graph_state.json"
+    );
+    let mut force_cfg = cfg.clone();
+    force_cfg.force = true;
+    let _ = convert_repo(&force_cfg).unwrap();
+    assert_eq!(incremental_hashes, artifact_sha_map(&out));
+
+    // The restored state must enable Tier 3 again.
+    let body = fs::read_to_string(&file).unwrap();
+    fs::write(&file, format!("# two more\n{body}")).unwrap();
+    bump_file_mtime(&file);
+    let healed = convert_repo(&cfg).unwrap();
+    assert_eq!(healed.metadata.incremental_tier, "coordinate_shift");
+    assert_eq!(healed.metadata.link_ms, 0);
+    assert_eq!(symbol_coords(&healed, "pm_match_key"), (s0 + 2, e0 + 2));
+}
+
+#[test]
+fn test_truncated_meta_json_rebuilds_without_panic() {
+    let tmp = TestTempDir::new("coord_truncated_meta");
+    let repo = tmp.path().join("repo");
+    let out = tmp.path().join("bundle");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(
+        repo.join("src/app.py"),
+        "def app_main() -> int:\n    return 0\n",
+    )
+    .unwrap();
+
+    let cfg = ConvertConfig::new(repo.clone(), out.clone());
+    let cold = convert_repo(&cfg).unwrap();
+    assert_eq!(cold.metadata.symbol_count, 1);
+    let good_hashes = artifact_sha_map(&out);
+
+    let meta_path = out.join("meta.json");
+    let meta_bytes = fs::read(&meta_path).unwrap();
+    fs::write(&meta_path, &meta_bytes[..128.min(meta_bytes.len())]).unwrap();
+    assert!(chipsrc_core::scanner::load_meta_file(&out).is_none());
+    assert!(!chipsrc_core::scanner::bundle_artifacts_complete(&out));
+
+    let rebuilt = convert_repo(&cfg).unwrap();
+    assert_eq!(rebuilt.metadata.incremental_tier, "structural");
+    assert!(chipsrc_core::scanner::load_meta_file(&out).is_some());
+    assert!(chipsrc_core::scanner::bundle_artifacts_complete(&out));
+    let mut force_cfg = cfg.clone();
+    force_cfg.force = true;
+    let _ = convert_repo(&force_cfg).unwrap();
+    assert_eq!(good_hashes, artifact_sha_map(&out));
+}
+
+#[test]
+fn test_invalid_utf8_and_unicode_sources_never_panic() {
+    let tmp = TestTempDir::new("coord_unicode");
+    let repo = tmp.path().join("repo");
+    let out = tmp.path().join("bundle");
+    fs::create_dir_all(repo.join("domain")).unwrap();
+
+    fs::write(
+        repo.join("domain/qa_invalid_utf8.py"),
+        b"# raw invalid bytes below\ndef qa_invalid_bytes():\n    value = b'\xff\xfe'\n    return value\n",
+    )
+    .unwrap();
+    let unicode_file = repo.join("domain/qa_unic_snow.py");
+    let unicode_source = "# \u{2603} \u{4e2d}\u{6587} w\u{f6}rld\ndef qa_unicode_snow(value: str) -> str:\n    \"\"\"Snowman \u{2603} helper.\"\"\"\n    return value\n";
+    fs::write(&unicode_file, unicode_source).unwrap();
+
+    let cfg = ConvertConfig::new(repo.clone(), out.clone());
+    let cold = convert_repo(&cfg).unwrap();
+    assert!(cold
+        .indexes
+        .symbols
+        .iter()
+        .any(|rs| rs.symbol.name == "qa_unicode_snow"));
+
+    // A comment shift on the unicode file exercises Tier 3 with non-ASCII source.
+    fs::write(&unicode_file, format!("# pad \u{2603}\n{unicode_source}")).unwrap();
+    bump_file_mtime(&unicode_file);
+    let shifted = convert_repo(&cfg).unwrap();
+    assert_eq!(shifted.metadata.link_ms, 0);
+    assert!(shifted
+        .indexes
+        .symbols
+        .iter()
+        .any(|rs| rs.symbol.name == "qa_unicode_snow" && rs.symbol.start_line == 3));
+
+    // Unicode search (regex, literal, and the reserved `concept` kind) must never panic and must
+    // be deterministic across repeated calls.
+    let first = chipsrc_core::query::parallel_bundle_search(
+        std::slice::from_ref(&out),
+        "\u{2603} \u{4e2d}\u{6587} w\u{f6}rld",
+        "all",
+        false,
+        50,
+    )
+    .unwrap();
+    let second = chipsrc_core::query::parallel_bundle_search(
+        std::slice::from_ref(&out),
+        "\u{2603} \u{4e2d}\u{6587} w\u{f6}rld",
+        "all",
+        false,
+        50,
+    )
+    .unwrap();
+    assert_eq!(first, second);
+    let concept = chipsrc_core::query::parallel_bundle_search(
+        std::slice::from_ref(&out),
+        "\u{2603} \u{4e2d}\u{6587} w\u{f6}rld",
+        "concept",
+        false,
+        50,
+    )
+    .unwrap();
+    assert!(
+        concept.is_empty(),
+        "unknown search kinds must stay empty, not panic"
+    );
+
+    let syms = query_symbols(
+        std::slice::from_ref(&out),
+        "qa_unicode_snow",
+        None,
+        false,
+        10,
+    )
+    .unwrap();
+    assert!(syms.contains("qa_unicode_snow"));
+}
+
+#[test]
+fn test_coordinate_shift_with_vendor_surface_compaction_matches_force() {
+    let tmp = TestTempDir::new("coord_vendor");
+    let repo = tmp.path().join("repo");
+    let out = tmp.path().join("bundle");
+    fs::create_dir_all(repo.join("src/app")).unwrap();
+    fs::create_dir_all(repo.join("vendor/sdk")).unwrap();
+    fs::write(
+        repo.join("vendor/sdk/lib.py"),
+        "def vendor_init() -> int:\n    return 1\n\n\ndef unused_vendor_entry() -> int:\n    return 2\n",
+    )
+    .unwrap();
+    let app = repo.join("src/app/app.py");
+    fs::write(
+        &app,
+        "from vendor.sdk.lib import vendor_init\n\n\ndef app_main() -> int:\n    return vendor_init()\n",
+    )
+    .unwrap();
+
+    let cfg = ConvertConfig::new(repo.clone(), out.clone());
+    let cold = convert_repo(&cfg).unwrap();
+    assert_eq!(cold.metadata.vendor_files, 1);
+    assert!(
+        cold.indexes
+            .symbols
+            .iter()
+            .any(|rs| rs.symbol.name == "vendor_init"),
+        "referenced vendor symbol must survive active-surface compaction"
+    );
+    assert!(
+        !cold
+            .indexes
+            .symbols
+            .iter()
+            .any(|rs| rs.symbol.name == "unused_vendor_entry"),
+        "unreferenced vendor symbol must be compacted away"
+    );
+    let (s0, e0) = symbol_coords(&cold, "app_main");
+
+    fs::write(
+        &app,
+        "# vendor probe pad 1\n# vendor probe pad 2\n# vendor probe pad 3\nfrom vendor.sdk.lib import vendor_init\n\n\ndef app_main() -> int:\n    return vendor_init()\n",
+    )
+    .unwrap();
+    bump_file_mtime(&app);
+
+    let inc = convert_repo(&cfg).unwrap();
+    assert_eq!(inc.metadata.incremental_tier, "coordinate_shift");
+    assert_eq!(inc.metadata.link_ms, 0);
+    assert_eq!(inc.metadata.graph_ms, 0);
+    assert_eq!(symbol_coords(&inc, "app_main"), (s0 + 3, e0 + 3));
+    assert_eq!(inc.metadata.symbol_count, cold.metadata.symbol_count);
+    let incremental_hashes = artifact_sha_map(&out);
+
+    let mut force_cfg = cfg.clone();
+    force_cfg.force = true;
+    let _ = convert_repo(&force_cfg).unwrap();
+    assert_eq!(incremental_hashes, artifact_sha_map(&out));
+}

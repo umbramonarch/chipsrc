@@ -76,6 +76,16 @@ impl FileScope {
             Self::Test => "test",
         }
     }
+
+    /// Inverse of [`FileScope::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "first_party" => Some(Self::FirstParty),
+            "vendor_sdk" => Some(Self::VendorSdk),
+            "test" => Some(Self::Test),
+            _ => None,
+        }
+    }
 }
 
 /// Canonical architectural layer detected from repository path structure.
@@ -141,6 +151,26 @@ impl ArchLayer {
             Self::Tests | Self::Other => 3,
         }
     }
+
+    /// Inverse of [`ArchLayer::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "app" => Some(Self::App),
+            "bsp" => Some(Self::Bsp),
+            "drvs" => Some(Self::Drivers),
+            "config" => Some(Self::Config),
+            "libs" => Some(Self::Libs),
+            "domain" => Some(Self::Domain),
+            "services" => Some(Self::Services),
+            "api" => Some(Self::Api),
+            "core" => Some(Self::Core),
+            "cli" => Some(Self::Cli),
+            "vendor_hal" => Some(Self::VendorHal),
+            "tests" => Some(Self::Tests),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
 }
 
 /// Kind of callable or executable symbol.
@@ -164,6 +194,18 @@ impl SymbolKind {
             Self::Entrypoint => "entrypoint",
         }
     }
+
+    /// Inverse of [`SymbolKind::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "fn" => Some(Self::Function),
+            "method" => Some(Self::Method),
+            "isr" => Some(Self::Isr),
+            "ctor" => Some(Self::Constructor),
+            "entrypoint" => Some(Self::Entrypoint),
+            _ => None,
+        }
+    }
 }
 
 /// Symbol or type visibility modifier.
@@ -185,6 +227,18 @@ impl Visibility {
             Self::Protected => "prot",
             Self::Internal => "internal",
             Self::Static => "static",
+        }
+    }
+
+    /// Inverse of [`Visibility::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "pub" => Some(Self::Public),
+            "priv" => Some(Self::Private),
+            "prot" => Some(Self::Protected),
+            "internal" => Some(Self::Internal),
+            "static" => Some(Self::Static),
+            _ => None,
         }
     }
 }
@@ -216,6 +270,21 @@ impl TypeKind {
             Self::TypeAlias => "type_alias",
         }
     }
+
+    /// Inverse of [`TypeKind::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "struct" => Some(Self::Struct),
+            "enum" => Some(Self::Enum),
+            "union" => Some(Self::Union),
+            "trait" => Some(Self::Trait),
+            "interface" => Some(Self::Interface),
+            "class" => Some(Self::Class),
+            "typedef" => Some(Self::Typedef),
+            "type_alias" => Some(Self::TypeAlias),
+            _ => None,
+        }
+    }
 }
 
 /// Kind of macro, compile-time constant, or MMIO register construct.
@@ -241,6 +310,20 @@ impl MacroKind {
             Self::Bitmask => "bitmask",
             Self::RegisterAccess => "reg_access",
             Self::LinkerSection => "linker_section",
+        }
+    }
+
+    /// Inverse of [`MacroKind::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "macro" => Some(Self::ObjectMacro),
+            "fn_macro" => Some(Self::FunctionMacro),
+            "const" => Some(Self::Constant),
+            "mmio_addr" => Some(Self::MmioAddress),
+            "bitmask" => Some(Self::Bitmask),
+            "reg_access" => Some(Self::RegisterAccess),
+            "linker_section" => Some(Self::LinkerSection),
+            _ => None,
         }
     }
 }
@@ -278,6 +361,18 @@ impl ResolutionTier {
             self,
             Self::SameFile | Self::ImportResolved | Self::UniqueGlobal
         )
+    }
+
+    /// Inverse of [`ResolutionTier::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "same_file" => Some(Self::SameFile),
+            "import_resolved" => Some(Self::ImportResolved),
+            "unique_global" => Some(Self::UniqueGlobal),
+            "ambiguous_name" => Some(Self::AmbiguousName),
+            "external_or_macro" => Some(Self::ExternalOrMacro),
+            _ => None,
+        }
     }
 }
 
@@ -716,6 +811,68 @@ pub struct BundleIndexes {
     pub vendor_surface: VendorSurfaceSummary,
 }
 
+/// Identity of a linked symbol inside `cache/graph_state.json`.
+///
+/// `start_line` is the coordinate the symbol had when the graph was linked; it disambiguates
+/// duplicate `symbol_id`s (e.g. two same-named definitions in one file) and lets the
+/// coordinate-shift tier re-attach graph metrics after line numbers move.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphSymbolRef {
+    pub symbol_id: String,
+    pub start_line: usize,
+}
+
+/// Per-symbol graph annotations that cannot be re-derived from the AST alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SymbolGraphState {
+    pub symbol_id: String,
+    pub start_line: usize,
+    pub pagerank: f64,
+    #[serde(default)]
+    pub hub_score: f64,
+    #[serde(default)]
+    pub authority_score: f64,
+    pub in_degree: usize,
+    pub out_degree: usize,
+    #[serde(default)]
+    pub is_god_node: bool,
+    #[serde(default)]
+    pub is_entrypoint: bool,
+    #[serde(default)]
+    pub scc_id: Option<usize>,
+}
+
+/// Reconstructible linked-graph state persisted at `cache/graph_state.json` next to the
+/// per-file AST manifest. Holds only the analysis results that cannot be cheaply recomputed
+/// from source (PageRank/HITS/degree/SCC annotations, god nodes, entrypoints, layer edges,
+/// cycles, vendor surface); the entity tables themselves live in `index/*.tsv`.
+///
+/// Schema-versioned with `CACHE_SCHEMA_VERSION`; a missing, truncated, or version-mismatched
+/// file simply disables the coordinate-shift tier (the caller falls back to a full rebuild).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GraphStateFile {
+    pub schema_version: String,
+    #[serde(default)]
+    pub fingerprint: String,
+    #[serde(default)]
+    pub vendor_mode: VendorMode,
+    #[serde(default)]
+    pub symbols: Vec<SymbolGraphState>,
+    #[serde(default)]
+    pub god_nodes: Vec<GraphSymbolRef>,
+    #[serde(default)]
+    pub entrypoints: Vec<GraphSymbolRef>,
+    #[serde(default)]
+    pub layer_edges: Vec<LayerDependencyEdge>,
+    #[serde(default)]
+    pub cycles: Vec<CyclicCluster>,
+    #[serde(default)]
+    pub vendor_surface: VendorSurfaceSummary,
+}
+
+/// Name of the persisted linked-graph state file inside a bundle's `cache/` directory.
+pub const GRAPH_STATE_FILE: &str = "graph_state.json";
+
 /// Per-language file and line count breakdown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LanguageStat {
@@ -777,6 +934,10 @@ pub struct RepoMetadata {
     pub shard_ms: u64,
     #[serde(default)]
     pub emit_ms: u64,
+    /// Synchronization tier that produced this bundle: `cache_hit`, `digest_noop`,
+    /// `coordinate_shift`, or `structural` (full link + graph).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub incremental_tier: String,
     pub incremental_reused_files: usize,
     pub incremental_reparsed_files: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -1,8 +1,9 @@
 use crate::error::{ChipsrcError, Result};
 use crate::model::{
     ArchLayer, BundleIndexes, CacheManifest, CacheShardEntry, ConvertConfig, ExtractedType,
-    FileScope, IncrementalAstCache, RankedSymbol, RepoMetadata, SanityReport, SectionShard,
-    SymbolKind, TypeKind, Visibility,
+    FileScope, GraphStateFile, GraphSymbolRef, IncrementalAstCache, RankedSymbol, RepoMetadata,
+    SanityReport, SectionShard, SymbolGraphState, SymbolKind, TypeKind, VendorMode, Visibility,
+    CACHE_SCHEMA_VERSION, GRAPH_STATE_FILE,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
@@ -677,9 +678,82 @@ pub fn emit_bundle(
         write_file(&single_path, &combined)?;
     }
 
+    // Persist the compact linked-graph state used by the coordinate-shift tier. Written last so
+    // it always describes the bundle that is on disk; a missing/corrupt file only disables the
+    // fast path (callers fall back to a full rebuild).
+    let graph_state = build_graph_state(indexes, &metadata.fingerprint, metadata.vendor_mode);
+    emit_graph_state(output_dir, &graph_state)?;
+
     // Ensure .claudeignore entry (only when output_dir is inside repo_path)
     let claudeignore_updated = ensure_claudeignore_entry(&config.repo_path, output_dir)?;
     Ok(claudeignore_updated)
+}
+
+/// Builds the compact linked-graph state persisted at `cache/graph_state.json`.
+///
+/// The per-symbol annotations (PageRank/HITS/degree/SCC/god/entrypoint flags) are the only
+/// analysis output that cannot be re-derived from the AST tables, so they are stored compactly
+/// keyed by `(symbol_id, start_line)`; calls and xrefs are reconstructed from `index/*.tsv`.
+pub fn build_graph_state(
+    indexes: &BundleIndexes,
+    fingerprint: &str,
+    vendor_mode: VendorMode,
+) -> GraphStateFile {
+    GraphStateFile {
+        schema_version: CACHE_SCHEMA_VERSION.to_string(),
+        fingerprint: fingerprint.to_string(),
+        vendor_mode,
+        symbols: indexes
+            .symbols
+            .iter()
+            .map(|rs| SymbolGraphState {
+                symbol_id: rs.symbol.symbol_id.clone(),
+                start_line: rs.symbol.start_line,
+                pagerank: rs.pagerank,
+                hub_score: rs.hub_score,
+                authority_score: rs.authority_score,
+                in_degree: rs.in_degree,
+                out_degree: rs.out_degree,
+                is_god_node: rs.is_god_node,
+                is_entrypoint: rs.is_entrypoint,
+                scc_id: rs.scc_id,
+            })
+            .collect(),
+        god_nodes: indexes
+            .god_nodes
+            .iter()
+            .map(|rs| GraphSymbolRef {
+                symbol_id: rs.symbol.symbol_id.clone(),
+                start_line: rs.symbol.start_line,
+            })
+            .collect(),
+        entrypoints: indexes
+            .entrypoints
+            .iter()
+            .map(|rs| GraphSymbolRef {
+                symbol_id: rs.symbol.symbol_id.clone(),
+                start_line: rs.symbol.start_line,
+            })
+            .collect(),
+        layer_edges: indexes.layer_edges.clone(),
+        cycles: indexes.cycles.clone(),
+        vendor_surface: indexes.vendor_surface.clone(),
+    }
+}
+
+/// Atomically writes the linked-graph state to `<out_dir>/cache/graph_state.json`.
+pub fn emit_graph_state(output_dir: &Path, state: &GraphStateFile) -> Result<()> {
+    let cache_dir = output_dir.join("cache");
+    create_dir(&cache_dir)?;
+    let json = serde_json::to_string(state)?;
+    write_bytes_atomic(&cache_dir.join(GRAPH_STATE_FILE), json.as_bytes())
+}
+
+/// Loads `cache/graph_state.json` if present and well-formed (any schema version is accepted
+/// here; callers validate the version before using it).
+pub fn load_graph_state(bundle_dir: &Path) -> Option<GraphStateFile> {
+    let bytes = fs::read(bundle_dir.join("cache").join(GRAPH_STATE_FILE)).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn build_master_index_markdown(
@@ -878,7 +952,7 @@ fn build_master_index_markdown(
         lines.push(String::new());
         lines.push("| Type | Kind | Layer | Refs | Location | Fields / Variants |".to_string());
         lines.push("| --- | --- | --- | ---: | --- | --- |".to_string());
-        for (t, refs) in top_types.into_iter().take(12) {
+        for (t, refs) in top_types.into_iter().take(15) {
             let fields = if t.fields_summary.is_empty() {
                 Cow::Borrowed("-")
             } else {
@@ -1078,7 +1152,10 @@ pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Resu
     }
 
     for existing_name in &existing_json_files {
-        if existing_name != "manifest.json" && !expected_shard_names.contains(existing_name) {
+        if existing_name != "manifest.json"
+            && existing_name != GRAPH_STATE_FILE
+            && !expected_shard_names.contains(existing_name)
+        {
             let _ = fs::remove_file(cache_dir.join(existing_name));
         }
     }

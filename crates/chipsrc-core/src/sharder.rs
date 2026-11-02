@@ -11,6 +11,89 @@ const GENERIC_FILE_STEMS: &[&str] = &[
     "main", "mod", "index", "lib", "init", "test", "tests", "config", "utils",
 ];
 
+/// Single-file line threshold at which the sharder splits a large file into its own sub-shard.
+pub const LARGE_SINGLE_FILE_LINES: usize = 1400;
+
+/// Module-group line threshold above which the sharder splits a group into sub-shards.
+pub const MAX_GROUP_LINES: usize = 3000;
+
+/// Module-group file-count threshold above which the sharder splits a group into sub-shards.
+pub const MAX_GROUP_FILES: usize = 8;
+
+/// Returns the `(scope_sort_order, raw_slug)` grouping key that [`build_section_shards`] assigns
+/// to a parsed file. Shared with the incremental coordinate-shift tier so shard-threshold
+/// crossings can be detected without duplicating the module-derivation rules.
+pub fn shard_group_key(unit: &ParsedFileUnit) -> (u8, String) {
+    let (slug, _title, module_path) = derive_unit_shard_meta(unit);
+    let effective_scope = if unit.scanned.scope == FileScope::FirstParty
+        && crate::scanner::path_is_vendor_owned(&module_path)
+    {
+        FileScope::VendorSdk
+    } else {
+        unit.scanned.scope
+    };
+    (scope_sort_order(effective_scope), slug)
+}
+
+/// Returns `true` when a coordinate-only edit cannot change shard grouping.
+///
+/// Requirements: every dirty file stays strictly below [`LARGE_SINGLE_FILE_LINES`] in both its
+/// old and new state, and every module group containing a dirty file stays within
+/// [`MAX_GROUP_FILES`] / [`MAX_GROUP_LINES`] in both states. `dirty_old_line_counts` maps the
+/// relative path of each dirty file to its pre-edit line count; all other files are unchanged.
+pub fn coordinate_shift_grouping_stable(
+    units: &[ParsedFileUnit],
+    dirty_old_line_counts: &FxHashMap<&str, usize>,
+) -> bool {
+    struct GroupAggregate {
+        old_lines: usize,
+        new_lines: usize,
+        files: usize,
+        dirty: Vec<(usize, usize)>,
+    }
+
+    let mut groups: FxHashMap<(u8, String), GroupAggregate> = FxHashMap::default();
+    for unit in units {
+        let key = shard_group_key(unit);
+        let new_lines = unit.scanned.line_count;
+        let rel_path = unit.scanned.rel_path.as_str();
+        let old_lines = dirty_old_line_counts
+            .get(rel_path)
+            .copied()
+            .unwrap_or(new_lines);
+        let entry = groups.entry(key).or_insert_with(|| GroupAggregate {
+            old_lines: 0,
+            new_lines: 0,
+            files: 0,
+            dirty: Vec::new(),
+        });
+        entry.old_lines += old_lines;
+        entry.new_lines += new_lines;
+        entry.files += 1;
+        if dirty_old_line_counts.contains_key(rel_path) {
+            entry.dirty.push((old_lines, new_lines));
+        }
+    }
+
+    for aggregate in groups.values() {
+        if aggregate.dirty.is_empty() {
+            continue;
+        }
+        if aggregate.files > MAX_GROUP_FILES
+            || aggregate.old_lines > MAX_GROUP_LINES
+            || aggregate.new_lines > MAX_GROUP_LINES
+        {
+            return false;
+        }
+        for &(old_lines, new_lines) in &aggregate.dirty {
+            if old_lines >= LARGE_SINGLE_FILE_LINES || new_lines >= LARGE_SINGLE_FILE_LINES {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 const GENERIC_HEADER_STEMS: &[&str] = &[
     "main", "config", "types", "common", "board", "system", "version", "def", "defs", "utils",
     "hal", "bsp",
@@ -994,10 +1077,6 @@ fn split_oversized_shard_group<'a>(
     group: RawShardGroup<'a>,
     file_to_raw_slug: &mut FxHashMap<String, String>,
 ) -> Vec<RawShardGroup<'a>> {
-    const MAX_GROUP_FILES: usize = 8;
-    const MAX_GROUP_LINES: usize = 3000;
-    const LARGE_SINGLE_FILE_LINES: usize = 1400;
-
     let total_lines: usize = group.units.iter().map(|u| u.scanned.line_count).sum();
     if group.scope == FileScope::VendorSdk
         || group.units.len() <= 1

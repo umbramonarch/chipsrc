@@ -8,21 +8,19 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// Resolves raw call sites across all parsed files into a unified call graph,
-/// builds the code + hardware cross-reference table, and summarizes the active
-/// vendor SDK and MMIO register surface referenced by first-party code.
-#[allow(clippy::type_complexity)]
-pub fn resolve_and_link(
+/// Collects the unified symbol/type/macro tables from parsed units: deterministic sort,
+/// exact-duplicate removal, and C/C++ header-prototype merging.
+///
+/// This is the coordinate-only part of [`resolve_and_link`] (no call-site resolution), shared
+/// with the coordinate-shift incremental tier so a comment/line shift can rebuild the entity
+/// tables without relinking the call graph.
+pub fn collect_symbol_tables(
     units: &[ParsedFileUnit],
 ) -> (
     Vec<ExtractedSymbol>,
     Vec<ExtractedType>,
     Vec<ExtractedMacro>,
-    Vec<ResolvedCallEdge>,
-    Vec<XrefEntry>,
-    VendorSurfaceSummary,
 ) {
-    // 1. Collect and deterministically sort symbols, types, and macros
     let mut symbols: Vec<ExtractedSymbol> = units
         .iter()
         .flat_map(|u| u.symbols.iter().cloned())
@@ -37,7 +35,7 @@ pub fn resolve_and_link(
     });
     symbols.dedup_by(|a, b| a.symbol_id == b.symbol_id && a.start_line == b.start_line);
 
-    // 1b. Deduplicate C/C++ header prototypes against their `.c`/`.cpp` implementations.
+    // Deduplicate C/C++ header prototypes against their `.c`/`.cpp` implementations.
     // Without this, a caller that `#include`s a header resolves the call to the header
     // prototype (`in > 0, out = 0`) instead of the implementation (`out > 0`), which severs the
     // call graph at every module boundary. Matched prototypes are removed and their doc summary
@@ -67,6 +65,26 @@ pub fn resolve_and_link(
             .then_with(|| a.name.cmp(&b.name))
     });
     macros.dedup_by(|a, b| a.file == b.file && a.line == b.line && a.name == b.name);
+
+    (symbols, types, macros)
+}
+
+/// Resolves raw call sites across all parsed files into a unified call graph,
+/// builds the code + hardware cross-reference table, and summarizes the active
+/// vendor SDK and MMIO register surface referenced by first-party code.
+#[allow(clippy::type_complexity)]
+pub fn resolve_and_link(
+    units: &[ParsedFileUnit],
+) -> (
+    Vec<ExtractedSymbol>,
+    Vec<ExtractedType>,
+    Vec<ExtractedMacro>,
+    Vec<ResolvedCallEdge>,
+    Vec<XrefEntry>,
+    VendorSurfaceSummary,
+) {
+    // 1. Collect and deterministically sort symbols, types, and macros
+    let (symbols, types, macros) = collect_symbol_tables(units);
 
     // 2. Build fast lookup indexes
     let mut by_name: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
