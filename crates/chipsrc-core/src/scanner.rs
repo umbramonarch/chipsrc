@@ -3,8 +3,9 @@
 
 use crate::error::{ChipsrcError, Result};
 use crate::model::{
-    ArchLayer, BundleMetaFile, CacheManifest, FileScope, IncrementalAstCache, LanguageKind,
-    ParsedFileUnit, RepoBlueprint, RepoMetadata, ScannedFile, VendorMode, CACHE_SCHEMA_VERSION,
+    ArchLayer, BundleMetaFile, CacheManifest, FileScope, FileStamp, IncrementalAstCache,
+    LanguageKind, ParsedFileUnit, RepoBlueprint, RepoMetadata, ScannedFile, VendorMode,
+    CACHE_SCHEMA_VERSION,
 };
 use ignore::WalkBuilder;
 use rayon::prelude::*;
@@ -600,15 +601,40 @@ fn read_tsv_header_line(path: &Path) -> Option<String> {
     std::str::from_utf8(line_bytes).ok().map(|s| s.to_string())
 }
 
+/// Pre-parsed bundle metadata that lets callers run the artifact-integrity gate without
+/// re-reading `meta.json` or `cache/manifest.json` more than once per command.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BundleArtifactSources<'a> {
+    /// Result of `load_meta_file(bundle_dir)`; `None` means "read it here".
+    pub meta: Option<&'a BundleMetaFile>,
+    /// Result of `load_cache_manifest(bundle_dir)` (schema-validated); `None` means "read it here".
+    pub manifest: Option<&'a CacheManifest>,
+}
+
 /// Returns the relative path of the first missing or invalid required bundle artifact in `bundle_dir`,
 /// or `None` when the bundle is complete (`meta.json`, `INDEX.md`, all six `index/*.tsv` tables
 /// with non-empty header lines, every `md_file` listed in column 11 of `index/sections.tsv`,
 /// `cache/manifest.json`, and every shard listed in `cache/manifest.json`).
 pub fn first_missing_bundle_artifact(bundle_dir: &Path) -> Option<String> {
+    first_missing_bundle_artifact_with(bundle_dir, BundleArtifactSources::default())
+}
+
+/// Same as [`first_missing_bundle_artifact`], but reuses an already-parsed `meta.json` and/or
+/// `cache/manifest.json` when the caller has them. Keeping the parses to one per command matters on
+/// large bundles: the STM32CubeF4 `meta.json` is ~4 MB and `cache/manifest.json` ~2.5 MB.
+pub fn first_missing_bundle_artifact_with(
+    bundle_dir: &Path,
+    sources: BundleArtifactSources<'_>,
+) -> Option<String> {
     if !bundle_dir.is_dir() {
         return Some("bundle directory".to_string());
     }
-    if load_meta_file(bundle_dir).is_none() {
+    let local_meta = if sources.meta.is_none() {
+        load_meta_file(bundle_dir)
+    } else {
+        None
+    };
+    if sources.meta.or(local_meta.as_ref()).is_none() {
         return Some("meta.json".to_string());
     }
     if !bundle_dir.join("INDEX.md").is_file() {
@@ -681,7 +707,12 @@ pub fn first_missing_bundle_artifact(bundle_dir: &Path) -> Option<String> {
         }
     }
 
-    let Some(manifest) = load_cache_manifest(bundle_dir) else {
+    let local_manifest = if sources.manifest.is_none() {
+        load_cache_manifest(bundle_dir)
+    } else {
+        None
+    };
+    let Some(manifest) = sources.manifest.or(local_manifest.as_ref()) else {
         return Some("cache/manifest.json".to_string());
     };
     if manifest.files.is_empty() {
@@ -721,6 +752,15 @@ pub fn first_missing_bundle_artifact(bundle_dir: &Path) -> Option<String> {
 /// `cache/manifest.json`, and every per-file cache shard listed in the manifest).
 pub fn bundle_artifacts_complete(bundle_dir: &Path) -> bool {
     first_missing_bundle_artifact(bundle_dir).is_none()
+}
+
+/// Same as [`bundle_artifacts_complete`], reusing already-parsed metadata (see
+/// [`BundleArtifactSources`]).
+pub fn bundle_artifacts_complete_with(
+    bundle_dir: &Path,
+    sources: BundleArtifactSources<'_>,
+) -> bool {
+    first_missing_bundle_artifact_with(bundle_dir, sources).is_none()
 }
 
 /// Loads the incremental AST cache from `bundle_dir/cache/manifest.json` + `cache/*.json` shards
@@ -777,10 +817,260 @@ pub struct StampCheck {
     pub fingerprint: String,
 }
 
+/// Immutable shared state for the parallel stat-only stamp walk.
+struct StampWalkCtx<'a> {
+    repo_root: &'a Path,
+    stamps: &'a [FileStamp],
+    stamp_index: FxHashMap<&'a str, u32>,
+    blueprint: Option<&'a RepoBlueprint>,
+    vendor_mode: VendorMode,
+    max_file_bytes: u64,
+    blueprint_changed: bool,
+}
+
+/// Per-thread accumulator for [`stamp_check`]'s parallel walk. Each walker worker owns one and
+/// hands it to the shared sink on drop, so no locking happens on the per-file hot path.
+struct StampThreadAcc {
+    built_files: Vec<ScannedFile>,
+    suspects: Vec<PathBuf>,
+    suspect_rel_paths: Vec<String>,
+    touched_mtimes: Vec<(String, (u64, u32))>,
+    seen_stamp_idx: Vec<u32>,
+    added: usize,
+    modified: usize,
+    can_build_files: bool,
+}
+
+impl Default for StampThreadAcc {
+    fn default() -> Self {
+        StampThreadAcc {
+            built_files: Vec::new(),
+            suspects: Vec::new(),
+            suspect_rel_paths: Vec::new(),
+            touched_mtimes: Vec::new(),
+            seen_stamp_idx: Vec::new(),
+            added: 0,
+            modified: 0,
+            can_build_files: true,
+        }
+    }
+}
+
+impl StampWalkCtx<'_> {
+    /// Classifies one walked file against the recorded stamps, appending results to `acc`.
+    /// Unchanged files (matching size + whole-second mtime + sub-second mtime) are never opened.
+    fn visit_file(&self, entry: &ignore::DirEntry, acc: &mut StampThreadAcc) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            return;
+        }
+        let abs_path = entry.path();
+        let Some(ext) = abs_path.extension().and_then(|e| e.to_str()) else {
+            return;
+        };
+        let Some(language) = LanguageKind::from_extension(ext) else {
+            return;
+        };
+        let file_name = entry.file_name().to_str().unwrap_or_default();
+        let lower_filename = file_name.to_ascii_lowercase();
+        if is_bundled_js_asset(&lower_filename) {
+            return;
+        }
+        let Ok(fs_meta) = entry.metadata() else {
+            return;
+        };
+        let size_bytes = fs_meta.len();
+        if size_bytes == 0 || size_bytes > self.max_file_bytes {
+            return;
+        }
+        let (mtime_secs, mtime_nanos) = file_mtime_secs_nanos(&fs_meta);
+
+        let rel_path = match abs_path.strip_prefix(self.repo_root) {
+            Ok(rel) => normalize_rel_path(rel),
+            Err(_) => normalize_rel_path(abs_path),
+        };
+        if rel_path.is_empty() || is_generated_doc_asset(&rel_path, &lower_filename) {
+            return;
+        }
+        if let Some(bp) = self.blueprint {
+            if path_matches_ignore_dirs(&rel_path, &bp.ignore_dirs) {
+                return;
+            }
+        }
+
+        let Some(&stamp_idx) = self.stamp_index.get(rel_path.as_str()) else {
+            // Candidate new file: check if it would be filtered by VendorMode::None or vendor
+            // example rules, mirroring the full scanner's scope classification.
+            acc.can_build_files = false;
+            let explicit_example_scope = self
+                .blueprint
+                .and_then(|bp| match_longest_prefix(&rel_path, &bp.scopes))
+                .is_some_and(|(matched_key, _)| {
+                    matched_key.split('/').any(|seg| {
+                        matches!(
+                            seg.to_ascii_lowercase().as_str(),
+                            "examples"
+                                | "example"
+                                | "samples"
+                                | "sample"
+                                | "demos"
+                                | "demo"
+                                | "templates"
+                                | "template"
+                                | "boards"
+                                | "board"
+                        )
+                    })
+                });
+            let dir_scope = classify_file_scope_with_blueprint(&rel_path, 0, b"", self.blueprint);
+            if dir_scope == FileScope::VendorSdk
+                && (self.vendor_mode == VendorMode::None
+                    || (!explicit_example_scope && is_vendor_example_or_demo_path(&rel_path)))
+            {
+                return;
+            }
+            if size_bytes > 200 * 1024
+                && (lower_filename.ends_with(".h") || lower_filename.ends_with(".hpp"))
+            {
+                if let Ok(bytes) = fs::read(abs_path) {
+                    let scope = classify_file_scope_with_blueprint(
+                        &rel_path,
+                        size_bytes,
+                        &bytes,
+                        self.blueprint,
+                    );
+                    if scope == FileScope::VendorSdk
+                        && (self.vendor_mode == VendorMode::None
+                            || (!explicit_example_scope
+                                && is_vendor_example_or_demo_path(&rel_path)))
+                    {
+                        return;
+                    }
+                }
+            }
+            acc.suspects.push(abs_path.to_path_buf());
+            acc.suspect_rel_paths.push(rel_path);
+            acc.added += 1;
+            return;
+        };
+
+        let stamp = &self.stamps[stamp_idx as usize];
+        acc.seen_stamp_idx.push(stamp_idx);
+        if !self.blueprint_changed
+            && stamp.size_bytes == size_bytes
+            && stamp.mtime_secs == mtime_secs
+            && stamp.mtime_nanos == mtime_nanos
+            && stamp.mtime_secs > 0
+        {
+            // Trusted stat-only hit: no fs::read needed!
+            if stamp.line_count > 0 {
+                acc.built_files.push(ScannedFile {
+                    rel_path,
+                    abs_path: abs_path.to_path_buf(),
+                    language,
+                    scope: stamp.scope,
+                    arch_layer: stamp.arch_layer,
+                    size_bytes,
+                    mtime_secs,
+                    mtime_nanos,
+                    blake3_hash: stamp.blake3_hash.clone(),
+                    line_count: stamp.line_count,
+                });
+            } else {
+                acc.can_build_files = false;
+            }
+            return;
+        }
+
+        acc.suspects.push(abs_path.to_path_buf());
+        acc.suspect_rel_paths.push(rel_path.clone());
+        let Ok(bytes) = fs::read(abs_path) else {
+            acc.modified += 1;
+            acc.can_build_files = false;
+            return;
+        };
+        let full_hash = blake3::hash(&bytes).to_hex();
+        let blake3_hash = full_hash[..16].to_string();
+        let scope =
+            classify_file_scope_with_blueprint(&rel_path, size_bytes, &bytes, self.blueprint);
+        let arch_layer = classify_arch_layer_with_blueprint(&rel_path, scope, self.blueprint);
+        let line_count = count_source_lines(&bytes);
+        if stamp.size_bytes == size_bytes
+            && stamp.blake3_hash == blake3_hash
+            && stamp.scope == scope
+            && stamp.arch_layer == arch_layer
+        {
+            acc.touched_mtimes
+                .push((rel_path.clone(), (mtime_secs, mtime_nanos)));
+        } else {
+            acc.modified += 1;
+        }
+        acc.built_files.push(ScannedFile {
+            rel_path,
+            abs_path: abs_path.to_path_buf(),
+            language,
+            scope,
+            arch_layer,
+            size_bytes,
+            mtime_secs,
+            mtime_nanos,
+            blake3_hash,
+            line_count,
+        });
+    }
+}
+
+/// Parallel walker visitor: classifies entries on the walker's worker threads.
+struct StampVisitor<'a> {
+    ctx: &'a StampWalkCtx<'a>,
+    acc: StampThreadAcc,
+    sink: &'a std::sync::Mutex<Vec<StampThreadAcc>>,
+}
+
+impl ignore::ParallelVisitor for StampVisitor<'_> {
+    fn visit(
+        &mut self,
+        result: std::result::Result<ignore::DirEntry, ignore::Error>,
+    ) -> ignore::WalkState {
+        if let Ok(entry) = result {
+            self.ctx.visit_file(&entry, &mut self.acc);
+        }
+        ignore::WalkState::Continue
+    }
+}
+
+impl Drop for StampVisitor<'_> {
+    fn drop(&mut self) {
+        let acc = std::mem::take(&mut self.acc);
+        if let Ok(mut sink) = self.sink.lock() {
+            sink.push(acc);
+        }
+    }
+}
+
+struct StampVisitorBuilder<'a> {
+    ctx: &'a StampWalkCtx<'a>,
+    sink: &'a std::sync::Mutex<Vec<StampThreadAcc>>,
+}
+
+impl<'s> ignore::ParallelVisitorBuilder<'s> for StampVisitorBuilder<'s> {
+    fn build(&mut self) -> Box<dyn ignore::ParallelVisitor + 's> {
+        Box::new(StampVisitor {
+            ctx: self.ctx,
+            acc: StampThreadAcc::default(),
+            sink: self.sink,
+        })
+    }
+}
+
 /// Walks `repo_path` comparing `(mtime_secs, mtime_nanos, size_bytes)` against `meta.file_stamps` WITHOUT
 /// reading unchanged files from disk. Only files whose `(mtime_secs, mtime_nanos, size_bytes)` differ from
 /// their recorded stamp ("suspects") are read and BLAKE3-hashed; touch-only suspects whose
 /// BLAKE3 hash matches `stamp.blake3_hash` are treated as unchanged and recorded in `touched_mtimes`.
+///
+/// The walk is parallel (`ignore::WalkParallel`): `.gitignore`/`.ignore`/`.claudeignore` rules are
+/// evaluated once per directory by the ignore crate and reused from its per-directory matcher stack,
+/// while every entry's stat + stamp comparison runs on the walker's worker threads. `FxHashMap`
+/// lookups keep the per-file work allocation-light, and unchanged files are never opened.
 pub fn stamp_check(
     repo_path: &Path,
     meta: &RepoMetadata,
@@ -860,177 +1150,59 @@ pub fn stamp_check(
             true
         });
 
-    let stamp_map: FxHashMap<&str, &crate::model::FileStamp> = meta
+    let stamp_index: FxHashMap<&str, u32> = meta
         .file_stamps
         .iter()
-        .map(|s| (s.rel_path.as_str(), s))
+        .enumerate()
+        .map(|(idx, s)| (s.rel_path.as_str(), idx as u32))
         .collect();
 
-    let mut seen_stamps: FxHashSet<&str> =
-        FxHashSet::with_capacity_and_hasher(meta.file_stamps.len(), Default::default());
-    let mut suspects = Vec::new();
-    let mut suspect_rel_paths = Vec::new();
-    let mut touched_mtimes = BTreeMap::new();
+    let ctx = StampWalkCtx {
+        repo_root: repo_path,
+        stamps: &meta.file_stamps,
+        stamp_index,
+        blueprint: bp_ref,
+        vendor_mode: meta.vendor_mode,
+        max_file_bytes,
+        blueprint_changed,
+    };
+    let sink: std::sync::Mutex<Vec<StampThreadAcc>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut builder = StampVisitorBuilder {
+            ctx: &ctx,
+            sink: &sink,
+        };
+        walker.build_parallel().visit(&mut builder);
+    }
+    // A poisoned sink means a walker worker already panicked (which propagates out of `visit`);
+    // recover the accumulated results anyway rather than reporting every file as deleted.
+    let thread_accs = sink
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut suspects: Vec<PathBuf> = Vec::new();
+    let mut suspect_rel_paths: Vec<String> = Vec::new();
+    let mut touched_mtimes: BTreeMap<String, (u64, u32)> = BTreeMap::new();
     let mut built_files: Vec<ScannedFile> = Vec::with_capacity(meta.file_stamps.len());
+    let mut seen_stamps: FxHashSet<u32> =
+        FxHashSet::with_capacity_and_hasher(meta.file_stamps.len(), Default::default());
     let mut can_build_files = !blueprint_changed;
     let mut added = 0usize;
     let mut modified = 0usize;
-
-    for entry_res in walker.build() {
-        let Ok(entry) = entry_res else {
-            continue;
-        };
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
+    for mut acc in thread_accs {
+        built_files.append(&mut acc.built_files);
+        suspects.append(&mut acc.suspects);
+        suspect_rel_paths.append(&mut acc.suspect_rel_paths);
+        for (rel, mtime) in acc.touched_mtimes {
+            touched_mtimes.insert(rel, mtime);
         }
-        let abs_path = entry.path().to_path_buf();
-        let Some(ext) = abs_path.extension().and_then(|e| e.to_str()) else {
-            continue;
-        };
-        let Some(language) = LanguageKind::from_extension(ext) else {
-            continue;
-        };
-        let lower_filename = abs_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.to_ascii_lowercase())
-            .unwrap_or_default();
-        if is_bundled_js_asset(&lower_filename) {
-            continue;
-        }
-        let Ok(fs_meta) = entry.metadata() else {
-            continue;
-        };
-        let size_bytes = fs_meta.len();
-        if size_bytes == 0 || size_bytes > max_file_bytes {
-            continue;
-        }
-        let (mtime_secs, mtime_nanos) = file_mtime_secs_nanos(&fs_meta);
-
-        let rel_path = match abs_path.strip_prefix(repo_path) {
-            Ok(rel) => normalize_rel_path(rel),
-            Err(_) => normalize_rel_path(&abs_path),
-        };
-        if rel_path.is_empty() || is_generated_doc_asset(&rel_path, &lower_filename) {
-            continue;
-        }
-        if let Some(bp) = bp_ref {
-            if path_matches_ignore_dirs(&rel_path, &bp.ignore_dirs) {
-                continue;
-            }
-        }
-
-        if let Some(&stamp) = stamp_map.get(rel_path.as_str()) {
-            seen_stamps.insert(stamp.rel_path.as_str());
-            if !blueprint_changed
-                && stamp.size_bytes == size_bytes
-                && stamp.mtime_secs == mtime_secs
-                && stamp.mtime_nanos == mtime_nanos
-                && stamp.mtime_secs > 0
-            {
-                // Trusted stat-only hit: no fs::read needed!
-                if stamp.line_count > 0 {
-                    built_files.push(ScannedFile {
-                        rel_path,
-                        abs_path,
-                        language,
-                        scope: stamp.scope,
-                        arch_layer: stamp.arch_layer,
-                        size_bytes,
-                        mtime_secs,
-                        mtime_nanos,
-                        blake3_hash: stamp.blake3_hash.clone(),
-                        line_count: stamp.line_count,
-                    });
-                } else {
-                    can_build_files = false;
-                }
-                continue;
-            }
-            suspects.push(abs_path.clone());
-            suspect_rel_paths.push(rel_path.clone());
-            let Ok(bytes) = fs::read(&abs_path) else {
-                modified += 1;
-                can_build_files = false;
-                continue;
-            };
-            let full_hash = blake3::hash(&bytes).to_hex();
-            let blake3_hash = full_hash[..16].to_string();
-            let scope = classify_file_scope_with_blueprint(&rel_path, size_bytes, &bytes, bp_ref);
-            let arch_layer = classify_arch_layer_with_blueprint(&rel_path, scope, bp_ref);
-            let line_count = count_source_lines(&bytes);
-            if stamp.size_bytes == size_bytes
-                && stamp.blake3_hash == blake3_hash
-                && stamp.scope == scope
-                && stamp.arch_layer == arch_layer
-            {
-                touched_mtimes.insert(rel_path.clone(), (mtime_secs, mtime_nanos));
-            } else {
-                modified += 1;
-            }
-            built_files.push(ScannedFile {
-                rel_path,
-                abs_path,
-                language,
-                scope,
-                arch_layer,
-                size_bytes,
-                mtime_secs,
-                mtime_nanos,
-                blake3_hash,
-                line_count,
-            });
-        } else {
-            can_build_files = false;
-            // Candidate new file: check if it would be filtered by VendorMode::None or vendor example rules
-            let explicit_example_scope = bp_ref
-                .and_then(|bp| match_longest_prefix(&rel_path, &bp.scopes))
-                .is_some_and(|(matched_key, _)| {
-                    matched_key.split('/').any(|seg| {
-                        matches!(
-                            seg.to_ascii_lowercase().as_str(),
-                            "examples"
-                                | "example"
-                                | "samples"
-                                | "sample"
-                                | "demos"
-                                | "demo"
-                                | "templates"
-                                | "template"
-                                | "boards"
-                                | "board"
-                        )
-                    })
-                });
-            let dir_scope = classify_file_scope_with_blueprint(&rel_path, 0, b"", bp_ref);
-            if dir_scope == FileScope::VendorSdk
-                && (meta.vendor_mode == VendorMode::None
-                    || (!explicit_example_scope && is_vendor_example_or_demo_path(&rel_path)))
-            {
-                continue;
-            }
-            if size_bytes > 200 * 1024
-                && (lower_filename.ends_with(".h") || lower_filename.ends_with(".hpp"))
-            {
-                if let Ok(bytes) = fs::read(&abs_path) {
-                    let scope =
-                        classify_file_scope_with_blueprint(&rel_path, size_bytes, &bytes, bp_ref);
-                    if scope == FileScope::VendorSdk
-                        && (meta.vendor_mode == VendorMode::None
-                            || (!explicit_example_scope
-                                && is_vendor_example_or_demo_path(&rel_path)))
-                    {
-                        continue;
-                    }
-                }
-            }
-            suspects.push(abs_path);
-            suspect_rel_paths.push(rel_path);
-            added += 1;
-        }
+        seen_stamps.extend(acc.seen_stamp_idx);
+        added += acc.added;
+        modified += acc.modified;
+        can_build_files &= acc.can_build_files;
     }
 
-    let deleted = stamp_map.len().saturating_sub(seen_stamps.len());
+    let deleted = meta.file_stamps.len().saturating_sub(seen_stamps.len());
 
     let mut changed_count = added + deleted + modified;
     if changed_count == 0 && blueprint_changed {
@@ -1766,6 +1938,24 @@ mod tests {
         }
     }
 
+    /// Writes a fixture source file, creating parent directories as needed.
+    fn write_src(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create fixture dir");
+        }
+        std::fs::write(path, content).expect("write fixture file");
+    }
+
+    /// Sets a deterministic mtime on a fixture file (std-only, no `filetime` dependency).
+    fn set_mtime(path: &Path, modified: std::time::SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open fixture for mtime")
+            .set_modified(modified)
+            .expect("set fixture mtime");
+    }
+
     #[test]
     fn test_assign_section_id() {
         let (slug, title, module) = assign_section_id(
@@ -2038,6 +2228,185 @@ mod tests {
         );
         assert_eq!(sc_dirty.changed_count, 1);
         assert_eq!(sc_dirty.suspects.len(), 1);
+    }
+
+    #[test]
+    fn stamp_check_never_reads_unchanged_file_content() {
+        use std::time::Duration;
+
+        let tmp = TestTempDir::new("chipsrc_scanner_stat_only");
+        let repo_dir = tmp.path().join("repo");
+        let out_dir = tmp.path().join("bundle");
+
+        let file_path = repo_dir.join("src/lib.c");
+        let content_v1 = "int alpha_fn(void) { return 1; }\n";
+        let content_v2 = "int bravo_fn(void) { return 1; }\n";
+        assert_eq!(content_v1.len(), content_v2.len());
+
+        write_src(&file_path, content_v1);
+        let t0 = UNIX_EPOCH + Duration::new(1_700_000_100, 250_000_000);
+        set_mtime(&file_path, t0);
+
+        let cfg = crate::model::ConvertConfig::new(repo_dir.clone(), out_dir);
+        let bundle = crate::convert_repo(&cfg).expect("initial convert_repo");
+
+        // Replace the body with a different same-size program and restore the exact mtime.
+        // A content read would see `bravo_fn`, so an unchanged result proves the stat-only path.
+        write_src(&file_path, content_v2);
+        set_mtime(&file_path, t0);
+
+        let sc =
+            stamp_check(&repo_dir, &bundle.metadata, DEFAULT_MAX_FILE_BYTES).expect("stamp_check");
+        assert!(
+            sc.unchanged,
+            "unchanged (size, mtime_secs, mtime_nanos) must be trusted without reading content"
+        );
+        assert_eq!(sc.changed_count, 0);
+        assert!(sc.suspects.is_empty());
+        assert!(sc.suspect_rel_paths.is_empty());
+    }
+
+    #[test]
+    fn stamp_check_parallel_walk_covers_nested_files_adds_and_deletes() {
+        let tmp = TestTempDir::new("chipsrc_scanner_parallel");
+        let repo_dir = tmp.path().join("repo");
+        let out_dir = tmp.path().join("bundle");
+        let mut paths = Vec::new();
+        for dir in 0..4 {
+            for file in 0..10 {
+                let path = repo_dir.join(format!("mod{dir}/nested/file{file}.c"));
+                write_src(
+                    &path,
+                    &format!("int fn_{dir}_{file}(void) {{ return {file}; }}\n"),
+                );
+                paths.push(path);
+            }
+        }
+
+        let cfg = crate::model::ConvertConfig::new(repo_dir.clone(), out_dir);
+        let bundle = crate::convert_repo(&cfg).expect("initial convert_repo");
+
+        let clean =
+            stamp_check(&repo_dir, &bundle.metadata, DEFAULT_MAX_FILE_BYTES).expect("stamp_check");
+        assert!(clean.unchanged);
+        assert_eq!(clean.changed_count, 0);
+        let scanned = clean
+            .scanned_files
+            .expect("clean walk yields scanned files");
+        assert_eq!(scanned.len(), 40);
+        assert!(
+            scanned.windows(2).all(|w| w[0].rel_path < w[1].rel_path),
+            "parallel walk must still return rel_path-sorted files"
+        );
+
+        write_src(&paths[0], "int fn_edited(void) { return 42; }\n");
+        write_src(
+            &repo_dir.join("mod3/nested/new_file.c"),
+            "int brand_new(void) { return 7; }\n",
+        );
+        std::fs::remove_file(&paths[1]).unwrap();
+
+        let dirty =
+            stamp_check(&repo_dir, &bundle.metadata, DEFAULT_MAX_FILE_BYTES).expect("stamp_check");
+        assert!(!dirty.unchanged);
+        assert_eq!(dirty.added, 1, "one nested file was added");
+        assert_eq!(dirty.deleted, 1, "one nested file was deleted");
+        assert_eq!(dirty.changed_count, 3);
+        assert_eq!(dirty.suspect_rel_paths.len(), 2, "edit + add are suspects");
+        assert!(dirty
+            .suspect_rel_paths
+            .iter()
+            .any(|p| p == "mod0/nested/file0.c"));
+        assert!(dirty
+            .suspect_rel_paths
+            .iter()
+            .any(|p| p == "mod3/nested/new_file.c"));
+    }
+
+    #[test]
+    fn stamp_check_parallel_walk_honors_gitignore_and_claudeignore() {
+        let tmp = TestTempDir::new("chipsrc_scanner_parallel_ignore");
+        let repo_dir = tmp.path().join("repo");
+        let out_dir = tmp.path().join("bundle");
+        write_src(&repo_dir.join("src/app.c"), "int app(void) { return 0; }\n");
+        write_src(&repo_dir.join(".gitignore"), "ignored/\n");
+        write_src(&repo_dir.join(".claudeignore"), "gen/\n");
+
+        let cfg = crate::model::ConvertConfig::new(repo_dir.clone(), out_dir);
+        let bundle = crate::convert_repo(&cfg).expect("initial convert_repo");
+
+        write_src(
+            &repo_dir.join("ignored/skip_me.c"),
+            "int ignored_fn(void) { return 1; }\n",
+        );
+        write_src(
+            &repo_dir.join("gen/skip_me.c"),
+            "int generated_fn(void) { return 1; }\n",
+        );
+        write_src(
+            &repo_dir.join("src/fresh.c"),
+            "int fresh_fn(void) { return 1; }\n",
+        );
+
+        let sc =
+            stamp_check(&repo_dir, &bundle.metadata, DEFAULT_MAX_FILE_BYTES).expect("stamp_check");
+        assert_eq!(sc.added, 1, "only src/fresh.c is a real addition");
+        assert_eq!(sc.changed_count, 1);
+        assert!(sc.suspect_rel_paths.iter().any(|p| p == "src/fresh.c"));
+        assert!(!sc
+            .suspect_rel_paths
+            .iter()
+            .any(|p| p.starts_with("ignored/") || p.starts_with("gen/")));
+    }
+
+    #[test]
+    fn bundle_artifacts_complete_with_reuses_parsed_metadata() {
+        let tmp = TestTempDir::new("chipsrc_scanner_artifact_sources");
+        let repo_dir = tmp.path().join("repo");
+        let bundle_dir = tmp.path().join("bundle");
+        write_src(
+            &repo_dir.join("src/main.c"),
+            "int compute_value(int x) { return x + 1; }\n",
+        );
+
+        let cfg = crate::model::ConvertConfig::new(repo_dir, bundle_dir.clone());
+        crate::convert_repo(&cfg).expect("initial convert_repo");
+
+        let meta = load_meta_file(&bundle_dir).expect("meta");
+        let manifest = load_cache_manifest(&bundle_dir).expect("manifest");
+        let sources = BundleArtifactSources {
+            meta: Some(&meta),
+            manifest: Some(&manifest),
+        };
+        assert!(bundle_artifacts_complete_with(&bundle_dir, sources));
+
+        // Hiding `meta.json` must not matter when the parsed copy is supplied.
+        let meta_path = bundle_dir.join("meta.json");
+        let meta_backup = bundle_dir.join("meta.json.hidden");
+        std::fs::rename(&meta_path, &meta_backup).unwrap();
+        assert!(
+            bundle_artifacts_complete_with(&bundle_dir, sources),
+            "passed-in meta must be reused instead of re-reading meta.json"
+        );
+        assert_eq!(
+            first_missing_bundle_artifact(&bundle_dir).as_deref(),
+            Some("meta.json")
+        );
+        std::fs::rename(&meta_backup, &meta_path).unwrap();
+
+        // A deleted cache shard is still detected through the supplied manifest.
+        let shard = manifest
+            .files
+            .values()
+            .next()
+            .expect("manifest entry")
+            .shard
+            .clone();
+        std::fs::remove_file(bundle_dir.join(&shard)).unwrap();
+        assert_eq!(
+            first_missing_bundle_artifact_with(&bundle_dir, sources).as_deref(),
+            Some(shard.as_str())
+        );
     }
 
     #[test]

@@ -3,8 +3,8 @@ use crate::mmio::{normalize_hex_literal, normalize_query_hex_literal};
 use crate::model::{BundleStatusEntry, LanguageKind, SearchHit, DEFAULT_MAX_FILE_BYTES};
 use crate::scanner::{
     canonical_repo_root_and_name, check_files_changed, check_meta_files_changed,
-    first_missing_bundle_artifact, has_bundle_cache, has_valid_tsv_header, load_cache_file,
-    load_cache_manifest_any_version, load_meta_file, scan_repository,
+    first_missing_bundle_artifact_with, has_bundle_cache, has_valid_tsv_header, load_cache_file,
+    load_cache_manifest_any_version, load_meta_file, scan_repository, BundleArtifactSources,
 };
 use memchr::memmem;
 use rayon::prelude::*;
@@ -192,8 +192,16 @@ pub fn workspace_status(workspace: &Path) -> Result<Vec<BundleStatusEntry>> {
 
     let mut entries = Vec::with_capacity(bundles.len());
     for bundle_dir in bundles {
-        let missing_artifact = first_missing_bundle_artifact(&bundle_dir);
-        let Some(meta_file) = load_meta_file(&bundle_dir) else {
+        // Parse `meta.json` once and feed the parsed copy into the artifact-integrity gate.
+        let meta_file_opt = load_meta_file(&bundle_dir);
+        let missing_artifact = first_missing_bundle_artifact_with(
+            &bundle_dir,
+            BundleArtifactSources {
+                meta: meta_file_opt.as_ref(),
+                manifest: None,
+            },
+        );
+        let Some(meta_file) = meta_file_opt else {
             let fallback_manifest = load_cache_manifest_any_version(&bundle_dir);
             let bundle_name = bundle_dir
                 .file_name()

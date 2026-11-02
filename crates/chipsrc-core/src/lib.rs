@@ -859,13 +859,29 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
     // 1. Stat-only fast-path check against `meta.file_stamps` (zero source-file reads when clean)
     let mut pre_scanned: Option<(Vec<ScannedFile>, String)> = None;
     if let Some(mut existing_meta) = existing_meta_opt.clone() {
-        if let Some(sc) = scanner::stamp_check(
-            &config.repo_path,
-            &existing_meta.metadata,
-            config.max_file_bytes,
-        ) {
+        // The artifact-integrity gate and the stat walk are independent: run the gate on its own
+        // thread so its `cache/manifest.json` parse and `cache/` listing overlap the walk.
+        let (sc_opt, complete) = std::thread::scope(|scope| {
+            let artifacts = scope.spawn(|| {
+                scanner::bundle_artifacts_complete_with(
+                    &config.output_dir,
+                    scanner::BundleArtifactSources {
+                        meta: Some(&existing_meta),
+                        manifest: None,
+                    },
+                )
+            });
+            let sc = scanner::stamp_check(
+                &config.repo_path,
+                &existing_meta.metadata,
+                config.max_file_bytes,
+            );
+            let complete = artifacts.join().unwrap_or(false);
+            (sc, complete)
+        });
+        if let Some(sc) = sc_opt {
             if sc.unchanged {
-                if scanner::bundle_artifacts_complete(&config.output_dir) {
+                if complete {
                     let claudeignore_updated =
                         emitter::ensure_claudeignore_entry(&config.repo_path, &config.output_dir)
                             .unwrap_or(false);
@@ -1421,6 +1437,14 @@ pub fn auto_refresh_bundles(bundles: &[PathBuf]) -> Result<usize> {
 
     for bundle_dir in bundles {
         let meta_opt = scanner::load_meta_file(bundle_dir);
+        // Parse `cache/manifest.json` at most once per bundle per command: the same parsed
+        // manifest drives the cache gate, the artifact-integrity gate, and `repo_root` recovery.
+        let manifest_opt = scanner::load_cache_manifest(bundle_dir);
+        let manifest_any = if manifest_opt.is_none() {
+            scanner::load_cache_manifest_any_version(bundle_dir)
+        } else {
+            None
+        };
         let (source_root_str, vendor_mode, repo_name, file_stamps_empty) =
             if let Some(ref mf) = meta_opt {
                 (
@@ -1429,13 +1453,13 @@ pub fn auto_refresh_bundles(bundles: &[PathBuf]) -> Result<usize> {
                     mf.metadata.repo_name.clone(),
                     mf.metadata.file_stamps.is_empty(),
                 )
-            } else if let Some(manifest) = scanner::load_cache_manifest_any_version(bundle_dir) {
+            } else if let Some(manifest) = manifest_opt.as_ref().or(manifest_any.as_ref()) {
                 let name = bundle_dir
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("repo")
                     .to_string();
-                (manifest.repo_root, manifest.vendor_mode, name, true)
+                (manifest.repo_root.clone(), manifest.vendor_mode, name, true)
             } else {
                 continue;
             };
@@ -1446,10 +1470,15 @@ pub fn auto_refresh_bundles(bundles: &[PathBuf]) -> Result<usize> {
 
         // Fast-path: check `meta.file_stamps` directly from `meta.json` (~2 KB) without loading
         // the multi-megabyte `cache.json` when no source files have changed (Issue #41).
-        let needs_refresh = if !scanner::has_bundle_cache(bundle_dir)
+        let needs_refresh = if manifest_opt.is_none()
             || file_stamps_empty
-            || !scanner::bundle_artifacts_complete(bundle_dir)
-        {
+            || !scanner::bundle_artifacts_complete_with(
+                bundle_dir,
+                scanner::BundleArtifactSources {
+                    meta: meta_opt.as_ref(),
+                    manifest: manifest_opt.as_ref(),
+                },
+            ) {
             true
         } else if let Some(ref mf) = meta_opt {
             let meta = &mf.metadata;
