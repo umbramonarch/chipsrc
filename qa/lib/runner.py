@@ -6,7 +6,10 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
+
+from lib import procs
 
 EXPECTED_CACHE_SCHEMA = "2.1.0"
 REQUIRED_TSVS = ["symbols", "types", "calls", "macros", "xref", "sections"]
@@ -377,6 +380,302 @@ class HarnessContext:
                 print(f"FAIL {label}: {detail}")
             self.save()
         return record
+
+    def _append_invocation(
+        self,
+        label: str,
+        str_args: list[str],
+        exit_code: int,
+        wall_ms: float,
+        stdout: str,
+        stderr: str,
+        err_reason: str | None,
+        expected: int,
+        extra: dict | None = None,
+        parsed_json: object = None,
+    ) -> dict:
+        passed = err_reason is None and exit_code == expected
+        record: dict = {
+            "label": label,
+            "kind": "invocation",
+            "status": "passed" if passed else "failed",
+            "passed": passed,
+            "skipped": False,
+            "detail": (
+                None
+                if passed
+                else (err_reason or f"exit={exit_code}, expected={expected}")
+            ),
+            "args": str_args,
+            "exit": exit_code,
+            "wall_ms": wall_ms,
+            "stdout": stdout,
+            "stderr": stderr,
+            "json": parsed_json,
+        }
+        if extra:
+            record.update(extra)
+        if self.matches_filter(label):
+            self.results.append(record)
+            if not passed:
+                print(f"FAIL {label}: {record['detail']}")
+            self.save()
+        return record
+
+    def run_monitored(
+        self,
+        label: str,
+        *args: object,
+        expected: int = 0,
+        sample_path: Path | None = None,
+        sample_interval_ms: float = 25.0,
+        sample_process_rss: bool = False,
+        timeout: float | None = None,
+    ) -> dict:
+        """Run one command while polling a bundle file and/or the process working set.
+
+        `sample_path` is read (and JSON-parsed) every `sample_interval_ms`; the record
+        gains `samples`, `empty_reads`, `read_errors`, `parse_failures`, and
+        `distinct_hashes`. `sample_process_rss` records `peak_working_set_bytes` via the
+        Windows process API (None on other platforms).
+        """
+        str_args = [str(a) for a in args]
+        effective_timeout = self.timeout if timeout is None else timeout
+        interval = max(float(sample_interval_ms), 1.0) / 1000.0
+        samples = 0
+        empty_reads = 0
+        read_errors = 0
+        parse_failures = 0
+        distinct_hashes: set[str] = set()
+        read_errors_list: list[str] = []
+        peak_ws: int | None = None
+        rss_samples = 0
+        handle = None
+        err_reason: str | None = None
+        stdout = ""
+        stderr = ""
+        exit_code = -1
+        snapshot = self._snapshot_claudeignore()
+        out_file = tempfile.TemporaryFile()
+        err_file = tempfile.TemporaryFile()
+        started = time.perf_counter()
+        try:
+            try:
+                proc = subprocess.Popen(
+                    [str(self.bin_path), *str_args],
+                    cwd=self.out_dir,
+                    stdin=subprocess.DEVNULL,
+                    stdout=out_file,
+                    stderr=err_file,
+                )
+            except OSError as exc:
+                err_reason = f"Executable error ({self.bin_path}): {exc}"
+                proc = None
+            if proc is not None:
+                if sample_process_rss:
+                    handle = procs.open_process_handle(proc.pid)
+                deadline = started + effective_timeout
+                while proc.poll() is None:
+                    if time.perf_counter() > deadline:
+                        proc.kill()
+                        proc.wait()
+                        err_reason = f"Timed out after {effective_timeout}s"
+                        break
+                    if sample_path is not None:
+                        samples += 1
+                        raw = None
+                        last_error: OSError | None = None
+                        # A concurrent atomic rename can briefly deny or miss the target
+                        # name; retry immediately before treating it as a read failure.
+                        for attempt in range(3):
+                            try:
+                                raw = Path(sample_path).read_bytes()
+                                break
+                            except OSError as exc:
+                                last_error = exc
+                                if attempt < 2:
+                                    time.sleep(0.001)
+                        if raw is None:
+                            read_errors += 1
+                            if last_error is not None:
+                                read_errors_list.append(type(last_error).__name__)
+                        else:
+                            if not raw:
+                                empty_reads += 1
+                            else:
+                                distinct_hashes.add(
+                                    hashlib.sha256(raw).hexdigest()
+                                )
+                                try:
+                                    json.loads(raw.decode("utf-8"))
+                                except (ValueError, UnicodeDecodeError):
+                                    parse_failures += 1
+                    if handle is not None:
+                        rss_samples += 1
+                        working_set = procs.peak_working_set_bytes(handle)
+                        if working_set is not None and (
+                            peak_ws is None or working_set > peak_ws
+                        ):
+                            peak_ws = working_set
+                    time.sleep(interval)
+                exit_code = proc.returncode if proc.returncode is not None else -1
+            wall_ms = round((time.perf_counter() - started) * 1000, 2)
+            out_file.seek(0)
+            stdout = out_file.read().decode("utf-8", errors="replace")
+            err_file.seek(0)
+            stderr = err_file.read().decode("utf-8", errors="replace")
+        finally:
+            procs.close_process_handle(handle)
+            out_file.close()
+            err_file.close()
+            self._restore_claudeignore(snapshot)
+
+        try:
+            parsed_json = json.loads(stdout)
+        except ValueError:
+            parsed_json = None
+        extra: dict = {}
+        if sample_path is not None:
+            extra.update(
+                {
+                    "sample_path": str(sample_path),
+                    "samples": samples,
+                    "empty_reads": empty_reads,
+                    "read_errors": read_errors,
+                    "read_error_details": read_errors_list,
+                    "parse_failures": parse_failures,
+                    "distinct_hashes": len(distinct_hashes),
+                    "sample_hashes": sorted(distinct_hashes),
+                }
+            )
+        if sample_process_rss:
+            extra["peak_working_set_bytes"] = peak_ws
+            extra["rss_samples"] = rss_samples
+        return self._append_invocation(
+            label,
+            str_args,
+            exit_code,
+            wall_ms,
+            stdout,
+            stderr,
+            err_reason,
+            expected,
+            extra=extra,
+            parsed_json=parsed_json,
+        )
+
+    def run_many(
+        self,
+        items: list[tuple[str, list[object]]],
+        expected: int = 0,
+        timeout: float | None = None,
+    ) -> list[dict]:
+        """Launch every command at once (no wait between launches) and record each."""
+        effective_timeout = self.timeout if timeout is None else timeout
+        prepared = [(label, [str(a) for a in args]) for label, args in items]
+        snapshot = self._snapshot_claudeignore()
+        started = time.perf_counter()
+        deadline = started + effective_timeout
+        entries: list[dict] = []
+        try:
+            for label, str_args in prepared:
+                out_file = tempfile.TemporaryFile()
+                err_file = tempfile.TemporaryFile()
+                entry: dict = {
+                    "label": label,
+                    "args": str_args,
+                    "out": out_file,
+                    "err": err_file,
+                    "proc": None,
+                    "launched": time.perf_counter(),
+                    "finished": None,
+                    "err_reason": None,
+                }
+                try:
+                    entry["proc"] = subprocess.Popen(
+                        [str(self.bin_path), *str_args],
+                        cwd=self.out_dir,
+                        stdin=subprocess.DEVNULL,
+                        stdout=out_file,
+                        stderr=err_file,
+                    )
+                except OSError as exc:
+                    entry["err_reason"] = (
+                        f"Executable error ({self.bin_path}): {exc}"
+                    )
+                    entry["finished"] = time.perf_counter()
+                entries.append(entry)
+            while True:
+                pending = [
+                    entry
+                    for entry in entries
+                    if entry["proc"] is not None and entry["finished"] is None
+                ]
+                if not pending:
+                    break
+                now = time.perf_counter()
+                if now > deadline:
+                    for entry in pending:
+                        if entry["proc"].poll() is None:
+                            entry["proc"].kill()
+                        entry["err_reason"] = (
+                            f"Timed out after {effective_timeout}s"
+                        )
+                for entry in pending:
+                    if entry["proc"].poll() is not None:
+                        entry["finished"] = now
+                if pending:
+                    time.sleep(0.01)
+            for entry in entries:
+                if entry["proc"] is not None:
+                    entry["proc"].wait()
+        finally:
+            for entry in entries:
+                if entry.get("proc") is not None and entry.get("finished") is None:
+                    try:
+                        entry["proc"].kill()
+                    except OSError:
+                        pass
+                    try:
+                        entry["proc"].wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+            self._restore_claudeignore(snapshot)
+
+        records: list[dict] = []
+        for entry in entries:
+            out_file = entry["out"]
+            err_file = entry["err"]
+            out_file.seek(0)
+            stdout = out_file.read().decode("utf-8", errors="replace")
+            err_file.seek(0)
+            stderr = err_file.read().decode("utf-8", errors="replace")
+            out_file.close()
+            err_file.close()
+            proc = entry["proc"]
+            exit_code = (
+                proc.returncode if proc is not None and proc.returncode is not None else -1
+            )
+            finished = entry["finished"] or time.perf_counter()
+            wall_ms = round((finished - entry["launched"]) * 1000, 2)
+            try:
+                parsed_json = json.loads(stdout)
+            except ValueError:
+                parsed_json = None
+            records.append(
+                self._append_invocation(
+                    entry["label"],
+                    entry["args"],
+                    exit_code,
+                    wall_ms,
+                    stdout,
+                    stderr,
+                    entry["err_reason"],
+                    expected,
+                    parsed_json=parsed_json,
+                )
+            )
+        return records
 
     def run_hook(
         self,

@@ -1,0 +1,101 @@
+{
+  "description": "Timing budgets and scenario golden values for the qa perf, concurrency, and scale suites (Milestone 2 sync-performance contract).",
+  "perf": {
+    "copy_name": "smart_locker",
+    "target_file": "smart_locker/domain/identifiers.py",
+    "symbol": "pm_match_key",
+    "rename_prefix": "pm_match_q",
+    "expected_reparsed": 1,
+    "expected_reused": 122,
+    "budgets": {
+      "emit_ms": 50,
+      "total_ms": 100,
+      "spike_retry_ms": 150,
+      "warmup_rounds": 1,
+      "measured_rounds": 3,
+      "max_spike_retries": 2,
+      "settle_ms": 300
+    },
+    "docstring": {
+      "file": "smart_locker/database/models.py",
+      "type_name": "Device",
+      "old_text": "Physical device stored in the locker system.",
+      "new_text": "perf003 documentation revision token.",
+      "unchanged_tables": ["calls", "xref", "macros"],
+      "changed_table": "types"
+    },
+    "coordinate_shift": {
+      "file": "smart_locker/domain/identifiers.py",
+      "pad_lines": 5,
+      "pad_template": "# perf shift pad {n}",
+      "expected_tier": "coordinate_shift",
+      "expected_link_ms": 0,
+      "expected_graph_ms": 0
+    },
+    "threshold": {
+      "dir_name": "threshold",
+      "file_name": "threshold.py",
+      "symbol": "qa_threshold_target",
+      "comment_lines": 1394,
+      "comment_template": "# threshold padding line {n}",
+      "prepend_lines": 100,
+      "prepend_template": "# perf threshold pad {n}",
+      "function_lines": [
+        "def qa_threshold_target():",
+        "    total = 0",
+        "    total += 1",
+        "    return total"
+      ],
+      "expected_tier": "structural"
+    }
+  },
+  "concurrency": {
+    "target_file": "smart_locker/domain/identifiers.py",
+    "symbol": "pm_match_key",
+    "pipeline_symbol": "pm_match_pipe",
+    "locked_symbol": "pm_match_locked",
+    "hook_symbol": "pm_match_hook",
+    "wait_symbol": "pm_match_wait",
+    "stale_symbol": "pm_match_stale",
+    "sample_symbol_prefix": "pm_match_s",
+    "concurrent_symbol": "pm_match_conc",
+    "budgets": {
+      "background_wait_ms": 1500,
+      "explicit_wait_min_ms": 4500,
+      "explicit_wait_max_ms": 20000,
+      "stale_ensure_max_ms": 5000,
+      "stale_lock_age_s": 30,
+      "meta_sample_interval_ms": 5,
+      "meta_min_samples": 20,
+      "meta_rebuilds": 3,
+      "concurrent_processes": 5
+    }
+  },
+  "scale": {
+    "stm32_total_files": 12471,
+    "stm32_type_query": "GPIO_TypeDef",
+    "stm32_sym_query": "HAL_GPIO_Init",
+    "stm32_hal_gpio_file": "Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_gpio.c",
+    "stm32_reg_query": "GPIO_MODER",
+    "stm32_reg_prefix": "GPIO_MODER",
+    "stm32_xref_query": "GPIOA",
+    "lock_wait_s": 180,
+    "lock_stale_s": 1800,
+    "command_timeout_s": 300,
+    "budgets": {
+      "stm32_cold_total_ms": 40000,
+      "stm32_cold_link_ms": 14350,
+      "stm32_cold_emit_ms": 16450,
+      "stm32_peak_rss_bytes": 1610612736,
+      "stm32_warm_total_ms": 300,
+      "stm32_warm_scan_ms": 300,
+      "stm32_query_median_ms": 500,
+      "etl_link_ms": 17500,
+      "warm_runs": 3,
+      "query_runs": 3,
+      "query_limit": 10,
+      "rss_sample_interval_ms": 100,
+      "rss_min_samples": 10
+    }
+  }
+}
