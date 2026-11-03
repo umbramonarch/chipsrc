@@ -46,6 +46,64 @@ def _budget_timings(timings: dict[str, int], scale: dict) -> dict:
     }
 
 
+def _json_row_dicts(run: dict) -> list[dict]:
+    """Object rows from a query invocation whose stdout parsed as a non-empty JSON array."""
+    rows = run.get("json")
+    if not isinstance(rows, list) or not rows:
+        return []
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _type_response(run: dict, name: str) -> dict:
+    """Validate one `type <name> --json` response and summarise the matched struct row."""
+    rows = _json_row_dicts(run)
+    matched = [row for row in rows if row.get("name") == name]
+    fields_summary = matched[0].get("fields_summary") if matched else None
+    return {
+        "label": run["label"],
+        "exit": run["exit"],
+        "rows": len(rows),
+        "matched_rows": len(matched),
+        "file": matched[0].get("file") if matched else None,
+        "fields_summary": fields_summary,
+        "valid": run["exit"] == 0
+        and bool(rows)
+        and bool(matched)
+        and bool(str(fields_summary or "").strip()),
+    }
+
+
+def _sym_response(run: dict, name: str, expected_file: str) -> dict:
+    """Validate one `sym <name> --json` response and locate the expected defining file."""
+    rows = _json_row_dicts(run)
+    matched = [row for row in rows if row.get("name") == name]
+    files = sorted({row.get("file") for row in matched if row.get("file")})
+    return {
+        "label": run["label"],
+        "exit": run["exit"],
+        "rows": len(rows),
+        "matched_rows": len(matched),
+        "files": files,
+        "expected_file": expected_file,
+        "valid": run["exit"] == 0 and expected_file in files,
+    }
+
+
+def _reg_response(run: dict, prefix: str) -> dict:
+    """Validate one `reg <name> --json` response and locate matching macro rows."""
+    rows = _json_row_dicts(run)
+    names = [str(row.get("name", "")) for row in rows]
+    matched = [name for name in names if name.startswith(prefix)]
+    return {
+        "label": run["label"],
+        "exit": run["exit"],
+        "rows": len(rows),
+        "matched_rows": len(matched),
+        "names": names[:10],
+        "valid": run["exit"] == 0 and bool(rows) and bool(matched),
+    }
+
+
 def _run_stm32(ctx: HarnessContext, scale: dict) -> None:
     budgets = scale["budgets"]
     corpus = ctx.corpus_root / "STM32CubeF4"
@@ -189,7 +247,7 @@ def _run_stm32(ctx: HarnessContext, scale: dict) -> None:
         )
         for index in range(1, budgets["query_runs"] + 1)
     ]
-    ctx.run(
+    type_control = ctx.run(
         "scale: type GPIO_TypeDef no-sync control",
         "type",
         "-b",
@@ -200,14 +258,17 @@ def _run_stm32(ctx: HarnessContext, scale: dict) -> None:
         "--limit",
         limit,
     )
+    type_checks = [
+        _type_response(run, scale["stm32_type_query"])
+        for run in [*type_runs, type_control]
+    ]
     type_rows = ctx.exact(type_runs[-1]["json"], scale["stm32_type_query"])
     ctx.check(
         "scale: type GPIO_TypeDef returns struct rows with fields",
-        all(item["exit"] == 0 for item in type_runs)
-        and bool(type_rows)
-        and bool(type_rows[0].get("fields_summary")),
+        all(item["valid"] for item in type_checks),
         {
-            "rows": len(ctx.exact(type_runs[-1]["json"], scale["stm32_type_query"])),
+            "runs": type_checks,
+            "rows": len(type_rows),
             "file": type_rows[0].get("file") if type_rows else None,
             "fields_summary": type_rows[0].get("fields_summary") if type_rows else None,
         },
@@ -226,12 +287,16 @@ def _run_stm32(ctx: HarnessContext, scale: dict) -> None:
         )
         for index in range(1, budgets["query_runs"] + 1)
     ]
+    sym_checks = [
+        _sym_response(run, scale["stm32_sym_query"], scale["stm32_hal_gpio_file"])
+        for run in sym_runs
+    ]
     sym_rows = ctx.exact(sym_runs[-1]["json"], scale["stm32_sym_query"])
     ctx.check(
         "scale: sym HAL_GPIO_Init resolves in the HAL GPIO source",
-        all(item["exit"] == 0 for item in sym_runs)
-        and any(row.get("file") == scale["stm32_hal_gpio_file"] for row in sym_rows),
+        all(item["valid"] for item in sym_checks),
         {
+            "runs": sym_checks,
             "rows": len(sym_rows),
             "files": sorted({row.get("file") for row in sym_rows if row.get("file")}),
             "expected_file": scale["stm32_hal_gpio_file"],
@@ -251,15 +316,14 @@ def _run_stm32(ctx: HarnessContext, scale: dict) -> None:
         )
         for index in range(1, budgets["query_runs"] + 1)
     ]
+    reg_checks = [_reg_response(run, scale["stm32_reg_prefix"]) for run in reg_runs]
     reg_rows = reg_runs[-1]["json"] if isinstance(reg_runs[-1]["json"], list) else []
-    reg_prefix = scale["stm32_reg_prefix"]
     ctx.check(
         "scale: reg GPIO_MODER returns macro rows",
-        all(item["exit"] == 0 for item in reg_runs)
-        and any(str(row.get("name", "")).startswith(reg_prefix) for row in reg_rows),
+        all(item["valid"] for item in reg_checks),
         {
+            "runs": reg_checks,
             "rows": len(reg_rows),
-            "names": [row.get("name") for row in reg_rows[:10]],
         },
     )
 
@@ -300,9 +364,13 @@ def _run_stm32(ctx: HarnessContext, scale: dict) -> None:
         and len(status["json"]) == 1
         and status["json"][0].get("is_fresh") is True
     )
+    query_content_valid = all(
+        item["valid"] for item in [*type_checks, *sym_checks, *reg_checks]
+    )
     ctx.check(
         "scale: STM32 auto-sync query median within budget",
         all(item["exit"] == 0 for item in [*type_runs, *sym_runs, *reg_runs])
+        and query_content_valid
         and all(
             value < budgets["stm32_query_median_ms"] for value in medians.values()
         )
@@ -311,6 +379,7 @@ def _run_stm32(ctx: HarnessContext, scale: dict) -> None:
         {
             "medians_ms": medians,
             "budget_ms": budgets["stm32_query_median_ms"],
+            "content_valid": query_content_valid,
             "runs": {
                 "type": [item["wall_ms"] for item in type_runs],
                 "sym": [item["wall_ms"] for item in sym_runs],

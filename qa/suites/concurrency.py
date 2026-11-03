@@ -23,6 +23,7 @@ ASSERTION_LABELS = [
     "concurrency: stale lock is reclaimed by ensure",
     "concurrency: meta.json never observed torn during forced rebuilds",
     "concurrency: five concurrent ensure and five concurrent queries keep the bundle valid",
+    "concurrency: concurrent processes leave cache manifest and shards intact",
 ]
 
 ALL_LABELS = [
@@ -600,6 +601,15 @@ def _run_concurrent_processes(ctx: HarnessContext, conc: dict, budgets: dict) ->
         for md_file in procs.section_md_files(bundle)
     )
     artifacts = procs.missing_artifacts(bundle)
+    ctx.check(
+        "concurrency: concurrent processes leave cache manifest and shards intact",
+        not artifacts,
+        {
+            "missing_artifacts": artifacts,
+            "manifest_files": procs.manifest_file_count(bundle),
+            "exit_codes": [item["exit"] for item in records],
+        },
+    )
     leftovers = procs.find_leftovers(bundle)
     follow_up = ctx.run(
         "concurrency: follow-up ensure",

@@ -18,6 +18,8 @@ REQUIRED_ARTIFACTS = (
     "cache/manifest.json",
     *[f"index/{name}.tsv" for name in REQUIRED_TSVS],
 )
+MANIFEST_SCHEMA_VERSION = "2.1.0"
+INVALID_MANIFEST = "invalid cache/manifest.json"
 
 
 def parse_timings(stdout: str) -> dict[str, int]:
@@ -103,6 +105,39 @@ def _json_object(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _manifest_shard_problems(bundle: Path) -> list[str]:
+    """Validate `cache/manifest.json` schema and every shard it references.
+
+    Returns `[INVALID_MANIFEST]` for unparsable JSON, a wrong `schema_version`, a
+    missing/empty/non-object `files` map, or an entry without a shard path; otherwise
+    the bundle-relative paths of shards that are absent from disk. A missing or empty
+    manifest is already reported by the required-artifact loop.
+    """
+    manifest_path = bundle / "cache" / "manifest.json"
+    if not manifest_path.is_file() or manifest_path.stat().st_size == 0:
+        return []
+    manifest = _json_object(manifest_path)
+    if manifest is None or manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+        return [INVALID_MANIFEST]
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files:
+        return [INVALID_MANIFEST]
+    shards: set[str] = set()
+    for entry in files.values():
+        shard = entry.get("shard") if isinstance(entry, dict) else None
+        if not isinstance(shard, str) or not shard.strip():
+            return [INVALID_MANIFEST]
+        shards.add(shard.replace("\\", "/"))
+    return sorted(shard for shard in shards if not (bundle / shard).is_file())
+
+
+def manifest_file_count(bundle: Path) -> int:
+    """Number of `files` entries in a parseable `cache/manifest.json` (0 when absent)."""
+    manifest = _json_object(Path(bundle) / "cache" / "manifest.json")
+    files = manifest.get("files") if isinstance(manifest, dict) else None
+    return len(files) if isinstance(files, dict) else 0
+
+
 def missing_artifacts(bundle: Path) -> list[str]:
     """Missing, empty, or malformed required bundle artifacts (cheap stat/header reads)."""
     bundle = Path(bundle)
@@ -117,13 +152,7 @@ def missing_artifacts(bundle: Path) -> list[str]:
             problems.append(f"{rel} (missing header)")
     if (bundle / "meta.json").is_file() and _json_object(bundle / "meta.json") is None:
         problems.append("meta.json (invalid JSON)")
-    manifest = (
-        _json_object(bundle / "cache" / "manifest.json")
-        if (bundle / "cache" / "manifest.json").is_file()
-        else None
-    )
-    if manifest is not None and not isinstance(manifest.get("files"), dict):
-        problems.append("cache/manifest.json (missing files map)")
+    problems.extend(_manifest_shard_problems(bundle))
     for md_file in section_md_files(bundle):
         if not (bundle / "sections" / md_file).is_file():
             problems.append(f"sections/{md_file}")

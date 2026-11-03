@@ -6,14 +6,23 @@ a time (see ``library/user-testing.md``).  The scale suite claims the same direc
 before it starts a cold conversion and releases it when finished, so a harness run and
 a validator convert never overlap; when the guard is already held the suite records
 ``skipped`` assertions with the holder path instead of failing.
+
+Ownership safety: the claim writes ``owner.json`` (pid, per-process token, claim time)
+inside the lock directory.  Stale reclamation renames the directory to a unique
+``<lock>.stale.<uuid>`` sibling before deleting it, so a concurrent reclaimer can never
+``rmtree`` a replacement lock that another process created at the original path.
+``release()`` only removes the directory when ``owner.json`` still carries this
+guard's token.
 """
 from pathlib import Path
 import json
 import os
 import shutil
 import time
+import uuid
 
 LOCK_DIR_NAME = ".large-convert.lock"
+OWNER_FILE_NAME = "owner.json"
 
 
 def default_lock_path(corpus_root: Path) -> Path:
@@ -36,28 +45,82 @@ class LargeConvertLock:
         self.stale_seconds = float(stale_seconds)
         self.poll_seconds = max(float(poll_seconds), 0.05)
         self.owner = owner
+        self.token = uuid.uuid4().hex
         self._held = False
 
     def held(self) -> bool:
         return self._held
 
-    def _holder_age(self) -> float | None:
+    @staticmethod
+    def _read_owner_from(path: Path) -> dict | None:
         try:
-            return time.time() - self.path.stat().st_mtime
+            data = json.loads(
+                (Path(path) / OWNER_FILE_NAME).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _read_owner(self) -> dict | None:
+        return self._read_owner_from(self.path)
+
+    def _write_owner(self) -> bool:
+        try:
+            (self.path / OWNER_FILE_NAME).write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "token": self.token,
+                        "owner": self.owner,
+                        "created_ms": int(time.time() * 1000),
+                    }
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _path_age(path: Path) -> float | None:
+        """Age in seconds from ``owner.json.created_ms``, falling back to directory mtime."""
+        owner = LargeConvertLock._read_owner_from(path)
+        created_ms = owner.get("created_ms") if owner is not None else None
+        if isinstance(created_ms, (int, float)) and not isinstance(created_ms, bool):
+            return max(0.0, time.time() - float(created_ms) / 1000.0)
+        try:
+            return time.time() - Path(path).stat().st_mtime
         except OSError:
             return None
+
+    def _holder_age(self) -> float | None:
+        return self._path_age(self.path)
 
     def _reclaim_if_stale(self) -> bool:
         age = self._holder_age()
         if age is None or age <= self.stale_seconds:
             return False
-        if self.path.is_dir():
-            shutil.rmtree(self.path, ignore_errors=True)
-        else:
+        if not self.path.is_dir():
             try:
                 self.path.unlink()
             except OSError:
                 return False
+            return True
+        stale_path = self.path.with_name(f"{self.path.name}.stale.{uuid.uuid4().hex}")
+        try:
+            os.rename(self.path, stale_path)
+        except OSError:
+            return False
+        stale_age = self._path_age(stale_path)
+        if stale_age is not None and stale_age <= self.stale_seconds:
+            # A replacement lock claimed the path between our age check and the rename;
+            # restore it untouched instead of deleting a live lock.
+            try:
+                os.rename(stale_path, self.path)
+            except OSError:
+                pass
+            return False
+        shutil.rmtree(stale_path, ignore_errors=True)
         return True
 
     def acquire(self) -> tuple[bool, str]:
@@ -71,19 +134,13 @@ class LargeConvertLock:
             except OSError as exc:
                 return False, f"cannot claim large-convert guard {self.path}: {exc}"
             else:
-                try:
-                    (self.path / "owner.json").write_text(
-                        json.dumps(
-                            {
-                                "pid": os.getpid(),
-                                "owner": self.owner,
-                                "claimed_ms": int(time.time() * 1000),
-                            }
-                        ),
-                        encoding="utf-8",
+                if not self._write_owner():
+                    shutil.rmtree(self.path, ignore_errors=True)
+                    return (
+                        False,
+                        f"cannot write {OWNER_FILE_NAME} inside {self.path}; "
+                        "refusing to hold the large-convert guard",
                     )
-                except OSError:
-                    pass
                 self._held = True
                 return True, f"claimed {self.path}"
 
@@ -91,6 +148,15 @@ class LargeConvertLock:
                 continue
             age = self._holder_age()
             if age is None:
+                # The guard vanished or is unreadable mid-poll: retry, but never spin
+                # past the wait deadline.
+                if time.monotonic() >= deadline:
+                    return (
+                        False,
+                        f"cannot inspect large-convert guard {self.path}; "
+                        "skipping large-corpus budgets",
+                    )
+                time.sleep(self.poll_seconds)
                 continue
             if time.monotonic() >= deadline:
                 return (
@@ -103,5 +169,7 @@ class LargeConvertLock:
     def release(self) -> None:
         if not self._held:
             return
-        shutil.rmtree(self.path, ignore_errors=True)
+        owner = self._read_owner()
+        if owner is not None and owner.get("token") == self.token:
+            shutil.rmtree(self.path, ignore_errors=True)
         self._held = False
