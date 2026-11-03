@@ -169,6 +169,28 @@ pub fn resolve_and_link(
         per_symbol,
     };
 
+    // Structural call-noise pruning needs repository-wide name tables, so build them once before
+    // the parallel resolution pass. Test-scope symbols are excluded: a helper that only exists
+    // under test can never keep a production `logger.info`-style edge alive.
+    let mut defined_names: FxHashSet<&str> = FxHashSet::default();
+    let mut callable_names: FxHashSet<&str> = FxHashSet::default();
+    for sym in &symbols {
+        if sym.scope == FileScope::Test {
+            continue;
+        }
+        defined_names.insert(sym.name.as_str());
+        if matches!(
+            sym.kind,
+            SymbolKind::Function
+                | SymbolKind::Method
+                | SymbolKind::Constructor
+                | SymbolKind::Entrypoint
+                | SymbolKind::Isr
+        ) {
+            callable_names.insert(sym.name.as_str());
+        }
+    }
+
     let per_unit_results: Vec<(Vec<ResolvedCallEdge>, Vec<XrefEntry>, bool)> = units
         .par_iter()
         .map(|unit| {
@@ -256,12 +278,18 @@ pub fn resolve_and_link(
                 };
 
                 if tier == ResolutionTier::ExternalOrMacro
-                    && unit_language == LanguageKind::Rust
-                    && is_noisy_rust_external_call(
-                        raw.callee_name.as_str(),
+                    && (is_structural_call_noise(
+                        unit_language,
                         short_callee,
                         raw.receiver_or_qualifier.as_deref(),
-                    )
+                        &defined_names,
+                        &callable_names,
+                    ) || (unit_language == LanguageKind::Rust
+                        && is_noisy_rust_external_call(
+                            raw.callee_name.as_str(),
+                            short_callee,
+                            raw.receiver_or_qualifier.as_deref(),
+                        )))
                 {
                     continue;
                 }
@@ -1505,6 +1533,40 @@ const TREE_SITTER_METHODS: &[&str] = &[
     "id",
     "set_language",
 ];
+
+/// Structural call-noise pruning for sites that already failed to resolve (`ExternalOrMacro`).
+///
+/// Rule 1: a receiver/qualified call whose short name is defined by no non-Test symbol anywhere in
+/// the repository is third-party/stdlib noise (`logger.info`, `store.flush`, `console.log`).
+/// Rule 2: a bare Rust `PascalCase(...)` call that names no callable symbol is a constructor,
+/// enum variant, or std type path (`Wrapper(3)`, `Option`, `Reverse`).
+///
+/// Bare calls in other languages (C `malloc`, vendor HAL entry points) and bare lowercase Rust
+/// calls are never pruned by these rules; unresolved names that *do* exist in the repository keep
+/// their edges so `callees`/`xref` still show cross-module uses.
+fn is_structural_call_noise(
+    language: LanguageKind,
+    short_callee: &str,
+    receiver_or_qualifier: Option<&str>,
+    defined_names: &FxHashSet<&str>,
+    callable_names: &FxHashSet<&str>,
+) -> bool {
+    if receiver_or_qualifier.is_some() && !defined_names.contains(short_callee) {
+        return true;
+    }
+    language == LanguageKind::Rust
+        && receiver_or_qualifier.is_none()
+        && is_pascal_case_word(short_callee)
+        && !callable_names.contains(short_callee)
+}
+
+/// True when `name` starts with an ASCII uppercase letter and contains at least one ASCII
+/// lowercase letter (`Wrapper`, `ParserConfig`), distinguishing type-like constructor calls from
+/// all-caps constants (`MAX`, `GPIOA`) and lowercase functions.
+fn is_pascal_case_word(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_uppercase())
+        && name.bytes().any(|b| b.is_ascii_lowercase())
+}
 
 /// Returns `true` when an unresolved (`ExternalOrMacro`) call in a Rust file is a ubiquitous
 /// standard-library method/constructor/iterator/option operation (`clone`, `to_string`, `as_str`,
@@ -3081,6 +3143,243 @@ mod tests {
         let codec_edge = find_call(&calls, "encode_frame");
         assert_eq!(codec_edge.tier, ResolutionTier::UniqueGlobal);
         assert_eq!(codec_edge.callee_id, "scripts/codec.py::encode_frame");
+    }
+
+    fn sample_method(
+        file: &str,
+        name: &str,
+        enclosing_type: &str,
+        start_line: usize,
+        scope: FileScope,
+        layer: ArchLayer,
+        section_id: &str,
+    ) -> ExtractedSymbol {
+        let mut symbol = sample_symbol(file, name, start_line, scope, layer, section_id);
+        symbol.qualified_name = format!("{enclosing_type}::{name}");
+        symbol.kind = SymbolKind::Method;
+        symbol.enclosing_type = Some(enclosing_type.to_string());
+        symbol
+    }
+
+    fn callee_names(calls: &[ResolvedCallEdge]) -> BTreeSet<&str> {
+        calls.iter().map(|c| c.callee_name.as_str()).collect()
+    }
+
+    #[test]
+    fn prune_rule1_drops_qualified_calls_to_undefined_short_names() {
+        let unit_caller = sample_unit(
+            "app/uses.py",
+            FileScope::FirstParty,
+            ArchLayer::App,
+            LanguageKind::Python,
+            vec![sample_symbol(
+                "app/uses.py",
+                "run",
+                1,
+                FileScope::FirstParty,
+                ArchLayer::App,
+                "app",
+            )],
+            Vec::new(),
+            vec![
+                // Defined (in another language) => the name exists in the repository, keep the edge.
+                sample_call("app/uses.py", "run", 1, "commit", Some("store"), 2),
+                // Undefined receiver methods => structural noise.
+                sample_call("app/uses.py", "run", 1, "flush", Some("store"), 3),
+                sample_call("app/uses.py", "run", 1, "info", Some("logger"), 4),
+                // Bare builtins have no receiver => never pruned by rule 1.
+                sample_call("app/uses.py", "run", 1, "print", None, 5),
+                sample_call("app/uses.py", "run", 1, "len", None, 6),
+            ],
+        );
+        let unit_js = sample_unit(
+            "frontend/db.js",
+            FileScope::FirstParty,
+            ArchLayer::Libs,
+            LanguageKind::JavaScript,
+            vec![sample_symbol(
+                "frontend/db.js",
+                "commit",
+                3,
+                FileScope::FirstParty,
+                ArchLayer::Libs,
+                "frontend",
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+        let unit_c = sample_unit(
+            "hal/board.c",
+            FileScope::VendorSdk,
+            ArchLayer::VendorHal,
+            LanguageKind::C,
+            vec![sample_symbol(
+                "hal/board.c",
+                "board_entry",
+                2,
+                FileScope::VendorSdk,
+                ArchLayer::VendorHal,
+                "hal",
+            )],
+            Vec::new(),
+            vec![
+                sample_call("hal/board.c", "board_entry", 2, "vendor_undef", None, 2),
+                sample_call("hal/board.c", "board_entry", 2, "malloc", None, 2),
+            ],
+        );
+
+        let (_symbols, _types, _macros, calls, _xrefs, _vendor) =
+            resolve_and_link(&[unit_caller, unit_js, unit_c]);
+
+        assert_eq!(
+            callee_names(&calls),
+            BTreeSet::from(["commit", "len", "malloc", "print", "vendor_undef"]),
+            "rule 1 must drop only receiver calls to names defined nowhere: {calls:?}"
+        );
+        let commit = find_call(&calls, "commit");
+        assert_eq!(commit.tier, ResolutionTier::ExternalOrMacro);
+        assert_eq!(commit.callee_id, "external::commit");
+    }
+
+    #[test]
+    fn prune_rule2_drops_rust_bare_pascal_case_calls_but_keeps_callables() {
+        let unit_lib = sample_unit(
+            "src/lib.rs",
+            FileScope::FirstParty,
+            ArchLayer::Core,
+            LanguageKind::Rust,
+            vec![
+                sample_symbol(
+                    "src/lib.rs",
+                    "real_fn",
+                    1,
+                    FileScope::FirstParty,
+                    ArchLayer::Core,
+                    "src",
+                ),
+                sample_symbol(
+                    "src/lib.rs",
+                    "use_it",
+                    2,
+                    FileScope::FirstParty,
+                    ArchLayer::Core,
+                    "src",
+                ),
+            ],
+            Vec::new(),
+            vec![
+                // Bare PascalCase constructor with no callable definition => noise.
+                sample_call("src/lib.rs", "use_it", 2, "Wrapper", None, 2),
+                // Resolved same-file call stays resolved.
+                sample_call("src/lib.rs", "use_it", 2, "real_fn", None, 2),
+                // Bare lowercase unknown callable is not rule-2 noise.
+                sample_call("src/lib.rs", "use_it", 2, "helper_undefined", None, 2),
+                // PascalCase name defined as a callable function stays.
+                sample_call("src/lib.rs", "use_it", 2, "BuilderFactory", None, 2),
+                // Qualified variant path whose short name is defined nowhere => rule 1 noise.
+                sample_call(
+                    "src/lib.rs",
+                    "use_it",
+                    2,
+                    "ChipsrcError::ParserConfig",
+                    Some("ChipsrcError"),
+                    2,
+                ),
+                // Qualified path whose short name is defined stays external (rule 1 boundary).
+                sample_call(
+                    "src/lib.rs",
+                    "use_it",
+                    2,
+                    "Wrapper::assemble",
+                    Some("Wrapper"),
+                    2,
+                ),
+            ],
+        );
+        let unit_builder = sample_unit(
+            "src/builder.rs",
+            FileScope::FirstParty,
+            ArchLayer::Core,
+            LanguageKind::Rust,
+            vec![sample_symbol(
+                "src/builder.rs",
+                "BuilderFactory",
+                4,
+                FileScope::FirstParty,
+                ArchLayer::Core,
+                "src",
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+        let unit_container = sample_unit(
+            "src/model.rs",
+            FileScope::FirstParty,
+            ArchLayer::Domain,
+            LanguageKind::Rust,
+            vec![sample_method(
+                "src/model.rs",
+                "assemble",
+                "ConvertConfig",
+                10,
+                FileScope::FirstParty,
+                ArchLayer::Domain,
+                "src",
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+        let unit_py = sample_unit(
+            "script/tool.py",
+            FileScope::FirstParty,
+            ArchLayer::Libs,
+            LanguageKind::Python,
+            vec![sample_symbol(
+                "script/tool.py",
+                "run_tool",
+                1,
+                FileScope::FirstParty,
+                ArchLayer::Libs,
+                "script",
+            )],
+            Vec::new(),
+            vec![sample_call(
+                "script/tool.py",
+                "run_tool",
+                1,
+                "Store",
+                None,
+                2,
+            )],
+        );
+
+        let (_symbols, _types, _macros, calls, _xrefs, _vendor) =
+            resolve_and_link(&[unit_lib, unit_builder, unit_container, unit_py]);
+
+        assert_eq!(
+            callee_names(&calls),
+            BTreeSet::from([
+                "BuilderFactory",
+                "Store",
+                "Wrapper::assemble",
+                "helper_undefined",
+                "real_fn"
+            ]),
+            "rule 2 must drop only bare Rust PascalCase calls with no callable: {calls:?}"
+        );
+        assert_eq!(
+            find_call(&calls, "Wrapper::assemble").tier,
+            ResolutionTier::ExternalOrMacro
+        );
+        assert_eq!(
+            find_call(&calls, "BuilderFactory").tier,
+            ResolutionTier::UniqueGlobal
+        );
+        assert_eq!(
+            find_call(&calls, "Store").tier,
+            ResolutionTier::ExternalOrMacro,
+            "rule 2 applies to Rust only"
+        );
     }
 
     #[test]

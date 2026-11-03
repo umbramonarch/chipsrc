@@ -1248,3 +1248,110 @@ fn unicode_macro_name_query_never_panics() {
         );
     }
 }
+
+/// P2.1 (VAL-NOISE-007): a synthetic multi-language probe that pins both structural call-noise
+/// rules and their non-pruning boundaries through the real parsers.
+///
+/// Rule 1 drops unresolved receiver calls whose short name is defined by no non-Test symbol
+/// (`store.flush`, `logger.info`); rule 2 drops bare Rust `PascalCase(...)` constructor calls with
+/// no callable definition (`Wrapper`). Bare Python builtins, bare unqualified C calls, defined
+/// receiver methods, and already-resolved calls all survive.
+#[test]
+fn noise_probe_rules_end_to_end() {
+    let tmp = TestTempDir::new("noise_probe");
+    let repo_dir = tmp.0.join("noise-probe");
+    fs::create_dir_all(repo_dir.join("app")).expect("create app dir");
+    fs::create_dir_all(repo_dir.join("hal")).expect("create hal dir");
+    fs::create_dir_all(repo_dir.join("src")).expect("create src dir");
+
+    fs::write(
+        repo_dir.join("app/models.py"),
+        "class Store:\n    def commit(self):\n        return 1\n\ndef helper(value):\n    return value\n",
+    )
+    .expect("write models.py");
+    fs::write(
+        repo_dir.join("app/uses.py"),
+        "def run(store, logger):\n    store.commit()\n    store.flush()\n    logger.info(\"noise\")\n    helper(1)\n    print(\"builtin\")\n    len([1])\n",
+    )
+    .expect("write uses.py");
+    fs::write(
+        repo_dir.join("hal/board.c"),
+        "extern int vendor_undef(int);\nvoid board_entry(void) { vendor_undef(3); malloc(8); }\n",
+    )
+    .expect("write board.c");
+    fs::write(
+        repo_dir.join("src/lib.rs"),
+        "pub fn real_fn() -> u8 { 7 }\npub fn use_it() -> u8 { let wrapper = Wrapper(3); real_fn() }\n",
+    )
+    .expect("write lib.rs");
+
+    // `hal/` is detected as a vendor-HAL directory, so `--vendor-mode all` is required to parse
+    // it; the noise rules themselves are what this test pins.
+    let mut cfg = ConvertConfig::new(repo_dir.clone(), tmp.0.join("out"));
+    cfg.vendor_mode = VendorMode::All;
+    let bundle = convert_repo(&cfg).expect("convert noise probe");
+
+    let calls_tsv = fs::read_to_string(bundle.output_dir.join("index").join("calls.tsv"))
+        .expect("read calls.tsv");
+    let rows: Vec<Vec<&str>> = calls_tsv
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.split('\t').collect())
+        .collect();
+    let find = |file: &str, callee: &str| -> Option<&Vec<&str>> {
+        rows.iter().find(|row| row[4] == file && row[2] == callee)
+    };
+
+    // (1) Rust bare PascalCase constructor noise is pruned.
+    assert!(
+        find("src/lib.rs", "Wrapper").is_none(),
+        "rule 2 must drop the bare Rust `Wrapper(3)` constructor call"
+    );
+    // (2) Python receiver-method noise is pruned.
+    for callee in ["flush", "info"] {
+        assert!(
+            find("app/uses.py", callee).is_none(),
+            "rule 1 must drop the undefined receiver method `{callee}`"
+        );
+    }
+    // (3) Bare Python builtins stay as external edges.
+    for callee in ["print", "len"] {
+        let row = find("app/uses.py", callee)
+            .unwrap_or_else(|| panic!("bare Python builtin `{callee}` must be kept"));
+        assert_eq!(row[6], "external_or_macro");
+    }
+    // (4) Unqualified C externals stay untouched.
+    for callee in ["vendor_undef", "malloc"] {
+        let row = find("hal/board.c", callee)
+            .unwrap_or_else(|| panic!("unqualified C external `{callee}` must be kept"));
+        assert_eq!(row[6], "external_or_macro");
+    }
+    // (5) A receiver method whose name exists in the repository stays.
+    let commit = find("app/uses.py", "commit").expect("defined receiver method `commit` kept");
+    assert_eq!(commit[3], "app/models.py::Store::commit");
+    // (6) Resolved calls keep resolving.
+    assert_eq!(
+        find("app/uses.py", "helper").expect("helper resolved")[6],
+        "unique_global"
+    );
+    assert_eq!(
+        find("src/lib.rs", "real_fn").expect("real_fn resolved")[6],
+        "same_file"
+    );
+
+    // Baseline probe resolution ratio was 3 resolved / 10 edges = 0.375.
+    assert!(
+        bundle.sanity.call_resolution_ratio > 0.375,
+        "pruning must raise call_resolution_ratio, got {}",
+        bundle.sanity.call_resolution_ratio
+    );
+    assert!(
+        !bundle
+            .indexes
+            .xrefs
+            .iter()
+            .any(|x| x.category == "call" && x.symbol == "info"),
+        "pruned call must not leave an xref row behind"
+    );
+}

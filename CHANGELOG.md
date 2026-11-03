@@ -111,6 +111,13 @@ All notable changes to this project are listed here. Versions follow
   - Added per-file `file_stamps` in `meta.json` (`RepoMetadata`) so `auto_refresh_bundles` and `workspace_status` verify bundle freshness in `<2ms` without deserializing multi-megabyte `cache.json` files.
   - Added `-n` short alias for `--limit` across all query subcommands and `-S` / `--source` full-text source search in `chipsrc search`.
 
+### Changed
+
+- **Structural Call-Noise Pruning (`resolver.rs`)**:
+  - `resolver::resolve_and_link` now drops two classes of unresolved (`external_or_macro`) call edges using repository-wide name tables built once per link (non-Test symbols, all languages; callable kinds `fn`/`method`/`ctor`/`entrypoint`/`isr`): a receiver/qualified call whose short name is defined by no non-Test symbol (`logger.info`, `store.flush`, `console.log`) and a bare Rust `PascalCase(...)` call that names no callable symbol (`Wrapper(3)`, `Option`, `Reverse`). Resolved tiers (`same_file`, `import_resolved`, `unique_global`) are unchanged, and bare unqualified calls (`malloc`, vendor HAL entry points, Python builtins) are never pruned.
+  - Measured on the mission corpora: `chipsrc` external edges `2,178 → 1,075` (sanity `call_resolution_ratio` `0.528 → 0.693`), `smart_locker` `8,136 → 3,418` (`0.279 → 0.478`), `volt_website` `459 → 126` (`0.311 → 0.622`), `beautiful-embedded-c` `1,255 → 430` (`0.229 → 0.465`). All four keep an identical resolved-edge projection, no external row is invented, and every removed row satisfies one of the two predicates. `smart_locker`'s 119 `logger.info` edges disappear while every `pm_match_key` caller stays.
+  - Tests: `resolver::tests::prune_rule1_drops_qualified_calls_to_undefined_short_names`, `resolver::tests::prune_rule2_drops_rust_bare_pascal_case_calls_but_keeps_callables`, and the multi-language end-to-end `integration_tests::noise_probe_rules_end_to_end`.
+
 ### Fixed
 
 - **Platform-Qualified NTFS Handle-Locking Tests (SYNC-SCRUT-015) (`emitter.rs`, `qa/tests/test_lockguard.py`)**:
