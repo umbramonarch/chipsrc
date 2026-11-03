@@ -545,16 +545,102 @@ pub fn load_cache_manifest_any_version(bundle_dir: &Path) -> Option<CacheManifes
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Loads a single per-file AST cache shard (`cache/<blake3_hash>.json`) from `bundle_dir`.
+/// Parses the bytes of a cache shard: either one compact `ParsedFileUnit` (`cache/<key>.json`) or
+/// a packed JSON array of units (`cache/pack-<16hex>.json`).
+fn parse_cache_shard_units(bytes: &[u8]) -> Option<Vec<ParsedFileUnit>> {
+    let first = bytes.iter().copied().find(|b| !b.is_ascii_whitespace())?;
+    if first == b'[' {
+        serde_json::from_slice::<Vec<ParsedFileUnit>>(bytes).ok()
+    } else {
+        serde_json::from_slice::<ParsedFileUnit>(bytes)
+            .ok()
+            .map(|unit| vec![unit])
+    }
+}
+
+/// Loads every parsed unit stored in one cache shard (`cache/<key>.json` or a packed
+/// `cache/pack-<16hex>.json`) and restores its per-file fields.
 ///
 /// Shards store the owning path once (the unit's `scanned.rel_path`) and omit it from every
 /// symbol/type/macro/import/call/xref row, so the per-file fields are re-attached here.
+pub fn load_cache_shard_units(bundle_dir: &Path, shard_rel: &str) -> Option<Vec<ParsedFileUnit>> {
+    let bytes = fs::read(bundle_dir.join(shard_rel)).ok()?;
+    let mut units = parse_cache_shard_units(&bytes)?;
+    for unit in &mut units {
+        unit.restore_per_file_fields();
+    }
+    Some(units)
+}
+
+/// Loads a single per-file AST cache shard (`cache/<blake3_hash>.json`) from `bundle_dir`.
+///
+/// Packed shards hold several units; use [`load_cache_shard_unit`] or [`load_cache_units`] for
+/// those. A pack with exactly one unit is accepted here for convenience.
 pub fn load_cache_shard(bundle_dir: &Path, shard_rel: &str) -> Option<ParsedFileUnit> {
-    let shard_path = bundle_dir.join(shard_rel);
-    let bytes = fs::read(shard_path).ok()?;
-    let mut unit: ParsedFileUnit = serde_json::from_slice(&bytes).ok()?;
-    unit.restore_per_file_fields();
-    Some(unit)
+    let mut units = load_cache_shard_units(bundle_dir, shard_rel)?;
+    if units.len() == 1 {
+        units.pop()
+    } else {
+        None
+    }
+}
+
+/// Loads the unit named `rel_path` from `shard_rel`, which may be a per-file shard or a packed
+/// shard. Returns `None` when the shard is missing, unparsable, or does not contain that file.
+pub fn load_cache_shard_unit(
+    bundle_dir: &Path,
+    shard_rel: &str,
+    rel_path: &str,
+) -> Option<ParsedFileUnit> {
+    let mut units = load_cache_shard_units(bundle_dir, shard_rel)?;
+    let index = units
+        .iter()
+        .position(|unit| unit.scanned.rel_path == rel_path)?;
+    Some(units.swap_remove(index))
+}
+
+/// Loads the requested `(rel_path, shard_rel)` cache units, reading each shard file once even when
+/// it is a packed shard shared by many files. Units that are missing or unparsable are omitted so
+/// callers can fall back to reparsing those files.
+pub fn load_cache_units(
+    bundle_dir: &Path,
+    requests: &[(String, String)],
+) -> FxHashMap<String, ParsedFileUnit> {
+    let mut by_shard: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (rel_path, shard_rel) in requests {
+        by_shard
+            .entry(shard_rel.as_str())
+            .or_default()
+            .push(rel_path.as_str());
+    }
+    let shards: Vec<(&str, Vec<&str>)> = by_shard.into_iter().collect();
+    let loaded: Vec<Vec<(String, ParsedFileUnit)>> = shards
+        .par_iter()
+        .map(|(shard_rel, rel_paths)| {
+            let Some(units) = load_cache_shard_units(bundle_dir, shard_rel) else {
+                return Vec::new();
+            };
+            let mut wanted: FxHashSet<&str> = rel_paths.iter().copied().collect();
+            let mut out = Vec::with_capacity(rel_paths.len().min(units.len()));
+            for unit in units {
+                if wanted.remove(unit.scanned.rel_path.as_str()) {
+                    out.push((unit.scanned.rel_path.clone(), unit));
+                    if wanted.is_empty() {
+                        break;
+                    }
+                }
+            }
+            out
+        })
+        .collect();
+    let mut by_rel_path = FxHashMap::default();
+    by_rel_path.reserve(requests.len());
+    for batch in loaded {
+        for (rel_path, unit) in batch {
+            by_rel_path.insert(rel_path, unit);
+        }
+    }
+    by_rel_path
 }
 
 /// Returns `true` when `bundle_dir` has a valid `cache/manifest.json` matching `CACHE_SCHEMA_VERSION`.
@@ -772,20 +858,16 @@ pub fn bundle_artifacts_complete_with(
 /// (schema `2.1.0`).
 pub fn load_cache_file(bundle_dir: &Path) -> Option<IncrementalAstCache> {
     if let Some(manifest) = load_cache_manifest(bundle_dir) {
-        let entries: Vec<(&String, &crate::model::CacheShardEntry)> =
-            manifest.files.iter().collect();
-        let loaded_units: Vec<Option<(String, ParsedFileUnit)>> = entries
-            .into_par_iter()
-            .map(|(rel_path, entry)| {
-                load_cache_shard(bundle_dir, &entry.shard)
-                    .filter(|u| u.scanned.rel_path == **rel_path)
-                    .map(|u| (rel_path.clone(), u))
-            })
+        let requests: Vec<(String, String)> = manifest
+            .files
+            .iter()
+            .map(|(rel_path, entry)| (rel_path.clone(), entry.shard.clone()))
             .collect();
+        let mut loaded = load_cache_units(bundle_dir, &requests);
         let mut files = BTreeMap::new();
-        for item in loaded_units {
-            let (rel_path, unit) = item?;
-            files.insert(rel_path, unit);
+        for rel_path in manifest.files.keys() {
+            let unit = loaded.remove(rel_path)?;
+            files.insert(rel_path.clone(), unit);
         }
         return Some(IncrementalAstCache {
             schema_version: manifest.schema_version,
@@ -2626,5 +2708,89 @@ mod tests {
             CacheShardEntry::shard_key("alpha/mod.py", content_hash),
             key_alpha
         );
+    }
+
+    #[test]
+    fn test_packed_cache_shard_loader_reads_each_pack_once_and_restores_fields() {
+        use crate::model::{
+            ArchLayer, ExtractedSymbol, FileScope, LanguageKind, ParsedFileUnit, ScannedFile,
+            SymbolKind, Visibility,
+        };
+
+        let tmp = std::env::temp_dir().join(format!(
+            "chipsrc_scanner_pack_{}_{}",
+            std::process::id(),
+            "load"
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cache_dir = tmp.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        fn make_unit(rel_path: &str, symbol: &str) -> ParsedFileUnit {
+            ParsedFileUnit {
+                scanned: ScannedFile {
+                    rel_path: rel_path.to_string(),
+                    abs_path: std::path::PathBuf::from(rel_path),
+                    language: LanguageKind::Python,
+                    scope: FileScope::FirstParty,
+                    arch_layer: ArchLayer::Domain,
+                    size_bytes: 32,
+                    mtime_secs: 1,
+                    mtime_nanos: 0,
+                    blake3_hash: format!("{rel_path}-hash"),
+                    line_count: 2,
+                },
+                symbols: vec![ExtractedSymbol {
+                    symbol_id: format!("{rel_path}::{symbol}"),
+                    name: symbol.to_string(),
+                    qualified_name: symbol.to_string(),
+                    kind: SymbolKind::Function,
+                    visibility: Visibility::Public,
+                    file: rel_path.to_string(),
+                    start_line: 1,
+                    end_line: 2,
+                    signature: format!("def {symbol}():"),
+                    doc_summary: String::new(),
+                    enclosing_type: None,
+                    scope: FileScope::FirstParty,
+                    arch_layer: ArchLayer::Domain,
+                    section_id: "mod".to_string(),
+                }],
+                types: Vec::new(),
+                macros: Vec::new(),
+                imports: Vec::new(),
+                raw_calls: Vec::new(),
+                raw_xrefs: Vec::new(),
+                parse_errors: 0,
+            }
+        }
+
+        let units = vec![
+            make_unit("alpha/mod.py", "alpha_probe"),
+            make_unit("beta/mod.py", "beta_probe"),
+            make_unit("gamma/mod.py", "gamma_probe"),
+        ];
+        let pack_name = "pack-0123456789abcdef.json";
+        let pack_rel = format!("cache/{pack_name}");
+        let json = serde_json::to_string(&units).unwrap();
+        std::fs::write(cache_dir.join(pack_name), json).unwrap();
+
+        // A multi-unit pack is not a single shard; the unit-aware loaders must be used.
+        assert!(load_cache_shard(&tmp, &pack_rel).is_none());
+        let loaded = load_cache_shard_unit(&tmp, &pack_rel, "beta/mod.py").expect("packed unit");
+        assert_eq!(loaded.symbols[0].file, "beta/mod.py");
+        assert_eq!(loaded.symbols[0].symbol_id, "beta/mod.py::beta_probe");
+
+        let requests = vec![
+            ("alpha/mod.py".to_string(), pack_rel.clone()),
+            ("gamma/mod.py".to_string(), pack_rel.clone()),
+        ];
+        let mut by_path = load_cache_units(&tmp, &requests);
+        assert_eq!(by_path.len(), 2);
+        let gamma = by_path.remove("gamma/mod.py").expect("gamma unit");
+        assert_eq!(gamma.symbols[0].name, "gamma_probe");
+        assert_eq!(gamma.symbols[0].file, "gamma/mod.py");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

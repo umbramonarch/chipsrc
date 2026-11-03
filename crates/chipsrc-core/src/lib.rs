@@ -1004,10 +1004,11 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
             let mut dirty_files = Vec::new();
             let mut clean_files = Vec::new();
             for f in &scanned_files {
-                let expected_shard = CacheShardEntry::shard_rel_path(&f.rel_path, &f.blake3_hash);
+                // Layout-independent: the unit's content hash is authoritative, so a bundle
+                // migrating from per-file shards to packs still reuses its parsed units (the
+                // emitter re-packs them canonically) instead of reparsing every file.
                 let reusable = manifest.files.get(&f.rel_path).is_some_and(|entry| {
                     entry.blake3_hash == f.blake3_hash
-                        && entry.shard == expected_shard
                         && prev_stamp_map
                             .get(f.rel_path.as_str())
                             .is_none_or(|s| s.scope == f.scope && s.arch_layer == f.arch_layer)
@@ -1024,6 +1025,20 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                 None,
                 blueprint_opt.as_ref().map(|(bp, _)| bp),
             )?;
+
+            // Load the previous unit of every dirty file once: a packed shard may hold several
+            // dirty files, and the digest check, the digest-noop tier, and Tier 3 all need them.
+            let dirty_requests: Vec<(String, String)> = dirty_units
+                .iter()
+                .filter_map(|u| {
+                    manifest
+                        .files
+                        .get(&u.scanned.rel_path)
+                        .map(|entry| (u.scanned.rel_path.clone(), entry.shard.clone()))
+                })
+                .collect();
+            let mut old_dirty_units_by_path =
+                scanner::load_cache_units(&config.output_dir, &dirty_requests);
 
             // Check Structural Digest No-Op Short-Circuit when no files were added/deleted
             let digest_and_coords_unchanged = !dirty_units.is_empty()
@@ -1042,10 +1057,11 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                                             && s.arch_layer == u.scanned.arch_layer
                                     },
                                 )
-                                && scanner::load_cache_shard(&config.output_dir, &entry.shard)
+                                && old_dirty_units_by_path
+                                    .get(&u.scanned.rel_path)
                                     .is_some_and(|old_u| {
                                         old_u.scanned.rel_path == u.scanned.rel_path
-                                            && units_have_identical_coordinates(&old_u, u)
+                                            && units_have_identical_coordinates(old_u, u)
                                     })
                         })
                 });
@@ -1059,34 +1075,19 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                 && line_counts_unchanged
                 && scanner::bundle_artifacts_complete(&config.output_dir);
 
-            if can_short_circuit {
+            if can_short_circuit
+                && emitter::rewrite_cache_shards_for_dirty_units(
+                    &config.output_dir,
+                    &mut manifest,
+                    &dirty_units,
+                )?
+            {
                 let parse_ms = t_parse.elapsed().as_millis() as u64;
                 let t_emit = Instant::now();
-                let mut existing_meta = existing_meta_opt.unwrap();
+                let mut existing_meta = existing_meta_opt.take().unwrap();
                 let cache_dir = config.output_dir.join("cache");
                 let _ = fs::create_dir_all(&cache_dir);
 
-                for u in &dirty_units {
-                    let new_hash = &u.scanned.blake3_hash;
-                    let new_shard_key = CacheShardEntry::shard_key(&u.scanned.rel_path, new_hash);
-                    let new_shard_rel = format!("cache/{new_shard_key}.json");
-                    let new_shard_path = cache_dir.join(format!("{new_shard_key}.json"));
-                    if let Some(packet) = emitter::prepare_cache_shard(u) {
-                        let _ =
-                            emitter::write_bytes_atomic(&new_shard_path, packet.json.as_bytes());
-                    }
-                    if let Some(old_entry) = manifest.files.get_mut(&u.scanned.rel_path) {
-                        let old_shard = old_entry.shard.clone();
-                        old_entry.blake3_hash = new_hash.clone();
-                        old_entry.shard = new_shard_rel.clone();
-                        old_entry.structural_digest = u.structural_digest();
-                        if old_shard != new_shard_rel
-                            && !manifest.files.values().any(|e| e.shard == old_shard)
-                        {
-                            let _ = fs::remove_file(config.output_dir.join(&old_shard));
-                        }
-                    }
-                }
                 manifest.fingerprint = fingerprint.clone();
                 if let Ok(m_bytes) = serde_json::to_vec(&manifest) {
                     let _ = emitter::write_bytes_atomic(&cache_dir.join("manifest.json"), &m_bytes);
@@ -1144,41 +1145,66 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                     claudeignore_updated,
                 });
             }
+            // A packed shard could not be read (missing/corrupt): fall through to the structural
+            // path, which reparses and re-emits the whole bundle.
 
-            // Load clean shards in parallel; re-parse any missing shard seamlessly
+            // Load clean shards (each packed shard once) and re-parse any missing shard seamlessly.
+            let requests: Vec<(String, String)> = clean_files
+                .iter()
+                .filter_map(|file| {
+                    manifest
+                        .files
+                        .get(&file.rel_path)
+                        .map(|entry| (file.rel_path.clone(), entry.shard.clone()))
+                })
+                .collect();
+            let mut cached_units = scanner::load_cache_units(&config.output_dir, &requests);
+            let mut cached_slots: Vec<Option<ParsedFileUnit>> =
+                Vec::with_capacity(clean_files.len());
+            let mut to_reparse: Vec<ScannedFile> = Vec::new();
+            for file in clean_files {
+                match cached_units.remove(&file.rel_path) {
+                    Some(mut cached)
+                        if cached.scanned.rel_path == file.rel_path
+                            && cached.scanned.blake3_hash == file.blake3_hash =>
+                    {
+                        cached.scanned = file;
+                        cached_slots.push(Some(cached));
+                    }
+                    _ => {
+                        to_reparse.push(file);
+                        cached_slots.push(None);
+                    }
+                }
+            }
             let bp_ref = blueprint_opt.as_ref().map(|(bp, _)| bp);
-            let clean_results: Vec<Result<(ParsedFileUnit, bool)>> = clean_files
+            let reparsed: Vec<ParsedFileUnit> = to_reparse
                 .into_par_iter()
                 .map(|file| {
-                    if let Some(entry) = manifest.files.get(&file.rel_path) {
-                        if let Some(mut cached) =
-                            scanner::load_cache_shard(&config.output_dir, &entry.shard)
-                                .filter(|u| u.scanned.rel_path == file.rel_path)
-                        {
-                            cached.scanned = file;
-                            return Ok((cached, true));
-                        }
-                    }
                     let (mut parsed, _, _) = parser::parse_files_incremental_with_blueprint(
                         std::slice::from_ref(&file),
                         None,
                         bp_ref,
                     )?;
-                    Ok((parsed.pop().unwrap(), false))
+                    Ok(parsed.pop().unwrap())
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             let mut all_units = Vec::with_capacity(scanned_files.len());
             let mut reused_count = 0usize;
             let mut actual_reparsed = reparsed_count;
-            for res in clean_results {
-                let (u, was_reused) = res?;
-                if was_reused {
-                    reused_count += 1;
-                } else {
-                    actual_reparsed += 1;
+            let mut reparsed_iter = reparsed.into_iter();
+            for slot in cached_slots {
+                match slot {
+                    Some(unit) => {
+                        reused_count += 1;
+                        all_units.push(unit);
+                    }
+                    None => {
+                        actual_reparsed += 1;
+                        all_units.push(reparsed_iter.next().unwrap());
+                    }
                 }
-                all_units.push(u);
             }
             all_units.extend(dirty_units.iter().cloned());
             all_units.sort_by(|a, b| a.scanned.rel_path.cmp(&b.scanned.rel_path));
@@ -1192,16 +1218,11 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                     Vec::with_capacity(dirty_units.len());
                 let mut old_dirty_complete = true;
                 for unit in &dirty_units {
-                    match manifest
-                        .files
-                        .get(&unit.scanned.rel_path)
-                        .and_then(|entry| {
-                            scanner::load_cache_shard(&config.output_dir, &entry.shard)
-                        })
-                        .filter(|old| old.scanned.rel_path == unit.scanned.rel_path)
-                    {
-                        Some(old) => old_dirty_units.push(old),
-                        None => {
+                    match old_dirty_units_by_path.remove(&unit.scanned.rel_path) {
+                        Some(old) if old.scanned.rel_path == unit.scanned.rel_path => {
+                            old_dirty_units.push(old)
+                        }
+                        _ => {
                             old_dirty_complete = false;
                             break;
                         }

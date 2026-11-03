@@ -3365,20 +3365,28 @@ mod tests {
 
     #[test]
     fn line_contains_hex_digits_ignores_underscores_and_case() {
-        let digits = |s: &str| s.as_bytes().to_vec();
+        fn hex_digits(text: &str) -> Vec<u8> {
+            text.as_bytes().to_vec()
+        }
         assert!(line_contains_hex_digits(
             b"0x41C0_0004UL\tx",
-            &digits("41C00004")
+            &hex_digits("41C00004")
         ));
-        assert!(line_contains_hex_digits(b"0x40020000", &digits("40020000")));
-        assert!(line_contains_hex_digits(b"0x0004", &digits("4")));
-        assert!(!line_contains_hex_digits(b"0x0004", &digits("400")));
-        assert!(!line_contains_hex_digits(b"timeout", &digits("E0")));
-        assert!(!line_contains_hex_digits(b"", &digits("0")));
-        assert!(line_contains_hex_digits(b"DEAD_BEEF", &digits("DEADBEEF")));
+        assert!(line_contains_hex_digits(
+            b"0x40020000",
+            &hex_digits("40020000")
+        ));
+        assert!(line_contains_hex_digits(b"0x0004", &hex_digits("4")));
+        assert!(!line_contains_hex_digits(b"0x0004", &hex_digits("400")));
+        assert!(!line_contains_hex_digits(b"timeout", &hex_digits("E0")));
+        assert!(!line_contains_hex_digits(b"", &hex_digits("0")));
+        assert!(line_contains_hex_digits(
+            b"DEAD_BEEF",
+            &hex_digits("DEADBEEF")
+        ));
         assert!(!line_contains_hex_digits(
             b"DEAD_BEEF",
-            &digits("DEADBEEF00")
+            &hex_digits("DEADBEEF00")
         ));
     }
 

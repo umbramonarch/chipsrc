@@ -2,8 +2,8 @@ use crate::error::{ChipsrcError, Result};
 use crate::model::{
     ArchLayer, BundleIndexes, CacheManifest, CacheShardEntry, ConvertConfig, ExtractedType,
     FileScope, GraphStateFile, GraphSymbolRef, IncrementalAstCache, ParsedFileUnit, RankedSymbol,
-    RepoMetadata, SanityReport, SectionShard, SymbolGraphState, SymbolKind, TypeKind, VendorMode,
-    Visibility, CACHE_SCHEMA_VERSION, GRAPH_STATE_FILE,
+    RepoMetadata, ResolvedCallEdge, SanityReport, SectionShard, SymbolGraphState, SymbolKind,
+    TypeKind, VendorMode, Visibility, XrefEntry, CACHE_SCHEMA_VERSION, GRAPH_STATE_FILE,
 };
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -222,18 +222,35 @@ fn rename_with_retry(tmp_path: &Path, path: &Path) -> Result<()> {
     ))
 }
 
-/// Bytes of row text accumulated before a streamed table is flushed to disk.
+/// Bytes of row text accumulated before a streamed table is flushed to its target.
 const STREAM_ROW_BUFFER_BYTES: usize = 1 << 20;
+
+/// Largest existing table that is re-rendered in memory and compared byte-for-byte with
+/// [`write_bytes_atomic`]. Above this size the table streams straight into a `.tmp` file so a
+/// multi-hundred-megabyte `xref.tsv` never has to exist in memory.
+const IN_MEMORY_STREAM_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Where a streamed table's rows go.
+enum RowTarget<'a> {
+    /// Direct `.tmp` file streaming (new or very large targets).
+    File {
+        out: &'a mut HashingWriter<std::io::BufWriter<fs::File>>,
+        path: &'a Path,
+    },
+    /// In-memory rendering for small existing targets, handed to [`write_bytes_atomic`] which
+    /// compares against the file on disk and skips the write when it is unchanged.
+    Memory { bytes: &'a mut Vec<u8> },
+}
 
 /// Streaming table writer: callers append rows to [`Self::rows`] and call [`Self::flush_if_full`]
 /// after each row, so a multi-hundred-megabyte table never has to exist in memory.
 struct RowSink<'a> {
-    out: &'a mut HashingWriter<std::io::BufWriter<fs::File>>,
-    path: &'a Path,
+    target: RowTarget<'a>,
     buf: String,
+    path: &'a Path,
 }
 
-/// Appends `bytes` to `sink`'s buffered output, keeping the running hash and length in sync.
+/// Appends `bytes` to the row target, keeping the running hash and length in sync.
 fn sink_write(
     out: &mut HashingWriter<std::io::BufWriter<fs::File>>,
     path: &Path,
@@ -249,6 +266,16 @@ fn sink_write(
     Ok(())
 }
 
+fn target_write(target: &mut RowTarget<'_>, bytes: &[u8]) -> Result<()> {
+    match target {
+        RowTarget::File { out, path } => sink_write(out, path, bytes),
+        RowTarget::Memory { bytes: buf } => {
+            buf.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+}
+
 impl<'a> RowSink<'a> {
     fn rows(&mut self) -> &mut String {
         &mut self.buf
@@ -256,21 +283,22 @@ impl<'a> RowSink<'a> {
 
     fn flush_if_full(&mut self) -> Result<()> {
         if self.buf.len() >= STREAM_ROW_BUFFER_BYTES {
-            let bytes = self.buf.as_bytes();
-            sink_write(self.out, self.path, bytes)?;
+            target_write(&mut self.target, self.buf.as_bytes())?;
             self.buf.clear();
         }
         Ok(())
     }
 
     fn finish(&mut self) -> Result<()> {
-        let bytes = self.buf.as_bytes();
-        sink_write(self.out, self.path, bytes)?;
+        target_write(&mut self.target, self.buf.as_bytes())?;
         self.buf.clear();
-        self.out
-            .inner
-            .flush()
-            .map_err(|e| ChipsrcError::io(self.path, e))
+        match &mut self.target {
+            RowTarget::File { out, .. } => out
+                .inner
+                .flush()
+                .map_err(|e| ChipsrcError::io(self.path, e)),
+            RowTarget::Memory { .. } => Ok(()),
+        }
     }
 }
 
@@ -295,6 +323,24 @@ where
         .ok()
         .filter(|m| m.is_file())
         .map(|m| m.len());
+
+    // A small table that already exists is rendered in memory and compared by
+    // `write_bytes_atomic`: on an incremental edit the result is byte-identical, so no `.tmp`
+    // file is written, renamed, or compared on disk. A brand-new table or a very large one keeps
+    // streaming straight to a `.tmp` file.
+    if let Some(len) = existing_len.filter(|len| *len <= IN_MEMORY_STREAM_MAX_BYTES) {
+        let mut bytes: Vec<u8> = Vec::with_capacity(len as usize + 4096);
+        {
+            let mut sink = RowSink {
+                target: RowTarget::Memory { bytes: &mut bytes },
+                buf: String::with_capacity(STREAM_ROW_BUFFER_BYTES + 4096),
+                path,
+            };
+            build(&mut sink).and_then(|()| sink.finish())?;
+        }
+        return write_bytes_atomic(path, &bytes);
+    }
+
     let tmp_path = temp_sibling_path(path);
     let hashing = match fs::File::create(&tmp_path) {
         Ok(file) => HashingWriter {
@@ -307,9 +353,12 @@ where
     let mut hashing = hashing;
     {
         let mut sink = RowSink {
-            out: &mut hashing,
-            path,
+            target: RowTarget::File {
+                out: &mut hashing,
+                path,
+            },
             buf: String::with_capacity(STREAM_ROW_BUFFER_BYTES + 4096),
+            path,
         };
         build(&mut sink).and_then(|()| sink.finish())?;
     }
@@ -534,6 +583,36 @@ pub fn ensure_claudeignore_entry(repo_path: &Path, output_root: &Path) -> Result
     Ok(true)
 }
 
+/// Returns `true` when every `index/*.tsv` already exists and is small enough that a rebuild is
+/// rendered in memory and compared against the file on disk (the incremental-sync steady state).
+fn index_tables_parallelizable(index_dir: &Path) -> bool {
+    const TABLES: [&str; 6] = [
+        "xref.tsv",
+        "calls.tsv",
+        "symbols.tsv",
+        "types.tsv",
+        "macros.tsv",
+        "sections.tsv",
+    ];
+    TABLES.iter().all(|name| {
+        fs::metadata(index_dir.join(name))
+            .is_ok_and(|meta| meta.is_file() && meta.len() <= IN_MEMORY_STREAM_MAX_BYTES)
+    })
+}
+
+/// Converts an emitter worker thread join result into the bundle's typed I/O error.
+fn join_emit_worker(
+    joined: std::thread::Result<Result<()>>,
+    index_dir: &Path,
+) -> Result<Result<()>> {
+    joined.map_err(|_| {
+        ChipsrcError::io(
+            index_dir,
+            std::io::Error::other("bundle emitter worker thread panicked"),
+        )
+    })
+}
+
 /// Where `emit_bundle` gets its per-file cache shards.
 pub enum CacheShardSource<'a> {
     /// A worker thread already serialized every unit's shard; the manifest is emitted from these
@@ -605,20 +684,57 @@ pub fn emit_bundle(
 
     // 1. Stream every generated table straight to disk. A 12k-file bundle produces ~480 MB of TSV
     //    text, so no table is ever materialized in memory.
-    //    Write largest-first on a single thread: parallel streams do not help on a rotational disk
-    //    (they only add seeks), and the CPU-side formatting is cheap compared to the I/O.
-    write_xref_tsv_file(&index_dir, indexes)?;
-    write_small_tsv_files(&index_dir, indexes)?;
-    write_calls_tsv_file(&index_dir, indexes)?;
-    write_index_and_sections(
-        config,
-        metadata,
-        sanity,
-        sections,
-        indexes,
-        &sections_dir,
-        &existing_md,
-    )?;
+    //    Cold builds write largest-first on a single thread: parallel streams do not help on a
+    //    rotational disk (they only add seeks), and the CPU-side formatting is cheap next to the
+    //    I/O. Incremental syncs rebuild the same files concurrently instead (see below).
+    let parallel_tables = index_tables_parallelizable(&index_dir);
+    if parallel_tables {
+        // Incremental sync: every table already exists and fits in memory, so it is re-rendered
+        // in memory and compared against the file on disk. Their (pure CPU) formatting is
+        // independent of each other, of the Markdown docs, and of the linked-graph state, so
+        // concurrent rebuilds keep it off the critical path. Cold builds and large corpora keep
+        // the single ordered stream, where disk seeks dominate.
+        std::thread::scope(|scope| -> Result<()> {
+            let xref = scope.spawn(|| write_xref_tsv_in_memory(&index_dir, indexes));
+            let calls = scope.spawn(|| write_calls_tsv_in_memory(&index_dir, indexes));
+            let small = scope.spawn(|| write_small_tsv_files(&index_dir, indexes));
+            let docs = scope.spawn(|| {
+                write_index_and_sections(
+                    config,
+                    metadata,
+                    sanity,
+                    sections,
+                    indexes,
+                    &sections_dir,
+                    &existing_md,
+                )
+            });
+            let graph = scope.spawn(|| {
+                let graph_state =
+                    build_graph_state(indexes, &metadata.fingerprint, metadata.vendor_mode);
+                emit_graph_state(output_dir, &graph_state)
+            });
+            join_emit_worker(xref.join(), &index_dir)??;
+            join_emit_worker(calls.join(), &index_dir)??;
+            join_emit_worker(small.join(), &index_dir)??;
+            join_emit_worker(docs.join(), &index_dir)??;
+            join_emit_worker(graph.join(), &index_dir)??;
+            Ok(())
+        })?;
+    } else {
+        write_xref_tsv_file(&index_dir, indexes)?;
+        write_small_tsv_files(&index_dir, indexes)?;
+        write_calls_tsv_file(&index_dir, indexes)?;
+        write_index_and_sections(
+            config,
+            metadata,
+            sanity,
+            sections,
+            indexes,
+            &sections_dir,
+            &existing_md,
+        )?;
+    }
 
     // Optional <repo_name>.md if config.single_file is true
     if config.single_file {
@@ -634,11 +750,13 @@ pub fn emit_bundle(
         write_file(&single_path, &combined)?;
     }
 
-    // Persist the compact linked-graph state used by the coordinate-shift tier. Written last so
-    // it always describes the bundle that is on disk; a missing/corrupt file only disables the
-    // fast path (callers fall back to a full rebuild).
-    let graph_state = build_graph_state(indexes, &metadata.fingerprint, metadata.vendor_mode);
-    emit_graph_state(output_dir, &graph_state)?;
+    // Persist the compact linked-graph state used by the coordinate-shift tier. Cold builds write
+    // it after the tables it describes; the incremental path wrote it alongside them. A
+    // missing/corrupt file only disables the fast path (callers fall back to a full rebuild).
+    if !parallel_tables {
+        let graph_state = build_graph_state(indexes, &metadata.fingerprint, metadata.vendor_mode);
+        emit_graph_state(output_dir, &graph_state)?;
+    }
 
     // The per-file AST cache is already on disk (the writer thread has been joined by the caller);
     // emit the manifest from the identities it recorded, or serialize the units here when the
@@ -727,63 +845,118 @@ pub fn load_graph_state(bundle_dir: &Path) -> Option<GraphStateFile> {
     serde_json::from_slice(&bytes).ok()
 }
 
+const CALLS_TSV_HEADER: &str =
+    "caller_id\tcaller_name\tcallee_name\tcallee_id\tfile\tline\ttier\tsection_id\n";
+const XREF_TSV_HEADER: &str =
+    "symbol\tcategory\trelation\ttarget\tfile\tline\tsection_id\tcontext\n";
+
+/// Appends one `index/calls.tsv` row.
+fn append_calls_row(buf: &mut String, c: &ResolvedCallEdge) {
+    buf.push_str(&sanitize_tsv(&c.caller_id));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&c.caller_name));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&c.callee_name));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&c.callee_id));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&c.file));
+    buf.push('\t');
+    push_usize(buf, c.line);
+    buf.push('\t');
+    buf.push_str(c.tier.as_str());
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&c.section_id));
+    buf.push('\n');
+}
+
+/// Appends one `index/xref.tsv` row.
+fn append_xref_row(buf: &mut String, x: &XrefEntry) {
+    buf.push_str(&sanitize_tsv(&x.symbol));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&x.category));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&x.relation));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&x.target));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&x.file));
+    buf.push('\t');
+    push_usize(buf, x.line);
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&x.section_id));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&x.context));
+    buf.push('\n');
+}
+
+/// Builds a table in memory, formatting order-preserving row chunks in parallel.
+///
+/// Only used on the incremental path, where every table fits in memory; row formatting is pure
+/// CPU and dominates once the write is skipped as identical.
+fn build_table_bytes<T, F>(header: &str, rows: &[T], append_row: F) -> Vec<u8>
+where
+    T: Sync,
+    F: Fn(&mut String, &T) + Sync + Send,
+{
+    const TABLE_BUILD_CHUNKS: usize = 4;
+    let chunk_len = rows.len().div_ceil(TABLE_BUILD_CHUNKS);
+    let parts: Vec<String> = if chunk_len == 0 {
+        Vec::new()
+    } else {
+        rows.par_chunks(chunk_len)
+            .map(|chunk| {
+                let mut buf = String::with_capacity(chunk.len() * 128);
+                for row in chunk {
+                    append_row(&mut buf, row);
+                }
+                buf
+            })
+            .collect()
+    };
+    let body_len: usize = parts.iter().map(|part| part.len()).sum();
+    let mut bytes = Vec::with_capacity(header.len() + body_len);
+    bytes.extend_from_slice(header.as_bytes());
+    for part in parts {
+        bytes.extend_from_slice(part.as_bytes());
+    }
+    bytes
+}
+
 /// Streams `index/calls.tsv`.
 fn write_calls_tsv_file(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
     write_streamed_file(&index_dir.join("calls.tsv"), |sink| {
-        sink.rows().push_str(
-            "caller_id\tcaller_name\tcallee_name\tcallee_id\tfile\tline\ttier\tsection_id\n",
-        );
+        sink.rows().push_str(CALLS_TSV_HEADER);
         for c in &indexes.calls {
-            let buf = sink.rows();
-            buf.push_str(&sanitize_tsv(&c.caller_id));
-            buf.push('\t');
-            buf.push_str(&sanitize_tsv(&c.caller_name));
-            buf.push('\t');
-            buf.push_str(&sanitize_tsv(&c.callee_name));
-            buf.push('\t');
-            buf.push_str(&sanitize_tsv(&c.callee_id));
-            buf.push('\t');
-            buf.push_str(&sanitize_tsv(&c.file));
-            buf.push('\t');
-            push_usize(buf, c.line);
-            buf.push('\t');
-            buf.push_str(c.tier.as_str());
-            buf.push('\t');
-            buf.push_str(&sanitize_tsv(&c.section_id));
-            buf.push('\n');
+            append_calls_row(sink.rows(), c);
             sink.flush_if_full()?;
         }
         Ok(())
     })
 }
 
+/// Rebuilds `index/calls.tsv` in memory with parallel row formatting (incremental syncs).
+fn write_calls_tsv_in_memory(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
+    let bytes = build_table_bytes(CALLS_TSV_HEADER, &indexes.calls, append_calls_row);
+    write_bytes_atomic(&index_dir.join("calls.tsv"), &bytes)
+}
+
 /// Streams `index/xref.tsv`.
 fn write_xref_tsv_file(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
     write_streamed_file(&index_dir.join("xref.tsv"), |sink| {
-        sink.rows()
-            .push_str("symbol\tcategory\trelation\ttarget\tfile\tline\tsection_id\tcontext\n");
+        sink.rows().push_str(XREF_TSV_HEADER);
         for x in &indexes.xrefs {
-            let buf = sink.rows();
-            buf.push_str(&sanitize_tsv(&x.symbol));
-            buf.push('\t');
-            buf.push_str(&sanitize_tsv(&x.category));
-            buf.push('\t');
-            buf.push_str(&sanitize_tsv(&x.relation));
-            buf.push('\t');
-            buf.push_str(&sanitize_tsv(&x.target));
-            buf.push('\t');
-            buf.push_str(&sanitize_tsv(&x.file));
-            buf.push('\t');
-            push_usize(buf, x.line);
-            buf.push('\t');
-            buf.push_str(&sanitize_tsv(&x.section_id));
-            buf.push('\t');
-            buf.push_str(&sanitize_tsv(&x.context));
-            buf.push('\n');
+            append_xref_row(sink.rows(), x);
             sink.flush_if_full()?;
         }
         Ok(())
     })
+}
+
+/// Rebuilds `index/xref.tsv` in memory with parallel row formatting (incremental syncs).
+fn write_xref_tsv_in_memory(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
+    let bytes = build_table_bytes(XREF_TSV_HEADER, &indexes.xrefs, append_xref_row);
+    write_bytes_atomic(&index_dir.join("xref.tsv"), &bytes)
 }
 
 /// Streams `index/sections.tsv`, `index/symbols.tsv`, `index/types.tsv`, and `index/macros.tsv`.
@@ -1302,7 +1475,8 @@ impl PrewrittenCache {
     }
 }
 
-/// Writes `cache/manifest.json` and per-file `cache/<shard_key>.json` shards, deleting
+/// Writes `cache/manifest.json` plus either per-file `cache/<shard_key>.json` shards (repositories
+/// with `<= 500` files) or packed `cache/pack-<16hex>.json` shards (larger repositories), deleting
 /// orphaned shards and any legacy `cache.json` file.
 pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Result<()> {
     emit_cache_shards_with_prewritten(output_dir, cache, &FxHashMap::default())
@@ -1389,8 +1563,25 @@ impl CacheShardWriter {
         })
     }
 
-    /// Serializes and writes the cache shards of `units`, returning their identity keyed by
-    /// repository-relative path.
+    /// Returns the previous manifest's structural digest when the shard can be reused verbatim:
+    /// same content hash, same shard path, a persisted digest, and the shard file on disk.
+    ///
+    /// This is checked before any JSON serialization or structural-digest hashing, so an
+    /// incremental sync over 122 unchanged files does no per-unit CPU work at all.
+    fn reusable_digest(&self, rel_path: &str, hash: &str, expected_shard: &str) -> Option<String> {
+        let prev = self.state.prev_manifest.as_ref()?.files.get(rel_path)?;
+        if prev.blake3_hash == hash
+            && prev.shard == expected_shard
+            && !prev.structural_digest.is_empty()
+        {
+            Some(prev.structural_digest.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Serializes and writes one cache shard per unit (small repositories), returning their
+    /// identity keyed by repository-relative path.
     ///
     /// JSON encoding and structural-digest hashing are pure CPU and run in parallel; the
     /// (I/O-bound) file writes stay on this thread so the disk sees one ordered stream.
@@ -1399,9 +1590,38 @@ impl CacheShardWriter {
         units: &[ParsedFileUnit],
     ) -> Result<Vec<(String, PrewrittenShard)>> {
         let started = Instant::now();
-        let mut packets: Vec<CacheShardPacket> =
-            units.par_iter().filter_map(prepare_cache_shard).collect();
-        if packets.len() != units.len() {
+        let mut out = Vec::with_capacity(units.len());
+        let mut pending: Vec<&ParsedFileUnit> = Vec::new();
+        // Reuse is decided from the previous manifest alone: no JSON, no digest hashing.
+        for unit in units {
+            let rel_path = unit.scanned.rel_path.as_str();
+            let hash = unit.scanned.blake3_hash.as_str();
+            let shard_name = format!("{}.json", CacheShardEntry::shard_key(rel_path, hash));
+            let expected_shard = format!("cache/{shard_name}");
+            let reusable = self.state.existing_json_files.contains(&shard_name);
+            match self
+                .reusable_digest(rel_path, hash, &expected_shard)
+                .filter(|_| reusable)
+            {
+                Some(structural_digest) => {
+                    self.reused += 1;
+                    out.push((
+                        rel_path.to_string(),
+                        PrewrittenShard {
+                            blake3_hash: hash.to_string(),
+                            shard_name,
+                            structural_digest,
+                        },
+                    ));
+                }
+                None => pending.push(unit),
+            }
+        }
+        let mut packets: Vec<CacheShardPacket> = pending
+            .par_iter()
+            .filter_map(|unit| prepare_cache_shard(unit))
+            .collect();
+        if packets.len() != pending.len() {
             // Every unit must have a shard on disk: the manifest is emitted from these identities
             // after the parsed units are dropped, so a missing shard would silently drop the file.
             return Err(ChipsrcError::io(
@@ -1412,36 +1632,70 @@ impl CacheShardWriter {
         // Hash-named shards land in random order; writing each batch in name order keeps the
         // directory index updates local, which matters for the 12k-file cold path on NTFS.
         packets.sort_by(|a, b| a.shard_name.cmp(&b.shard_name));
-        let mut out = Vec::with_capacity(packets.len());
         for packet in packets {
             let exists = self.state.existing_json_files.contains(&packet.shard_name);
-            let reusable = exists
-                && self
-                    .state
-                    .prev_manifest
-                    .as_ref()
-                    .and_then(|m| m.files.get(&packet.rel_path))
-                    .is_some_and(|prev| {
-                        prev.blake3_hash == packet.blake3_hash
-                            && prev.structural_digest == packet.structural_digest
-                    });
-            if reusable {
-                self.reused += 1;
-            } else {
-                write_new_or_existing_file(
-                    &self.cache_dir.join(&packet.shard_name),
-                    packet.json.as_bytes(),
-                    !exists,
-                )?;
-                self.written += 1;
-                self.bytes += packet.json.len();
-            }
+            write_new_or_existing_file(
+                &self.cache_dir.join(&packet.shard_name),
+                packet.json.as_bytes(),
+                !exists,
+            )?;
+            self.written += 1;
+            self.bytes += packet.json.len();
             out.push((
                 packet.rel_path,
                 PrewrittenShard {
                     blake3_hash: packet.blake3_hash,
                     shard_name: packet.shard_name,
                     structural_digest: packet.structural_digest,
+                },
+            ));
+        }
+        self.elapsed += started.elapsed();
+        Ok(out)
+    }
+
+    /// Serializes and writes one packed cache shard holding `units` (large repositories).
+    ///
+    /// The pack file name is content-addressed over every member's `(rel_path, blake3_hash)`, so a
+    /// pack is reused verbatim when no member changed; a pack containing an edit is rewritten once
+    /// with all of its siblings.
+    fn write_pack(&mut self, units: &[&ParsedFileUnit]) -> Result<Vec<(String, PrewrittenShard)>> {
+        let started = Instant::now();
+        let shard_name = crate::model::cache_pack_shard_name(units);
+        let shard_rel = format!("cache/{shard_name}");
+        let exists = self.state.existing_json_files.contains(&shard_name);
+        let mut fully_reusable = exists;
+        let mut digests: Vec<Option<String>> = Vec::with_capacity(units.len());
+        for unit in units {
+            let digest = self.reusable_digest(
+                &unit.scanned.rel_path,
+                &unit.scanned.blake3_hash,
+                &shard_rel,
+            );
+            fully_reusable &= digest.is_some();
+            digests.push(digest);
+        }
+        if fully_reusable {
+            self.reused += 1;
+        } else {
+            let json = serialize_pack_json(units, &self.cache_dir)?;
+            write_new_or_existing_file(
+                &self.cache_dir.join(&shard_name),
+                json.as_bytes(),
+                !exists,
+            )?;
+            self.written += 1;
+            self.bytes += json.len();
+        }
+        fill_missing_digests(units, &mut digests);
+        let mut out = Vec::with_capacity(units.len());
+        for (unit, digest) in units.iter().zip(digests) {
+            out.push((
+                unit.scanned.rel_path.clone(),
+                PrewrittenShard {
+                    blake3_hash: unit.scanned.blake3_hash.clone(),
+                    shard_name: shard_name.clone(),
+                    structural_digest: digest.unwrap_or_default(),
                 },
             ));
         }
@@ -1470,15 +1724,30 @@ pub fn write_cache_shards_for_units(
         CacheShardWriter::new(output_dir, schema_version, blueprint_hash, vendor_mode)?;
     let mut available: FxHashMap<String, PrewrittenShard> =
         FxHashMap::with_capacity_and_hasher(units.len(), Default::default());
-    // Serialize in parallel (pure CPU) but write on this single thread so the disk sees one
-    // sequential stream instead of a dozen competing ones; the chunk bounds serialized memory.
-    let mut start = 0usize;
-    while start < units.len() {
-        let end = (start + CACHE_SHARD_WRITE_CHUNK).min(units.len());
-        for (rel_path, shard) in writer.write_units(&units[start..end])? {
-            available.insert(rel_path, shard);
+    if units.len() > crate::model::CACHE_PACK_FILE_THRESHOLD {
+        // Large repositories use deterministic 64-unit packs: 12.5k tiny files become ~195
+        // ~1.3 MB files, which is the difference between minutes and seconds on a rotational disk.
+        let mut sorted: Vec<&ParsedFileUnit> = units.iter().collect();
+        sorted.sort_by(|a, b| a.scanned.rel_path.cmp(&b.scanned.rel_path));
+        let mut start = 0usize;
+        while start < sorted.len() {
+            let end = (start + crate::model::CACHE_PACK_UNITS).min(sorted.len());
+            for (rel_path, shard) in writer.write_pack(&sorted[start..end])? {
+                available.insert(rel_path, shard);
+            }
+            start = end;
         }
-        start = end;
+    } else {
+        // Serialize in parallel (pure CPU) but write on this single thread so the disk sees one
+        // sequential stream instead of a dozen competing ones; the chunk bounds serialized memory.
+        let mut start = 0usize;
+        while start < units.len() {
+            let end = (start + CACHE_SHARD_WRITE_CHUNK).min(units.len());
+            for (rel_path, shard) in writer.write_units(&units[start..end])? {
+                available.insert(rel_path, shard);
+            }
+            start = end;
+        }
     }
     Ok(PrewrittenCache {
         shards: available,
@@ -1489,6 +1758,57 @@ pub fn write_cache_shards_for_units(
 /// Number of units whose cache shards are serialized together before the writer thread writes
 /// them; bounds the serialized (JSON) memory held at once.
 const CACHE_SHARD_WRITE_CHUNK: usize = 256;
+
+/// Serializes a packed shard as a JSON array of compact [`ParsedFileUnit`]s.
+fn serialize_pack_json(units: &[&ParsedFileUnit], cache_dir: &Path) -> Result<String> {
+    let parts: Vec<Option<String>> = units
+        .par_iter()
+        .map(|unit| serde_json::to_string(unit).ok())
+        .collect();
+    if parts.iter().any(|part| part.is_none()) {
+        return Err(ChipsrcError::io(
+            cache_dir,
+            std::io::Error::other(
+                "failed to serialize a parsed unit into its packed AST cache shard",
+            ),
+        ));
+    }
+    let total: usize = parts
+        .iter()
+        .map(|part| part.as_ref().map_or(0, |text| text.len()))
+        .sum();
+    let mut json = String::with_capacity(total + units.len() + 2);
+    json.push('[');
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            json.push(',');
+        }
+        if let Some(text) = part {
+            json.push_str(text);
+        }
+    }
+    json.push(']');
+    Ok(json)
+}
+
+/// Computes structural digests in parallel for the members that could not be reused.
+fn fill_missing_digests(units: &[&ParsedFileUnit], digests: &mut [Option<String>]) {
+    let missing: Vec<usize> = digests
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, digest)| digest.is_none().then_some(idx))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let computed: Vec<String> = missing
+        .par_iter()
+        .map(|&idx| units[idx].structural_digest())
+        .collect();
+    for (idx, digest) in missing.into_iter().zip(computed) {
+        digests[idx] = Some(digest);
+    }
+}
 
 /// Cache identity written into `cache/manifest.json` and used to decide shard reuse.
 struct CacheIdentity<'a> {
@@ -1623,56 +1943,78 @@ where
     let mut expected_shard_names: FxHashSet<String> =
         FxHashSet::with_capacity_and_hasher(units.len(), Default::default());
 
-    for (rel_path, unit) in units {
-        let hash = &unit.scanned.blake3_hash;
-        let shard_key = CacheShardEntry::shard_key(rel_path, hash);
-        let shard_fname = format!("{shard_key}.json");
-        let shard_rel = format!("cache/{shard_fname}");
-
-        // A shard streamed to disk earlier in this run is authoritative: it was serialized from
-        // exactly this unit, so neither the digest nor the file needs to be recomputed.
-        let pre = prewritten
-            .get(rel_path)
-            .filter(|p| p.blake3_hash == *hash && p.shard_name == shard_fname);
-
-        let matched_prev = if pre.is_some() {
-            None
-        } else if schema_current {
-            prev_manifest
-                .and_then(|m| m.files.get(rel_path))
-                .filter(|prev| {
-                    prev.blake3_hash == *hash
-                        && prev.shard == shard_rel
-                        && !prev.structural_digest.is_empty()
-                })
-        } else {
-            None
-        };
-
-        let structural_digest = match (pre, matched_prev) {
-            (Some(pre), _) => pre.structural_digest.clone(),
-            (None, Some(prev)) => prev.structural_digest.clone(),
-            (None, None) => unit.structural_digest(),
-        };
-
-        let reuse_existing_shard =
-            pre.is_some() || (matched_prev.is_some() && existing_json_files.contains(&shard_fname));
-
-        if !reuse_existing_shard {
-            let shard_path = cache_dir.join(&shard_fname);
-            let unit_json = serde_json::to_string(unit)?;
-            write_file(&shard_path, &unit_json)?;
+    let mut collected: Vec<(&str, &ParsedFileUnit)> = units.collect();
+    if collected.len() > crate::model::CACHE_PACK_FILE_THRESHOLD {
+        // Large repositories use deterministic 64-unit packs, grouped over the rel_path-sorted
+        // unit set so the layout matches `write_cache_shards_for_units` exactly.
+        collected.sort_by(|a, b| a.0.cmp(b.0));
+        let mut start = 0usize;
+        while start < collected.len() {
+            let end = (start + crate::model::CACHE_PACK_UNITS).min(collected.len());
+            emit_packed_cache_chunk(
+                &cache_dir,
+                existing_json_files,
+                prev_manifest,
+                schema_current,
+                prewritten,
+                &collected[start..end],
+                &mut manifest_files,
+                &mut expected_shard_names,
+            )?;
+            start = end;
         }
+    } else {
+        for (rel_path, unit) in collected {
+            let hash = &unit.scanned.blake3_hash;
+            let shard_key = CacheShardEntry::shard_key(rel_path, hash);
+            let shard_fname = format!("{shard_key}.json");
+            let shard_rel = format!("cache/{shard_fname}");
 
-        expected_shard_names.insert(shard_fname);
-        manifest_files.insert(
-            rel_path.to_string(),
-            CacheShardEntry {
-                blake3_hash: hash.clone(),
-                shard: shard_rel,
-                structural_digest,
-            },
-        );
+            // A shard streamed to disk earlier in this run is authoritative: it was serialized
+            // from exactly this unit, so neither the digest nor the file needs to be recomputed.
+            let pre = prewritten
+                .get(rel_path)
+                .filter(|p| p.blake3_hash == *hash && p.shard_name == shard_fname);
+
+            let matched_prev = if pre.is_some() {
+                None
+            } else if schema_current {
+                prev_manifest
+                    .and_then(|m| m.files.get(rel_path))
+                    .filter(|prev| {
+                        prev.blake3_hash == *hash
+                            && prev.shard == shard_rel
+                            && !prev.structural_digest.is_empty()
+                    })
+            } else {
+                None
+            };
+
+            let structural_digest = match (pre, matched_prev) {
+                (Some(pre), _) => pre.structural_digest.clone(),
+                (None, Some(prev)) => prev.structural_digest.clone(),
+                (None, None) => unit.structural_digest(),
+            };
+
+            let reuse_existing_shard = pre.is_some()
+                || (matched_prev.is_some() && existing_json_files.contains(&shard_fname));
+
+            if !reuse_existing_shard {
+                let shard_path = cache_dir.join(&shard_fname);
+                let unit_json = serde_json::to_string(unit)?;
+                write_file(&shard_path, &unit_json)?;
+            }
+
+            expected_shard_names.insert(shard_fname);
+            manifest_files.insert(
+                rel_path.to_string(),
+                CacheShardEntry {
+                    blake3_hash: hash.clone(),
+                    shard: shard_rel,
+                    structural_digest,
+                },
+            );
+        }
     }
 
     write_cache_manifest(
@@ -1683,6 +2025,69 @@ where
         manifest_files,
         &expected_shard_names,
     )
+}
+
+/// Emits one 64-unit packed shard and its manifest entries.
+///
+/// The pack is skipped when every member is either already on disk from this run's writer
+/// (`prewritten`) or unchanged since the previous manifest; otherwise it is serialized once with
+/// all of its members and written atomically (identical content is still skipped by
+/// [`write_bytes_atomic`]).
+#[allow(clippy::too_many_arguments)]
+fn emit_packed_cache_chunk(
+    cache_dir: &Path,
+    existing_json_files: &FxHashSet<String>,
+    prev_manifest: Option<&CacheManifest>,
+    schema_current: bool,
+    prewritten: &FxHashMap<String, PrewrittenShard>,
+    chunk: &[(&str, &ParsedFileUnit)],
+    manifest_files: &mut BTreeMap<String, CacheShardEntry>,
+    expected_shard_names: &mut FxHashSet<String>,
+) -> Result<()> {
+    let units: Vec<&ParsedFileUnit> = chunk.iter().map(|(_, unit)| *unit).collect();
+    let shard_name = crate::model::cache_pack_shard_name(&units);
+    let shard_rel = format!("cache/{shard_name}");
+    let exists = existing_json_files.contains(&shard_name);
+
+    let mut digests: Vec<Option<String>> = Vec::with_capacity(chunk.len());
+    let mut all_prewritten = true;
+    let mut all_previous = schema_current && exists;
+    for (rel_path, unit) in chunk {
+        let hash = unit.scanned.blake3_hash.as_str();
+        let pre = prewritten
+            .get(*rel_path)
+            .filter(|p| p.blake3_hash == hash && p.shard_name == shard_name);
+        all_prewritten &= pre.is_some();
+        let prev = prev_manifest
+            .and_then(|manifest| manifest.files.get(*rel_path))
+            .filter(|p| {
+                p.blake3_hash == hash && p.shard == shard_rel && !p.structural_digest.is_empty()
+            });
+        all_previous &= prev.is_some();
+        digests.push(
+            pre.map(|p| p.structural_digest.clone())
+                .or_else(|| prev.map(|p| p.structural_digest.clone())),
+        );
+    }
+
+    if !all_prewritten && !all_previous {
+        let json = serialize_pack_json(&units, cache_dir)?;
+        write_file(&cache_dir.join(&shard_name), &json)?;
+    }
+
+    fill_missing_digests(&units, &mut digests);
+    expected_shard_names.insert(shard_name.clone());
+    for (idx, (rel_path, unit)) in chunk.iter().enumerate() {
+        manifest_files.insert(
+            (*rel_path).to_string(),
+            CacheShardEntry {
+                blake3_hash: unit.scanned.blake3_hash.clone(),
+                shard: shard_rel.clone(),
+                structural_digest: digests[idx].clone().unwrap_or_default(),
+            },
+        );
+    }
+    Ok(())
 }
 
 /// Prunes orphaned cache shards (using the directory snapshot taken before this run wrote any
@@ -1721,6 +2126,117 @@ fn write_cache_manifest(
     }
 
     Ok(())
+}
+
+/// Rewrites the cache shards that own `dirty_units` after a digest-noop update (content changed,
+/// structural digest, coordinates, and line counts did not), preserving the bundle's canonical
+/// shard layout and updating `manifest` entries in place.
+///
+/// Only the affected 64-unit packs are read and rewritten; every sibling pack is left untouched.
+/// Returns `Ok(false)` without modifying anything when an affected pack cannot be read, so the
+/// caller can fall back to the full structural rebuild.
+pub(crate) fn rewrite_cache_shards_for_dirty_units(
+    output_dir: &Path,
+    manifest: &mut CacheManifest,
+    dirty_units: &[ParsedFileUnit],
+) -> Result<bool> {
+    let cache_dir = output_dir.join("cache");
+    create_dir(&cache_dir)?;
+
+    let mut groups: BTreeMap<String, Vec<&ParsedFileUnit>> = BTreeMap::new();
+    for unit in dirty_units {
+        let Some(entry) = manifest.files.get(&unit.scanned.rel_path) else {
+            return Ok(false);
+        };
+        groups.entry(entry.shard.clone()).or_default().push(unit);
+    }
+
+    // Read every affected packed shard before mutating the manifest, so a missing or corrupt pack
+    // leaves the bundle exactly as it was and the caller can take the full structural path.
+    let mut loaded_packs: BTreeMap<String, Vec<ParsedFileUnit>> = BTreeMap::new();
+    for shard_rel in groups.keys() {
+        if crate::model::is_packed_cache_shard(shard_rel) {
+            let Some(members) = crate::scanner::load_cache_shard_units(output_dir, shard_rel)
+            else {
+                return Ok(false);
+            };
+            loaded_packs.insert(shard_rel.clone(), members);
+        }
+    }
+
+    let mut superseded_shards: Vec<String> = Vec::new();
+    for (old_shard, units) in groups {
+        if !crate::model::is_packed_cache_shard(&old_shard) {
+            // A per-file shard (small repository or a pre-pack bundle): rewrite it directly.
+            for unit in units {
+                let new_hash = &unit.scanned.blake3_hash;
+                let shard_name = format!(
+                    "{}.json",
+                    CacheShardEntry::shard_key(&unit.scanned.rel_path, new_hash)
+                );
+                let shard_rel = format!("cache/{shard_name}");
+                let Some(packet) = prepare_cache_shard(unit) else {
+                    return Ok(false);
+                };
+                write_bytes_atomic(&cache_dir.join(&shard_name), packet.json.as_bytes())?;
+                let mut previous = String::new();
+                if let Some(entry) = manifest.files.get_mut(&unit.scanned.rel_path) {
+                    previous = std::mem::take(&mut entry.shard);
+                    entry.blake3_hash = new_hash.clone();
+                    entry.shard = shard_rel.clone();
+                    entry.structural_digest = packet.structural_digest;
+                }
+                if !previous.is_empty()
+                    && previous != shard_rel
+                    && !manifest.files.values().any(|entry| entry.shard == previous)
+                {
+                    superseded_shards.push(previous);
+                }
+            }
+            continue;
+        }
+
+        let Some(mut members) = loaded_packs.remove(&old_shard) else {
+            return Ok(false);
+        };
+        for unit in units {
+            match members
+                .iter_mut()
+                .find(|member| member.scanned.rel_path == unit.scanned.rel_path)
+            {
+                Some(member) => member.clone_from(unit),
+                None => members.push(unit.clone()),
+            }
+        }
+        members.sort_by(|a, b| a.scanned.rel_path.cmp(&b.scanned.rel_path));
+        let refs: Vec<&ParsedFileUnit> = members.iter().collect();
+        let shard_name = crate::model::cache_pack_shard_name(&refs);
+        let shard_rel = format!("cache/{shard_name}");
+        let json = serialize_pack_json(&refs, &cache_dir)?;
+        let target = cache_dir.join(&shard_name);
+        let known_absent = !target.is_file();
+        write_new_or_existing_file(&target, json.as_bytes(), known_absent)?;
+        for member in &members {
+            if let Some(entry) = manifest.files.get_mut(&member.scanned.rel_path) {
+                entry.blake3_hash = member.scanned.blake3_hash.clone();
+                entry.shard = shard_rel.clone();
+                entry.structural_digest = member.structural_digest();
+            }
+        }
+        if shard_rel != old_shard
+            && !manifest
+                .files
+                .values()
+                .any(|entry| entry.shard == old_shard)
+        {
+            superseded_shards.push(old_shard);
+        }
+    }
+
+    for shard_rel in superseded_shards {
+        let _ = fs::remove_file(output_dir.join(shard_rel));
+    }
+    Ok(true)
 }
 
 fn select_entrypoints(indexes: &BundleIndexes) -> (Vec<&RankedSymbol>, Vec<&RankedSymbol>) {
@@ -2012,10 +2528,93 @@ mod tests {
     use super::*;
     use crate::model::{
         ExtractedImport, ExtractedMacro, ExtractedSymbol, LanguageKind, ParsedFileUnit,
-        RawCallSite, RawXrefSite, ScannedFile, VendorMode, CACHE_SCHEMA_VERSION,
+        RawCallSite, RawXrefSite, ResolutionTier, ScannedFile, SymbolKind, VendorMode, Visibility,
+        CACHE_SCHEMA_VERSION,
     };
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
+
+    /// Builds a minimal parsed unit for cache-shard and packing tests.
+    fn cache_unit(rel_path: &str, hash: &str, symbol: &str) -> ParsedFileUnit {
+        let owner = rel_path.to_string();
+        ParsedFileUnit {
+            scanned: ScannedFile {
+                rel_path: owner.clone(),
+                abs_path: PathBuf::from(rel_path),
+                language: LanguageKind::Python,
+                scope: FileScope::FirstParty,
+                arch_layer: ArchLayer::Domain,
+                size_bytes: 64,
+                mtime_secs: 1_700_000_000,
+                mtime_nanos: 0,
+                blake3_hash: hash.to_string(),
+                line_count: 2,
+            },
+            symbols: vec![ExtractedSymbol {
+                symbol_id: format!("{owner}::{symbol}"),
+                name: symbol.to_string(),
+                qualified_name: symbol.to_string(),
+                kind: SymbolKind::Function,
+                visibility: Visibility::Public,
+                file: owner.clone(),
+                start_line: 1,
+                end_line: 2,
+                signature: format!("def {symbol}(value: int) -> int"),
+                doc_summary: String::new(),
+                enclosing_type: None,
+                scope: FileScope::FirstParty,
+                arch_layer: ArchLayer::Domain,
+                section_id: "mod".to_string(),
+            }],
+            types: Vec::new(),
+            macros: Vec::new(),
+            imports: Vec::new(),
+            raw_calls: Vec::new(),
+            raw_xrefs: Vec::new(),
+            parse_errors: 0,
+        }
+    }
+
+    /// Builds `count` deterministic parsed units whose rel_paths are spread over seven modules.
+    fn cache_units(count: usize) -> Vec<ParsedFileUnit> {
+        (0..count)
+            .map(|i| {
+                let rel_path = format!("mod{:02}/f{i:04}.py", i % 7);
+                cache_unit(&rel_path, &format!("hash{i:016}"), &format!("probe_{i}"))
+            })
+            .collect()
+    }
+
+    fn pack_mtimes(cache_dir: &Path) -> BTreeMap<String, SystemTime> {
+        let mut mtimes = BTreeMap::new();
+        let entries = fs::read_dir(cache_dir).expect("read cache dir");
+        for entry in entries.flatten() {
+            let name = match entry.file_name().into_string() {
+                Ok(name) => name,
+                Err(_) => continue,
+            };
+            if !name.starts_with("pack-") {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .expect("pack metadata")
+                .modified()
+                .expect("mtime");
+            mtimes.insert(name, modified);
+        }
+        mtimes
+    }
+
+    fn pack_bytes(cache_dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        let mut packs = BTreeMap::new();
+        for name in pack_mtimes(cache_dir).into_keys() {
+            let bytes = fs::read(cache_dir.join(&name)).expect("read pack");
+            packs.insert(name, bytes);
+        }
+        packs
+    }
 
     struct TestTempDir(PathBuf);
 
@@ -2740,6 +3339,319 @@ mod tests {
             serde_json::to_value(&from_units).unwrap(),
             "prewritten and unit-based manifests must be identical"
         );
+    }
+
+    /// A >500-file repository stores its parsed units in deterministic 64-unit packs that load
+    /// back losslessly, and an unchanged rerun reuses every pack without rewriting it.
+    #[test]
+    fn packed_cache_shards_are_deterministic_and_round_trip() {
+        let tmp = TestTempDir::new("packed_round_trip");
+        let out_dir = tmp.0.join("bundle");
+        let units = cache_units(501);
+        let first = write_cache_shards_for_units(
+            &out_dir,
+            &units,
+            CACHE_SCHEMA_VERSION,
+            "",
+            VendorMode::Active,
+        )
+        .expect("write packed cache");
+
+        let mut shard_names: BTreeSet<String> = BTreeSet::new();
+        for shard in first.shards().values() {
+            assert!(
+                shard.shard_name.starts_with("pack-"),
+                "{}",
+                shard.shard_name
+            );
+            assert!(shard.shard_name.ends_with(".json"), "{}", shard.shard_name);
+            assert_eq!(
+                shard.shard_name.len(),
+                crate::model::CACHE_PACK_PREFIX.len() + 16 + ".json".len()
+            );
+            shard_names.insert(shard.shard_name.clone());
+        }
+        let expected_packs = units.len().div_ceil(crate::model::CACHE_PACK_UNITS);
+        assert_eq!(shard_names.len(), expected_packs);
+        let cache_dir = out_dir.join("cache");
+        assert_eq!(pack_mtimes(&cache_dir).len(), expected_packs);
+
+        let metadata = RepoMetadata {
+            source_root: "/repo".to_string(),
+            vendor_mode: VendorMode::Active,
+            ..Default::default()
+        };
+        let config = ConvertConfig::new(PathBuf::from("/repo"), out_dir.clone());
+        emit_cache_manifest_for_prewritten(&config, &metadata, "", &first).expect("manifest");
+        let manifest = crate::scanner::load_cache_manifest(&out_dir).expect("load manifest");
+        assert_eq!(manifest.files.len(), units.len());
+        for entry in manifest.files.values() {
+            assert!(crate::model::is_packed_cache_shard(&entry.shard));
+            assert!(!entry.structural_digest.is_empty());
+            assert!(out_dir.join(&entry.shard).is_file());
+        }
+
+        let cache = crate::scanner::load_cache_file(&out_dir).expect("load packed cache");
+        assert_eq!(cache.files.len(), units.len());
+        let loaded = cache.files.get("mod00/f0000.py").expect("unit 0");
+        assert_eq!(loaded.symbols[0].file, "mod00/f0000.py");
+        assert_eq!(loaded.symbols[0].symbol_id, "mod00/f0000.py::probe_0");
+
+        // Unchanged rerun: every pack is reused verbatim (mtime preserved, same names).
+        let past = SystemTime::now() - Duration::from_secs(60);
+        for name in &shard_names {
+            fs::File::options()
+                .write(true)
+                .open(cache_dir.join(name))
+                .expect("open pack")
+                .set_modified(past)
+                .expect("set pack mtime");
+        }
+        let before = pack_mtimes(&cache_dir);
+        let second = write_cache_shards_for_units(
+            &out_dir,
+            &units,
+            CACHE_SCHEMA_VERSION,
+            "",
+            VendorMode::Active,
+        )
+        .expect("rewrite packed cache");
+        let second_names: BTreeSet<String> = second
+            .shards()
+            .values()
+            .map(|shard| shard.shard_name.clone())
+            .collect();
+        assert_eq!(shard_names, second_names);
+        assert_eq!(
+            before,
+            pack_mtimes(&cache_dir),
+            "unchanged packs must not be rewritten"
+        );
+    }
+
+    /// Editing one unit rewrites exactly one packed shard and leaves every other pack byte-identical.
+    #[test]
+    fn packed_cache_shard_rewrite_keeps_sibling_units() {
+        let tmp = TestTempDir::new("packed_rewrite");
+        let out_dir = tmp.0.join("bundle");
+        let units = cache_units(501);
+        let first = write_cache_shards_for_units(
+            &out_dir,
+            &units,
+            CACHE_SCHEMA_VERSION,
+            "",
+            VendorMode::Active,
+        )
+        .expect("write packed cache");
+        let metadata = RepoMetadata {
+            source_root: "/repo".to_string(),
+            vendor_mode: VendorMode::Active,
+            ..Default::default()
+        };
+        let config = ConvertConfig::new(PathBuf::from("/repo"), out_dir.clone());
+        emit_cache_manifest_for_prewritten(&config, &metadata, "", &first).expect("manifest");
+
+        let cache_dir = out_dir.join("cache");
+        let before = pack_bytes(&cache_dir);
+        let edited_rel = "mod05/f0005.py";
+        let old_shard = first.shards()[edited_rel].shard_name.clone();
+        let old_file = old_shard.clone();
+        let siblings: Vec<String> = first
+            .shards()
+            .iter()
+            .filter(|(rel_path, shard)| {
+                shard.shard_name == old_shard && rel_path.as_str() != edited_rel
+            })
+            .map(|(rel_path, _)| rel_path.clone())
+            .collect();
+        assert!(!siblings.is_empty(), "pack must contain sibling units");
+
+        let mut edited_units = units.clone();
+        let edited = &mut edited_units[5];
+        edited.scanned.blake3_hash = "edited_hash_0005".to_string();
+        edited.symbols[0].signature = "def probe_5(value: int, scale: int) -> int".to_string();
+        let second = write_cache_shards_for_units(
+            &out_dir,
+            &edited_units,
+            CACHE_SCHEMA_VERSION,
+            "",
+            VendorMode::Active,
+        )
+        .expect("rewrite packed cache");
+        emit_cache_manifest_for_prewritten(&config, &metadata, "", &second).expect("manifest 2");
+
+        let new_shard = second.shards()[edited_rel].shard_name.clone();
+        assert_ne!(old_shard, new_shard);
+        assert!(
+            !cache_dir.join(&old_file).exists(),
+            "old pack must be pruned"
+        );
+        assert!(cache_dir.join(&new_shard).is_file());
+
+        let after = pack_bytes(&cache_dir);
+        for (name, bytes) in &before {
+            if *name == old_file {
+                continue;
+            }
+            assert_eq!(
+                after.get(name),
+                Some(bytes),
+                "unrelated pack {name} must be untouched"
+            );
+        }
+
+        let cache = crate::scanner::load_cache_file(&out_dir).expect("reload packed cache");
+        assert_eq!(cache.files.len(), units.len());
+        let sibling = cache.files.get(&siblings[0]).expect("sibling unit");
+        let original = units
+            .iter()
+            .find(|unit| unit.scanned.rel_path == siblings[0])
+            .expect("original sibling");
+        assert_eq!(sibling.scanned.blake3_hash, original.scanned.blake3_hash);
+        assert_eq!(sibling.symbols[0].name, original.symbols[0].name);
+        let reloaded = cache.files.get(edited_rel).expect("edited unit");
+        assert_eq!(reloaded.scanned.blake3_hash, "edited_hash_0005");
+    }
+
+    /// The digest-noop tier rewrites only the pack that owns the dirty file and repoints every
+    /// sibling manifest entry at the rebuilt pack.
+    #[test]
+    fn rewrite_cache_shards_for_dirty_units_rebuilds_only_the_affected_pack() {
+        let tmp = TestTempDir::new("packed_digest_noop");
+        let out_dir = tmp.0.join("bundle");
+        let units = cache_units(501);
+        let first = write_cache_shards_for_units(
+            &out_dir,
+            &units,
+            CACHE_SCHEMA_VERSION,
+            "",
+            VendorMode::Active,
+        )
+        .expect("write packed cache");
+        let metadata = RepoMetadata {
+            source_root: "/repo".to_string(),
+            vendor_mode: VendorMode::Active,
+            ..Default::default()
+        };
+        let config = ConvertConfig::new(PathBuf::from("/repo"), out_dir.clone());
+        emit_cache_manifest_for_prewritten(&config, &metadata, "", &first).expect("manifest");
+        let cache_dir = out_dir.join("cache");
+        let before = pack_bytes(&cache_dir);
+
+        let mut manifest = crate::scanner::load_cache_manifest(&out_dir).expect("load manifest");
+        let edited_rel = "mod05/f0005.py";
+        let old_shard = manifest.files[edited_rel].shard.clone();
+        let old_file = old_shard
+            .strip_prefix("cache/")
+            .expect("cache-relative shard")
+            .to_string();
+        let mut edited = units[5].clone();
+        edited.scanned.blake3_hash = "digest_noop_hash_0005".to_string();
+        assert!(rewrite_cache_shards_for_dirty_units(
+            &out_dir,
+            &mut manifest,
+            std::slice::from_ref(&edited),
+        )
+        .expect("rewrite dirty shard"));
+
+        let new_shard = manifest.files[edited_rel].shard.clone();
+        assert_ne!(old_shard, new_shard);
+        assert!(out_dir.join(&new_shard).is_file());
+        assert!(!out_dir.join(&old_shard).exists());
+
+        let after = pack_bytes(&cache_dir);
+        for (name, bytes) in &before {
+            if *name == old_file {
+                continue;
+            }
+            assert_eq!(
+                after.get(name),
+                Some(bytes),
+                "unrelated pack {name} must be untouched"
+            );
+        }
+
+        // Every sibling that used the old pack now uses the new one and keeps its digest.
+        for unit in &units {
+            let rel_path = unit.scanned.rel_path.as_str();
+            if rel_path == edited_rel {
+                continue;
+            }
+            let entry = &manifest.files[rel_path];
+            if entry.shard == new_shard {
+                assert_eq!(entry.structural_digest, unit.structural_digest());
+            }
+        }
+        // The caller persists the updated manifest; do the same before reloading from disk.
+        fs::write(
+            cache_dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        let cache = crate::scanner::load_cache_file(&out_dir).expect("reload packed cache");
+        assert_eq!(cache.files.len(), units.len());
+        assert_eq!(
+            cache.files[edited_rel].scanned.blake3_hash,
+            "digest_noop_hash_0005"
+        );
+    }
+
+    /// The parallel in-memory table rebuild used on incremental syncs must be byte-identical to
+    /// the streamed table writer used on cold builds.
+    #[test]
+    fn parallel_table_builder_matches_streamed_bytes() {
+        let tmp = TestTempDir::new("parallel_tables");
+        let index_dir = tmp.0.join("index");
+        fs::create_dir_all(&index_dir).expect("create index dir");
+
+        let calls: Vec<ResolvedCallEdge> = (0..97)
+            .map(|i| ResolvedCallEdge {
+                caller_id: format!("src/mod_{i}.c::caller_{i}"),
+                caller_name: format!("caller_{i}"),
+                callee_name: format!("callee\t{i}"),
+                callee_id: format!("src/mod_{i}.c::callee_{i}"),
+                file: format!("src/mod_{i}.c"),
+                line: i + 1,
+                tier: if i % 3 == 0 {
+                    ResolutionTier::ExternalOrMacro
+                } else {
+                    ResolutionTier::SameFile
+                },
+                section_id: format!("0{}-mod", i % 7),
+            })
+            .collect();
+        let xrefs: Vec<XrefEntry> = (0..97)
+            .map(|i| XrefEntry {
+                symbol: format!("symbol_{i}"),
+                category: "macro_ref".to_string(),
+                relation: "references".to_string(),
+                target: format!("TARGET\t{i}"),
+                file: format!("src/mod_{i}.c"),
+                line: i + 1,
+                section_id: format!("0{}-mod", i % 7),
+                context: "line\ncontext".to_string(),
+            })
+            .collect();
+        let indexes = BundleIndexes {
+            calls,
+            xrefs,
+            ..Default::default()
+        };
+
+        for table in ["xref.tsv", "calls.tsv"] {
+            let path = index_dir.join(table);
+            write_xref_tsv_file(&index_dir, &indexes).expect("streamed xref");
+            write_calls_tsv_file(&index_dir, &indexes).expect("streamed calls");
+            let streamed = fs::read(&path).expect("read streamed table");
+            fs::remove_file(&path).expect("remove streamed table");
+            write_xref_tsv_in_memory(&index_dir, &indexes).expect("in-memory xref");
+            write_calls_tsv_in_memory(&index_dir, &indexes).expect("in-memory calls");
+            let in_memory = fs::read(&path).expect("read in-memory table");
+            assert_eq!(
+                in_memory, streamed,
+                "{table} must be byte-identical across both writers"
+            );
+        }
     }
 
     #[test]

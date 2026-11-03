@@ -734,6 +734,57 @@ impl CacheShardEntry {
     }
 }
 
+/// Number of per-file cache units grouped into one packed shard on large repositories.
+pub const CACHE_PACK_UNITS: usize = 64;
+
+/// Repositories with more source files than this store their per-file AST cache as packed shards
+/// (`cache/pack-<16hex>.json`, [`CACHE_PACK_UNITS`] units each) instead of one small file per
+/// source file. Creating 12k tiny files costs minutes on a rotational disk; 195 packs do not.
+pub const CACHE_PACK_FILE_THRESHOLD: usize = 500;
+
+/// File-name prefix of a packed cache shard.
+pub const CACHE_PACK_PREFIX: &str = "pack-";
+
+/// Returns `true` when `shard` (a bundle-relative path or bare file name) names a packed shard.
+pub fn is_packed_cache_shard(shard: &str) -> bool {
+    shard
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| name.starts_with(CACHE_PACK_PREFIX))
+}
+
+/// Computes the deterministic file name of the packed shard holding the given
+/// `(rel_path, blake3_hash)` pairs: `pack-<16hex>.json`, where `<16hex>` is BLAKE3 over the pairs
+/// sorted by `rel_path`.
+pub fn cache_pack_file_name<'a, I>(pairs: I) -> String
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut sorted: Vec<(&str, &str)> = pairs.into_iter().collect();
+    sorted.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    for (rel_path, blake3_hash) in sorted {
+        hasher.update(rel_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(blake3_hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    format!(
+        "{CACHE_PACK_PREFIX}{}.json",
+        &hasher.finalize().to_hex()[..16]
+    )
+}
+
+/// Computes the deterministic packed shard file name for a chunk of parsed units.
+pub fn cache_pack_shard_name(units: &[&ParsedFileUnit]) -> String {
+    cache_pack_file_name(units.iter().map(|unit| {
+        (
+            unit.scanned.rel_path.as_str(),
+            unit.scanned.blake3_hash.as_str(),
+        )
+    }))
+}
+
 /// Per-file cache manifest stored at `output/<stem>/cache/manifest.json` (schema `2.1.0`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheManifest {
