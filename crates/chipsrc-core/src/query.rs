@@ -310,6 +310,32 @@ pub fn load_index_table(bundle_dir: &Path, name: &str) -> Result<String> {
     }
 }
 
+/// Byte-level counterpart of [`load_index_table`] for hot table walks (`index/macros.tsv`).
+///
+/// The header line is still validated exactly like [`load_index_table`], but the body is returned
+/// as raw bytes so a 100 MB table is never UTF-8-validated as a whole; rows that are not valid
+/// UTF-8 are skipped by the caller instead of failing the query.
+fn load_index_table_bytes(bundle_dir: &Path, name: &str) -> Result<Vec<u8>> {
+    let rel = if name.starts_with("index/") {
+        name.to_string()
+    } else {
+        format!("index/{name}")
+    };
+    let path = bundle_dir.join(&rel);
+    let incomplete = || ChipsrcError::IncompleteBundle {
+        bundle: bundle_dir.to_path_buf(),
+        missing: rel.clone(),
+    };
+    let bytes = fs::read(&path).map_err(|_| incomplete())?;
+    let first_end = memchr::memchr(b'\n', &bytes).unwrap_or(bytes.len());
+    let first = &bytes[..first_end];
+    let first = first.strip_suffix(b"\r").unwrap_or(first);
+    match std::str::from_utf8(first) {
+        Ok(header) if has_valid_tsv_header(&rel, header) => Ok(bytes),
+        _ => Err(incomplete()),
+    }
+}
+
 /// Queries functions, methods, constructors, entrypoints, and ISRs across bundles (`index/symbols.tsv`).
 pub fn query_symbols(
     bundles: &[PathBuf],
@@ -949,6 +975,127 @@ pub fn query_types(
     Ok(out)
 }
 
+/// One scored `index/macros.tsv` row. The raw row is kept verbatim so the (few) rendered rows can
+/// source their columns without allocating nine strings for every match in a 492k-row table.
+struct MacroRow {
+    bundle_dir: PathBuf,
+    bundle_name: String,
+    score: u8,
+    file: String,
+    line: usize,
+    raw: String,
+}
+
+impl MacroRow {
+    #[inline]
+    fn field(&self, idx: usize) -> &str {
+        self.raw.split('\t').nth(idx).unwrap_or("")
+    }
+}
+
+/// How aggressively [`MacroRowPrefilter`] admits rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MacroScanMode {
+    /// Rows that can score at least 2 (name-column identifier match) or an exact hex address.
+    Strong,
+    /// Every row that can score at all, including score-1 value/description substring matches.
+    Full,
+}
+
+/// Scans `index/macros.tsv` across `bundles` and returns every row that scores above zero.
+///
+/// The table is walked as raw bytes with `memchr` line offsets; rows are decoded and split only
+/// after the cheap prefilter admits them. Value/description substring matches (score 1) are only
+/// searched when no stronger match exists anywhere, because the caller drops score-1 rows as soon
+/// as any row reaches score 3 — so the common query never pays for that scan.
+fn collect_macro_rows(bundles: &[PathBuf], query: &str) -> Result<Vec<MacroRow>> {
+    let q_trim = query.trim();
+    let q_lower = q_trim.to_ascii_lowercase();
+    let q_hw = QueryHw::new(q_trim);
+
+    let mut hits = scan_macro_rows(bundles, &q_hw, &q_lower, MacroScanMode::Strong)?;
+    let has_strong = hits.iter().any(|h| h.score >= 3);
+    if q_hw.is_hex || has_strong {
+        if has_strong {
+            hits.retain(|h| h.score >= 2);
+        }
+        return Ok(hits);
+    }
+    scan_macro_rows(bundles, &q_hw, &q_lower, MacroScanMode::Full)
+}
+
+fn scan_macro_rows(
+    bundles: &[PathBuf],
+    q_hw: &QueryHw<'_>,
+    q_lower: &str,
+    mode: MacroScanMode,
+) -> Result<Vec<MacroRow>> {
+    let prefilter = MacroRowPrefilter::new(q_hw, mode);
+    let mut hits = Vec::new();
+
+    for bundle_dir in bundles {
+        let content = load_index_table_bytes(bundle_dir, "macros.tsv")?;
+        let bundle_name = bundle_name_from_dir(bundle_dir);
+        let mut line_start = 0usize;
+        let mut first_line = true;
+
+        let mut process = |raw: &[u8]| {
+            if first_line {
+                first_line = false;
+                return;
+            }
+            if raw.is_empty() || !prefilter.may_match(raw) {
+                return;
+            }
+            let Ok(line) = std::str::from_utf8(raw) else {
+                return;
+            };
+            let mut cols = line.split('\t');
+            let (Some(name), Some(_kind), Some(val), Some(hex_col)) =
+                (cols.next(), cols.next(), cols.next(), cols.next())
+            else {
+                return;
+            };
+            let (Some(file), Some(line_no), Some(_arch_layer), Some(_scope), Some(_section_id)) = (
+                cols.next(),
+                cols.next(),
+                cols.next(),
+                cols.next(),
+                cols.next(),
+            ) else {
+                return;
+            };
+            let Some(desc) = cols.next() else {
+                return;
+            };
+            let score = score_macro_row(name, val, hex_col, desc, q_hw, q_lower);
+            if score == 0 {
+                return;
+            }
+            hits.push(MacroRow {
+                bundle_dir: bundle_dir.clone(),
+                bundle_name: bundle_name.clone(),
+                score,
+                file: file.to_string(),
+                line: line_no.parse().unwrap_or(1),
+                raw: line.to_string(),
+            });
+        };
+
+        for newline in memchr::memchr_iter(b'\n', &content) {
+            let raw = &content[line_start..newline];
+            let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+            process(raw);
+            line_start = newline + 1;
+        }
+        if line_start < content.len() {
+            process(&content[line_start..]);
+        }
+    }
+
+    Ok(hits)
+}
+
 /// Queries `#define` macros, constants, bitmasks, and MMIO register accesses (`index/macros.tsv`),
 /// normalizing hex literals (`0x400` <-> `400h`) and peripheral separators (`PERIPH_REG` <-> `PERIPH->REG` <-> `PERIPH.REG`).
 pub fn query_macros(
@@ -957,103 +1104,12 @@ pub fn query_macros(
     show_source: bool,
     limit: usize,
 ) -> Result<String> {
-    let q_trim = query.trim();
-    let q_lower = q_trim.to_ascii_lowercase();
-    let q_hw = QueryHw::new(q_trim);
-
-    struct MacroHit {
-        bundle_dir: PathBuf,
-        bundle_name: String,
-        name: String,
-        kind: String,
-        value: String,
-        hex_addr: String,
-        file: String,
-        line: usize,
-        arch_layer: String,
-        scope: String,
-        section_id: String,
-        description: String,
-        score: u8,
-    }
-
-    let mut hits = Vec::new();
-
-    for bundle_dir in bundles {
-        let content = load_index_table(bundle_dir, "macros.tsv")?;
-        let bundle_name = bundle_name_from_dir(bundle_dir);
-
-        for line in content.lines().skip(1) {
-            let cols: Vec<&str> = line.split('\t').collect();
-            if cols.len() < 10 {
-                continue;
-            }
-            let name = cols[0];
-            let kind = cols[1];
-            let val = cols[2];
-            let hex_col = cols[3];
-            let desc = cols[9];
-
-            let row_hex = if hex_col != "-" && !hex_col.is_empty() {
-                normalize_hex_literal(hex_col)
-            } else {
-                normalize_hex_literal(val)
-            };
-
-            let hex_exact = match (&q_hw.hex, &row_hex) {
-                (Some(qh), Some(rh)) => qh.eq_ignore_ascii_case(rh),
-                _ => false,
-            };
-
-            let score = if hex_exact {
-                5
-            } else if q_hw.is_hex {
-                // Issue #9: When the query is an explicit hex address/mask (`0xFF`, `41C00004h`),
-                // require exact numeric hex equality so `0xFF` never substring-match `0xFFFFFFFF`.
-                0
-            } else {
-                let id_score = score_hw_identifier_match_prepared(name, &q_hw);
-                let val_score = if !q_lower.is_empty()
-                    && (ascii_contains_ignore_case(val.as_bytes(), q_lower.as_bytes())
-                        || ascii_contains_ignore_case(desc.as_bytes(), q_lower.as_bytes()))
-                {
-                    1
-                } else {
-                    0
-                };
-                id_score.max(val_score)
-            };
-
-            if score == 0 {
-                continue;
-            }
-
-            hits.push(MacroHit {
-                bundle_dir: bundle_dir.clone(),
-                bundle_name: bundle_name.clone(),
-                name: name.to_string(),
-                kind: kind.to_string(),
-                value: val.to_string(),
-                hex_addr: hex_col.to_string(),
-                file: cols[4].to_string(),
-                line: cols[5].parse().unwrap_or(1),
-                arch_layer: cols[6].to_string(),
-                scope: cols[7].to_string(),
-                section_id: cols[8].to_string(),
-                description: desc.to_string(),
-                score,
-            });
-        }
-    }
+    let mut hits = collect_macro_rows(bundles, query)?;
 
     if hits.is_empty() {
         return Ok(format!(
             "No macros or MMIO registers matched '{query}'. Try `chipsrc xref \"{query}\"` or `chipsrc search \"{query}\"`.\n"
         ));
-    }
-
-    if hits.iter().any(|h| h.score >= 3) {
-        hits.retain(|h| h.score >= 2);
     }
 
     hits.sort_by(|a, b| {
@@ -1066,25 +1122,26 @@ pub fn query_macros(
     let total = hits.len();
     let mut out = String::new();
     let mut snippet_cache = SourceSnippetCache::default();
-    for h in hits.into_iter().take(limit) {
-        let hex_info = if h.hex_addr != "-" && !h.hex_addr.is_empty() {
-            format!(" [hex={}]", h.hex_addr)
+    for h in hits.drain(..).take(limit) {
+        let hex_addr = h.field(3);
+        let hex_info = if hex_addr != "-" && !hex_addr.is_empty() {
+            format!(" [hex={hex_addr}]")
         } else {
             String::new()
         };
         out.push_str(&format!(
             "[{}] `{}` ({}){} = `{}` | `{}:{}` | layer={} scope={} shard=`{}` ({})\n",
             h.bundle_name,
-            h.name,
-            h.kind,
+            h.field(0),
+            h.field(1),
             hex_info,
-            h.value,
+            h.field(2),
             h.file,
             h.line,
-            h.arch_layer,
-            h.scope,
-            h.section_id,
-            h.description
+            h.field(6),
+            h.field(7),
+            h.field(8),
+            h.field(9)
         ));
 
         if show_source {
@@ -2304,17 +2361,209 @@ fn ascii_contains_ignore_case(haystack: &[u8], needle_upper_or_lower: &[u8]) -> 
     let first_lo = needle_upper_or_lower[0].to_ascii_lowercase();
     let first_hi = needle_upper_or_lower[0].to_ascii_uppercase();
     let max_start = haystack.len() - nlen;
-    let mut i = 0;
-    while i <= max_start {
-        let b = haystack[i];
-        if (b == first_lo || b == first_hi)
-            && haystack[i..i + nlen].eq_ignore_ascii_case(needle_upper_or_lower)
+    // Candidate start positions are found with SIMD; positions are yielded in increasing order, so
+    // the first one past `max_start` ends the scan.
+    for i in memchr::memchr2_iter(first_lo, first_hi, haystack) {
+        if i > max_start {
+            return false;
+        }
+        if haystack[i..i + nlen].eq_ignore_ascii_case(needle_upper_or_lower) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns the trailing ASCII alphanumeric run of `s` (the register/field segment of a peripheral
+/// identifier), or `None` when the string has no alphanumerics.
+fn last_alnum_run(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && !bytes[end - 1].is_ascii_alphanumeric() {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    let mut start = end;
+    while start > 0 && bytes[start - 1].is_ascii_alphanumeric() {
+        start -= 1;
+    }
+    Some(&s[start..end])
+}
+
+/// Returns `true` when `haystack` contains the contiguous hex digit sequence `digits` (uppercase,
+/// without the `0x` prefix) ignoring `_` separators and ASCII case.
+fn line_contains_hex_digits(haystack: &[u8], digits: &[u8]) -> bool {
+    if digits.is_empty() {
+        return true;
+    }
+    let first = digits[0];
+    let first_lo = first.to_ascii_lowercase();
+    let first_hi = first.to_ascii_uppercase();
+    'candidates: for start in memchr::memchr2_iter(first_lo, first_hi, haystack) {
+        let mut j = start;
+        let mut k = 0usize;
+        while k < digits.len() && j < haystack.len() {
+            let b = haystack[j];
+            if b == b'_' {
+                j += 1;
+                continue;
+            }
+            if !b.is_ascii_hexdigit() || b.to_ascii_uppercase() != digits[k] {
+                continue 'candidates;
+            }
+            k += 1;
+            j += 1;
+        }
+        if k == digits.len() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Cheap, sound row filter for `index/macros.tsv`.
+///
+/// Every row that can score at least 2 must contain the trimmed query, its peripheral stem (when
+/// at least three characters long), or the query's trailing alphanumeric run **in its name
+/// column** — otherwise it cannot survive [`score_hw_identifier_match_prepared`]. Hex queries
+/// additionally require the row's hex columns to contain the query digits. In [`Full`] mode the
+/// value/description substring path is admitted too. The filter runs on the raw line before column
+/// splitting or UTF-8 decoding, so ~97% of a 100 MB `macros.tsv` never allocates.
+///
+/// [`Full`]: MacroScanMode::Full
+struct MacroRowPrefilter {
+    name_needles: Vec<Vec<u8>>,
+    /// Trimmed query, searched in the value/description columns (`Full` mode only).
+    value_needle: Option<Vec<u8>>,
+    hex_digits: Option<Vec<u8>>,
+    hex_only: bool,
+}
+
+impl MacroRowPrefilter {
+    fn new(q: &QueryHw<'_>, mode: MacroScanMode) -> Self {
+        let mut name_needles: Vec<Vec<u8>> = Vec::with_capacity(3);
+        let mut push = |needle: &str| {
+            if needle.is_empty() {
+                return;
+            }
+            let lower = needle.to_ascii_lowercase();
+            let bytes = lower.into_bytes();
+            if !name_needles.contains(&bytes) {
+                name_needles.push(bytes);
+            }
+        };
+        push(q.raw);
+        let stem = strip_periph_instance_slice(q.raw);
+        if stem.len() >= 3 {
+            push(stem);
+        }
+        if let Some(last) = last_alnum_run(q.raw) {
+            push(last);
+        }
+        // Longest needles first: they select the fewest rows on this table.
+        name_needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
+
+        let hex_digits = q.hex.as_deref().and_then(|hex| {
+            let body = hex.strip_prefix("0x").or_else(|| hex.strip_prefix("0X"))?;
+            let digits: Vec<u8> = body
+                .bytes()
+                .filter(|b| *b != b'_')
+                .map(|b| b.to_ascii_uppercase())
+                .collect();
+            if digits.is_empty() || !body.bytes().all(|b| b.is_ascii_hexdigit() || b == b'_') {
+                None
+            } else {
+                Some(digits)
+            }
+        });
+
+        let value_needle = (mode == MacroScanMode::Full && !q.raw.is_empty())
+            .then(|| q.raw.to_ascii_lowercase().into_bytes());
+
+        Self {
+            hex_only: q.is_hex && hex_digits.is_some(),
+            name_needles,
+            value_needle,
+            hex_digits,
+        }
+    }
+
+    #[inline]
+    fn may_match(&self, line: &[u8]) -> bool {
+        if self.hex_only {
+            return self
+                .hex_digits
+                .as_deref()
+                .is_some_and(|d| line_contains_hex_digits(line, d));
+        }
+        // Identifier scoring only ever looks at the name column; value/description scoring looks
+        // at the columns after it. Splitting on the first tab keeps both checks exact and short.
+        let name_end = memchr::memchr(b'\t', line).unwrap_or(line.len());
+        let (name, rest) = line.split_at(name_end);
+        if self
+            .name_needles
+            .iter()
+            .any(|needle| ascii_contains_ignore_case(name, needle))
         {
             return true;
         }
-        i += 1;
+        if let Some(needle) = self.value_needle.as_deref() {
+            if ascii_contains_ignore_case(rest, needle) {
+                return true;
+            }
+        }
+        self.hex_digits
+            .as_deref()
+            .is_some_and(|d| line_contains_hex_digits(rest, d))
     }
-    false
+}
+
+/// Scores one `index/macros.tsv` row. Hex normalization only runs when the query is hex, so a
+/// non-hex row walk never allocates a `String` per row.
+#[inline]
+fn score_macro_row(
+    name: &str,
+    val: &str,
+    hex_col: &str,
+    desc: &str,
+    q: &QueryHw<'_>,
+    q_lower: &str,
+) -> u8 {
+    let hex_exact = if q.hex.is_some() {
+        let row_hex = if hex_col != "-" && !hex_col.is_empty() {
+            normalize_hex_literal(hex_col)
+        } else {
+            normalize_hex_literal(val)
+        };
+        match (&q.hex, &row_hex) {
+            (Some(qh), Some(rh)) => qh.eq_ignore_ascii_case(rh),
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    if hex_exact {
+        return 5;
+    }
+    if q.is_hex {
+        // Issue #9: When the query is an explicit hex address/mask (`0xFF`, `41C00004h`),
+        // require exact numeric hex equality so `0xFF` never substring-match `0xFFFFFFFF`.
+        return 0;
+    }
+
+    let id_score = score_hw_identifier_match_prepared(name, q);
+    let val_score = if !q_lower.is_empty()
+        && (ascii_contains_ignore_case(val.as_bytes(), q_lower.as_bytes())
+            || ascii_contains_ignore_case(desc.as_bytes(), q_lower.as_bytes()))
+    {
+        1
+    } else {
+        0
+    };
+    id_score.max(val_score)
 }
 
 /// Normalizes and scores hardware/code identifier matches across `PERIPH_REG`, `PERIPH->REG`, `PERIPH.REG`, and `PERIPH::REG`.
@@ -2531,10 +2780,24 @@ fn is_valid_bundle_dir(dir: &Path) -> bool {
                 && dir.join("cache").is_dir()))
 }
 
+/// Minimal projection of `meta.json` for [`bundle_name_from_dir`]: serde skips (without
+/// materializing) every other field, so naming a bundle never allocates 12k `FileStamp` entries.
+#[derive(serde::Deserialize)]
+struct BundleNameProbe {
+    #[serde(default)]
+    metadata: BundleNameMetadata,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct BundleNameMetadata {
+    #[serde(default)]
+    repo_name: String,
+}
+
 fn bundle_name_from_dir(bundle_dir: &Path) -> String {
-    if let Some(meta) = load_meta_file(bundle_dir) {
-        if !meta.metadata.repo_name.is_empty() {
-            return meta.metadata.repo_name;
+    if let Some(name) = bundle_repo_name(bundle_dir) {
+        if !name.is_empty() {
+            return name;
         }
     }
     bundle_dir
@@ -2542,6 +2805,72 @@ fn bundle_name_from_dir(bundle_dir: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("bundle")
         .to_string()
+}
+
+/// Reads `metadata.repo_name` from `meta.json` without deserializing the (large) `file_stamps`
+/// array. `repo_name` is the first key of the first root object, so a 64 KiB prefix normally
+/// suffices; otherwise the JSON is parsed through a projection struct that skips every other field.
+fn bundle_repo_name(bundle_dir: &Path) -> Option<String> {
+    use std::io::Read;
+
+    let meta_path = bundle_dir.join("meta.json");
+    if let Ok(mut file) = fs::File::open(&meta_path) {
+        let mut prefix = vec![0u8; 64 * 1024];
+        if let Ok(n) = file.read(&mut prefix) {
+            prefix.truncate(n);
+            if let Some(name) = repo_name_from_meta_prefix(&prefix) {
+                return Some(name);
+            }
+        }
+    }
+
+    let bytes = fs::read(&meta_path).ok()?;
+    let probe: BundleNameProbe = serde_json::from_slice(&bytes).ok()?;
+    Some(probe.metadata.repo_name)
+}
+
+/// Extracts the value of the first `"repo_name"` key from a JSON prefix. Returns `None` when the
+/// key/value is missing, escapes are involved, or the prefix does not look like bundle metadata,
+/// so the caller falls back to a full (but allocation-free) projection parse.
+fn repo_name_from_meta_prefix(bytes: &[u8]) -> Option<String> {
+    let key = b"\"repo_name\"";
+    let pos = memchr::memmem::find(bytes, key)?;
+    // The key must sit inside the root `metadata` object, i.e. after its key, so a `repo_name`
+    // substring inside some earlier string value can never be mistaken for the field name.
+    let meta_key = b"\"metadata\"";
+    let meta_pos = memchr::memmem::find(&bytes[..pos], meta_key)?;
+    if meta_pos + meta_key.len() >= pos {
+        return None;
+    }
+    let mut i = pos + key.len();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    i += 1;
+    let start = i;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => return None,
+            b'"' => {
+                return std::str::from_utf8(&bytes[start..i])
+                    .ok()
+                    .map(str::to_string)
+            }
+            b if b < 0x20 => return None,
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Executes a structured JSON query for `subcommand` (`sym`, `callers`, `callees`, `type`,
@@ -2788,72 +3117,27 @@ pub fn query_subcommand_json(
             Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| "[]".to_string()))
         }
         "macro" => {
-            let q_hw = QueryHw::new(q_trim);
-            let mut items = Vec::new();
-            for bundle_dir in bundles {
-                let content = load_index_table(bundle_dir, "macros.tsv")?;
-                let bundle_name = bundle_name_from_dir(bundle_dir);
-                for line in content.lines().skip(1) {
-                    let cols: Vec<&str> = line.split('\t').collect();
-                    if cols.len() < 10 {
-                        continue;
-                    }
-                    let name = cols[0];
-                    let val = cols[2];
-                    let hex_col = cols[3];
-                    let desc = cols[9];
-                    let row_hex = if hex_col != "-" && !hex_col.is_empty() {
-                        normalize_hex_literal(hex_col)
-                    } else {
-                        normalize_hex_literal(val)
-                    };
-                    let hex_exact = match (&q_hw.hex, &row_hex) {
-                        (Some(qh), Some(rh)) => qh.eq_ignore_ascii_case(rh),
-                        _ => false,
-                    };
-                    let score = if hex_exact {
-                        5u8
-                    } else if q_hw.is_hex {
-                        0
-                    } else {
-                        let id_score = score_hw_identifier_match_prepared(name, &q_hw);
-                        let val_score = if !q_lower.is_empty()
-                            && (ascii_contains_ignore_case(val.as_bytes(), q_lower.as_bytes())
-                                || ascii_contains_ignore_case(desc.as_bytes(), q_lower.as_bytes()))
-                        {
-                            1
-                        } else {
-                            0
-                        };
-                        id_score.max(val_score)
-                    };
-                    if score == 0 {
-                        continue;
-                    }
-                    items.push((
-                        score,
-                        serde_json::json!({
-                            "bundle": bundle_name,
-                            "name": name,
-                            "kind": cols[1],
-                            "value": val,
-                            "hex_addr": hex_col,
-                            "file": cols[4],
-                            "line": cols[5].parse::<usize>().unwrap_or(1),
-                            "arch_layer": cols[6],
-                            "scope": cols[7],
-                            "section_id": cols[8],
-                            "description": desc,
-                        }),
-                    ));
-                }
-            }
-            if items.iter().any(|(s, _)| *s >= 3) {
-                items.retain(|(s, _)| *s >= 2);
-            }
-            items.sort_by_key(|a| std::cmp::Reverse(a.0));
-            let out: Vec<serde_json::Value> =
-                items.into_iter().take(limit).map(|(_, v)| v).collect();
+            let mut hits = collect_macro_rows(bundles, q_trim)?;
+            hits.sort_by_key(|h| std::cmp::Reverse(h.score));
+            let out: Vec<serde_json::Value> = hits
+                .iter()
+                .take(limit)
+                .map(|h| {
+                    serde_json::json!({
+                        "bundle": h.bundle_name,
+                        "name": h.field(0),
+                        "kind": h.field(1),
+                        "value": h.field(2),
+                        "hex_addr": h.field(3),
+                        "file": h.file,
+                        "line": h.line,
+                        "arch_layer": h.field(6),
+                        "scope": h.field(7),
+                        "section_id": h.field(8),
+                        "description": h.field(9),
+                    })
+                })
+                .collect();
             Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| "[]".to_string()))
         }
         "section" => {
@@ -3056,6 +3340,224 @@ mod tests {
             4
         );
         assert_eq!(score_hw_identifier_match("TIM1->CCR1", "UART0_DR"), 0);
+    }
+
+    #[test]
+    fn ascii_contains_ignore_case_matches_reference_semantics() {
+        for (haystack, needle, expected) in [
+            ("GPIOA_MODER", "gpioa", true),
+            ("gpioa_moder", "GPIOA", true),
+            ("TIM1->CCR1", "->", true),
+            ("GPIOA_MODER", "MODERX", false),
+            ("x", "xy", false),
+            ("", "", true),
+            ("abc", "", true),
+            ("aXbXc", "XBX", true),
+            ("aXbXc", "XCX", false),
+        ] {
+            assert_eq!(
+                ascii_contains_ignore_case(haystack.as_bytes(), needle.as_bytes()),
+                expected,
+                "haystack={haystack:?} needle={needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_contains_hex_digits_ignores_underscores_and_case() {
+        let digits = |s: &str| s.as_bytes().to_vec();
+        assert!(line_contains_hex_digits(
+            b"0x41C0_0004UL\tx",
+            &digits("41C00004")
+        ));
+        assert!(line_contains_hex_digits(b"0x40020000", &digits("40020000")));
+        assert!(line_contains_hex_digits(b"0x0004", &digits("4")));
+        assert!(!line_contains_hex_digits(b"0x0004", &digits("400")));
+        assert!(!line_contains_hex_digits(b"timeout", &digits("E0")));
+        assert!(!line_contains_hex_digits(b"", &digits("0")));
+        assert!(line_contains_hex_digits(b"DEAD_BEEF", &digits("DEADBEEF")));
+        assert!(!line_contains_hex_digits(
+            b"DEAD_BEEF",
+            &digits("DEADBEEF00")
+        ));
+    }
+
+    /// The prefilter may not reject any row that the full scorer would accept, for every
+    /// query/row shape the macro table produces.
+    #[test]
+    fn macro_prefilter_never_rejects_a_scoring_row() {
+        let periphs = [
+            "GPIO", "GPIOA", "GPIOB", "GPIOx", "TIM", "TIM2", "TIM13", "TIMx", "USART1", "RCC",
+            "DMA2", "_GPIOA", "gpioa", "EXTI", "MOTOR", "HAL",
+        ];
+        let regs = [
+            "MODER",
+            "CCR1",
+            "IRQn",
+            "CR",
+            "AHB1ENR",
+            "IDR",
+            "MODER_MODER0",
+        ];
+        let seps = ["_", "->", ".", "::"];
+        let mut names: Vec<String> = Vec::new();
+        for p in periphs {
+            names.push(p.to_string());
+            for r in regs {
+                for sep in seps {
+                    names.push(format!("{p}{sep}{r}"));
+                }
+            }
+        }
+        names.extend(
+            [
+                "REG_CTRL",
+                "MASK_ALL",
+                "HAL_GPIO_Init",
+                "__HAL_TIM_GET_COUNTER",
+                "MOTOR_CTRL_H",
+                "XGPIO_MODERY",
+                "A_B_C",
+                "USART1_IRQn",
+                "LED1_Pin",
+                "stm32f4xx_hal_gpio.c",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+
+        let values = [
+            "0x41C00004UL",
+            "0xFFFFFFFFUL",
+            "GPIOA->MODER = id;",
+            "GPIO_MODER_MODER0_Msk",
+            "(1 << 5)",
+            "400h",
+            "0x4002_0000U",
+            "-",
+            "1",
+        ];
+        let hex_cols = ["-", "0x41C00004", "0x0", "0xFFFFFFFF"];
+        let descs = ["", "MMIO register", "MODER bits", "GPIOA->MODER = id;"];
+        let queries = [
+            "GPIO_MODER",
+            "GPIOA_MODER",
+            "GPIOA->MODER",
+            "GPIOA.MODER",
+            "GPIOx_MODER",
+            "MODER",
+            "GPIO",
+            "GPIOA",
+            "TIM3",
+            "TIMx",
+            "USART1_IRQn",
+            "HAL_GPIO_Init",
+            "HAL_TIM_GET_COUNTER",
+            "41C00004h",
+            "0x41C00004",
+            "FFh",
+            "0xFF",
+            "400h",
+            "0x40020000",
+            "MODER_MODER0",
+            "IRQn",
+            "CR",
+        ];
+
+        for query in queries {
+            let q_hw = QueryHw::new(query);
+            let q_lower = query.trim().to_ascii_lowercase();
+            let strong = MacroRowPrefilter::new(&q_hw, MacroScanMode::Strong);
+            let full = MacroRowPrefilter::new(&q_hw, MacroScanMode::Full);
+            for name in &names {
+                for val in values {
+                    for hex_col in hex_cols {
+                        for desc in descs {
+                            let score = score_macro_row(name, val, hex_col, desc, &q_hw, &q_lower);
+                            if score == 0 {
+                                continue;
+                            }
+                            let line = format!(
+                                "{name}\tmacro\t{val}\t{hex_col}\tsrc/drv.c\t1\tdrvs\tfirst_party\t01-src\t{desc}"
+                            );
+                            assert!(
+                                full.may_match(line.as_bytes()),
+                                "query {query:?} full prefilter rejected scoring row {line:?} (score {score})"
+                            );
+                            if score >= 2 {
+                                assert!(
+                                    strong.may_match(line.as_bytes()),
+                                    "query {query:?} strong prefilter rejected row {line:?} (score {score})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn macro_prefilter_rejects_non_matching_rows() {
+        let q_hw = QueryHw::new("GPIO_MODER");
+        let prefilter = MacroRowPrefilter::new(&q_hw, MacroScanMode::Full);
+        assert!(!prefilter.may_match(
+            b"USART1_CR1\tmacro\t0x0\t-\tsrc/usart.c\t10\tdrvs\tfirst_party\t01-src\tEnable bit"
+        ));
+        assert!(prefilter.may_match(
+            b"GPIOH_MODER\tmacro\t0x0\t-\tsrc/gpio.c\t10\tdrvs\tfirst_party\t01-src\tMode register"
+        ));
+        // Value/description columns only score in `Full` mode.
+        let value_row = b"REG_CTRL\tmmio_addr\t0x0\t-\tsrc/drv.c\t1\tdrvs\tfirst_party\t01-src\tGPIO_MODER bits";
+        assert!(prefilter.may_match(value_row));
+        let strong = MacroRowPrefilter::new(&q_hw, MacroScanMode::Strong);
+        assert!(!strong.may_match(value_row));
+        let hex = MacroRowPrefilter::new(&QueryHw::new("41C00004h"), MacroScanMode::Strong);
+        assert!(!hex.may_match(
+            b"USART1_CR1\tmacro\t0x0\t-\tsrc/usart.c\t10\tdrvs\tfirst_party\t01-src\tEnable bit"
+        ));
+        assert!(hex.may_match(
+            b"REG_CTRL\tmmio_addr\t0x41C00004UL\t0x41C00004\tsrc/drv.c\t1\tdrvs\tfirst_party\t01-src\tMMIO"
+        ));
+    }
+
+    #[test]
+    fn bundle_name_from_dir_reads_repo_name_without_materializing_stamps() {
+        let tmp = TestTempDir::new("bundle_name");
+        let bundle_dir = tmp.0.join("output").join("demo");
+        fs::create_dir_all(&bundle_dir).unwrap();
+        let mut stamps = Vec::new();
+        for i in 0..5_000 {
+            stamps.push(serde_json::json!({
+                "rel_path": format!("src/file_{i}.c"),
+                "size_bytes": 10,
+                "mtime_secs": 1_700_000_000u64,
+                "mtime_nanos": 0,
+                "line_count": 1,
+                "blake3_hash": "0123456789abcdef",
+                "scope": "first_party",
+                "arch_layer": "drvs",
+            }));
+        }
+        let meta = serde_json::json!({
+            "metadata": {
+                "repo_name": "demo-repo",
+                "source_root": "D:/repo",
+                "fingerprint": "abc",
+                "total_files": stamps.len(),
+                "file_stamps": stamps,
+            },
+            "sanity": { "score": 90 },
+        });
+        fs::write(
+            bundle_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(bundle_name_from_dir(&bundle_dir), "demo-repo");
+
+        fs::write(bundle_dir.join("meta.json"), b"{ truncated").unwrap();
+        assert_eq!(bundle_name_from_dir(&bundle_dir), "demo");
     }
 
     #[test]

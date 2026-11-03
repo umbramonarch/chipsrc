@@ -21,10 +21,34 @@ pub fn collect_symbol_tables(
     Vec<ExtractedType>,
     Vec<ExtractedMacro>,
 ) {
-    let mut symbols: Vec<ExtractedSymbol> = units
-        .iter()
-        .flat_map(|u| u.symbols.iter().cloned())
-        .collect();
+    // Pre-size every table: a 12k-file corpus holds ~59k symbols, ~3k types, and ~492k macros, so
+    // growing these vectors geometrically would recopy hundreds of megabytes of owned strings.
+    let symbol_count: usize = units.iter().map(|u| u.symbols.len()).sum();
+    let type_count: usize = units.iter().map(|u| u.types.len()).sum();
+    let macro_count: usize = units.iter().map(|u| u.macros.len()).sum();
+
+    // Deep-cloning ~1.7M owned rows is allocation-bound, so clone in parallel batches and append
+    // in unit order. The batch bounds the temporarily duplicated memory while keeping the result
+    // identical to a serial clone (order follows `units`).
+    const COLLECT_BATCH: usize = 512;
+    let mut symbols: Vec<ExtractedSymbol> = Vec::with_capacity(symbol_count);
+    let mut types: Vec<ExtractedType> = Vec::with_capacity(type_count);
+    let mut macros: Vec<ExtractedMacro> = Vec::with_capacity(macro_count);
+    for batch in units.chunks(COLLECT_BATCH) {
+        let parts: Vec<(
+            Vec<ExtractedSymbol>,
+            Vec<ExtractedType>,
+            Vec<ExtractedMacro>,
+        )> = batch
+            .par_iter()
+            .map(|u| (u.symbols.clone(), u.types.clone(), u.macros.clone()))
+            .collect();
+        for (mut batch_symbols, mut batch_types, mut batch_macros) in parts {
+            symbols.append(&mut batch_symbols);
+            types.append(&mut batch_types);
+            macros.append(&mut batch_macros);
+        }
+    }
     symbols.sort_by(|a, b| {
         a.file
             .cmp(&b.file)
@@ -42,8 +66,6 @@ pub fn collect_symbol_tables(
     // is transferred to the implementation when the implementation has no doc comment.
     merge_c_family_header_prototypes(&mut symbols);
 
-    let mut types: Vec<ExtractedType> =
-        units.iter().flat_map(|u| u.types.iter().cloned()).collect();
     types.sort_by(|a, b| {
         a.file
             .cmp(&b.file)
@@ -54,10 +76,6 @@ pub fn collect_symbol_tables(
     });
     types.dedup_by(|a, b| a.type_id == b.type_id && a.start_line == b.start_line);
 
-    let mut macros: Vec<ExtractedMacro> = units
-        .iter()
-        .flat_map(|u| u.macros.iter().cloned())
-        .collect();
     macros.sort_by(|a, b| {
         a.file
             .cmp(&b.file)
@@ -2511,6 +2529,78 @@ mod tests {
             receiver_or_qualifier: receiver_or_qualifier.map(ToOwned::to_owned),
             call_line,
         }
+    }
+
+    #[test]
+    fn collect_symbol_tables_parallel_batches_preserve_rows_and_order() {
+        // Cross the 512-unit parallel-clone batch boundary and feed units in reverse path order.
+        let count = 600usize;
+        let mut units: Vec<ParsedFileUnit> = Vec::with_capacity(count);
+        for i in (0..count).rev() {
+            let file = format!("src/f{i:03}.c");
+            let mut unit = sample_unit(
+                &file,
+                FileScope::FirstParty,
+                ArchLayer::Drivers,
+                LanguageKind::C,
+                vec![sample_symbol(
+                    &file,
+                    &format!("fn_{i}"),
+                    i + 1,
+                    FileScope::FirstParty,
+                    ArchLayer::Drivers,
+                    "01-src",
+                )],
+                Vec::new(),
+                Vec::new(),
+            );
+            unit.macros.push(ExtractedMacro {
+                name: format!("M_{i}"),
+                kind: MacroKind::ObjectMacro,
+                value_or_args: "1".to_string(),
+                hex_addr: None,
+                file: file.clone(),
+                line: i + 1,
+                scope: FileScope::FirstParty,
+                arch_layer: ArchLayer::Drivers,
+                section_id: "01-src".to_string(),
+                description: String::new(),
+            });
+            unit.types.push(ExtractedType {
+                type_id: format!("{file}::T_{i}"),
+                name: format!("T_{i}"),
+                kind: crate::model::TypeKind::Struct,
+                visibility: Visibility::Public,
+                file: file.clone(),
+                start_line: 1,
+                end_line: 2,
+                fields_summary: String::new(),
+                doc_summary: String::new(),
+                scope: FileScope::FirstParty,
+                arch_layer: ArchLayer::Drivers,
+                section_id: "01-src".to_string(),
+            });
+            units.push(unit);
+        }
+
+        let (symbols, types, macros) = collect_symbol_tables(&units);
+        assert_eq!(symbols.len(), count);
+        assert_eq!(types.len(), count);
+        assert_eq!(macros.len(), count);
+        for i in 0..count {
+            assert_eq!(symbols[i].name, format!("fn_{i}"));
+            assert_eq!(types[i].name, format!("T_{i}"));
+            assert_eq!(macros[i].name, format!("M_{i}"));
+        }
+        assert!(symbols.windows(2).all(
+            |w| (w[0].file.as_str(), w[0].start_line) <= (w[1].file.as_str(), w[1].start_line)
+        ));
+        assert!(macros
+            .windows(2)
+            .all(|w| (w[0].file.as_str(), w[0].line) <= (w[1].file.as_str(), w[1].line)));
+        assert!(types.windows(2).all(
+            |w| (w[0].file.as_str(), w[0].start_line) <= (w[1].file.as_str(), w[1].start_line)
+        ));
     }
 
     fn sample_unit(

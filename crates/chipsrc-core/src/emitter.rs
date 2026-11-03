@@ -242,7 +242,9 @@ fn sink_write(
     out.inner
         .write_all(bytes)
         .map_err(|e| ChipsrcError::io(path, e))?;
-    out.hasher.update(bytes);
+    if let Some(hasher) = out.hasher.as_mut() {
+        hasher.update(bytes);
+    }
     out.len += bytes.len() as u64;
     Ok(())
 }
@@ -275,7 +277,9 @@ impl<'a> RowSink<'a> {
 /// Writer that hashes and counts everything written through it.
 struct HashingWriter<W: std::io::Write> {
     inner: W,
-    hasher: blake3::Hasher,
+    /// `None` when the target does not exist yet: a cold build has nothing to compare against, so
+    /// hashing ~480 MB of fresh table text would be wasted CPU.
+    hasher: Option<blake3::Hasher>,
     len: u64,
 }
 
@@ -295,7 +299,7 @@ where
     let hashing = match fs::File::create(&tmp_path) {
         Ok(file) => HashingWriter {
             inner: std::io::BufWriter::with_capacity(1 << 20, file),
-            hasher: blake3::Hasher::new(),
+            hasher: existing_len.map(|_| blake3::Hasher::new()),
             len: 0,
         },
         Err(source) => return Err(ChipsrcError::io(&tmp_path, source)),
@@ -314,9 +318,11 @@ where
         len,
         mut inner,
     } = hashing;
-    if existing_len == Some(len) && file_hash(path).is_some_and(|hash| hash == hasher.finalize()) {
-        let _ = fs::remove_file(&tmp_path);
-        return Ok(());
+    if let (Some(existing_len), Some(hasher)) = (existing_len, hasher) {
+        if existing_len == len && file_hash(path).is_some_and(|hash| hash == hasher.finalize()) {
+            let _ = fs::remove_file(&tmp_path);
+            return Ok(());
+        }
     }
     // Flush explicitly instead of `into_inner()` so a flush failure reports the target path.
     inner.flush().map_err(|e| ChipsrcError::io(path, e))?;
@@ -528,15 +534,19 @@ pub fn ensure_claudeignore_entry(repo_path: &Path, output_root: &Path) -> Result
     Ok(true)
 }
 
+/// Where `emit_bundle` gets its per-file cache shards.
+pub enum CacheShardSource<'a> {
+    /// A worker thread already serialized every unit's shard; the manifest is emitted from these
+    /// identities, so the caller may drop its parsed units before calling the emitter.
+    Prewritten(&'a PrewrittenCache),
+    /// Serialize the units here (e.g. the coordinate-shift tier, which has no writer thread).
+    Units(&'a [ParsedFileUnit]),
+}
+
 /// Emits the Hierarchical Agent Codebase Bundle (`INDEX.md`, `sections/*.md`,
 /// `index/*.tsv`, `cache/manifest.json` + `cache/<shard>.json`, optional `<repo_name>.md`,
 /// and `.claudeignore`). `meta.json` is written once by `convert_repo` after final timings
 /// are recorded.
-///
-/// `resolve_prewritten` is invoked after the table artifacts are written and before the per-file
-/// AST cache: the caller uses that point to join the worker thread that streams `cache/<shard>.json`
-/// files, so the (many small, I/O-bound) cache writes overlap the table output instead of
-/// extending the critical path.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_bundle(
     config: &ConvertConfig,
@@ -544,52 +554,51 @@ pub fn emit_bundle(
     sanity: &SanityReport,
     sections: &[SectionShard],
     indexes: &BundleIndexes,
-    units: &[ParsedFileUnit],
+    cache_source: CacheShardSource<'_>,
     blueprint_hash: &str,
-    resolve_prewritten: &mut dyn FnMut() -> Result<FxHashMap<String, PrewrittenShard>>,
 ) -> Result<bool> {
     let output_dir = &config.output_dir;
     let sections_dir = output_dir.join("sections");
     let index_dir = output_dir.join("index");
 
-    // Await the cache-shard worker first, before this thread starts writing tables. On a
-    // rotational disk the two streams would otherwise interleave and lose throughput to seek
-    // contention; serializing them lets the worker run alone during link/graph/shard and the
-    // table writer run alone afterwards, which is measurably faster than overlapping them.
-    let prewritten = resolve_prewritten()?;
-
+    // A bundle that has no `sections/` directory yet cannot contain stale shards or temp files, so
+    // a cold build skips the section-directory listing (a 1.5k-entry directory walk is pure disk
+    // latency) and creates every shard directly instead of through the atomic-replace path.
+    let fresh_bundle = !sections_dir.is_dir();
     create_dir(output_dir)?;
     create_dir(&sections_dir)?;
     create_dir(&index_dir)?;
 
-    // Clean stale .md files in output_dir/sections/ that are no longer part of `sections`,
-    // and prune any stale *.tmp files (>60s) across bundle directories.
-    prune_stale_tmp_files_in_dir(output_dir);
-    let expected_md: FxHashSet<&str> = sections
-        .iter()
-        .map(|s| {
-            s.summary
-                .md_file
-                .strip_prefix("sections/")
-                .unwrap_or(s.summary.md_file.as_str())
-        })
-        .collect();
     let mut existing_md: FxHashSet<String> = FxHashSet::default();
-    if let Ok(entries) = fs::read_dir(&sections_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let ext = p.extension().and_then(|s| s.to_str());
-            if ext == Some("md") {
-                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                if expected_md.contains(name) {
-                    existing_md.insert(name.to_string());
-                } else {
+    if !fresh_bundle {
+        // Clean stale .md files in output_dir/sections/ that are no longer part of `sections`,
+        // and prune any stale *.tmp files (>60s) across bundle directories.
+        prune_stale_tmp_files_in_dir(output_dir);
+        let expected_md: FxHashSet<&str> = sections
+            .iter()
+            .map(|s| {
+                s.summary
+                    .md_file
+                    .strip_prefix("sections/")
+                    .unwrap_or(s.summary.md_file.as_str())
+            })
+            .collect();
+        if let Ok(entries) = fs::read_dir(&sections_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let ext = p.extension().and_then(|s| s.to_str());
+                if ext == Some("md") {
+                    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    if expected_md.contains(name) {
+                        existing_md.insert(name.to_string());
+                    } else {
+                        let _ = fs::remove_file(p);
+                    }
+                } else if ext == Some("tmp") && is_stale_tmp_file(&p) {
                     let _ = fs::remove_file(p);
                 }
-            } else if ext == Some("tmp") && is_stale_tmp_file(&p) {
-                let _ = fs::remove_file(p);
             }
         }
     }
@@ -609,7 +618,6 @@ pub fn emit_bundle(
         indexes,
         &sections_dir,
         &existing_md,
-        units.len(),
     )?;
 
     // Optional <repo_name>.md if config.single_file is true
@@ -632,9 +640,21 @@ pub fn emit_bundle(
     let graph_state = build_graph_state(indexes, &metadata.fingerprint, metadata.vendor_mode);
     emit_graph_state(output_dir, &graph_state)?;
 
-    // The per-file AST cache may still be streaming on a worker thread; its shards were joined
-    // above. Write the manifest now that every table is on disk.
-    emit_cache_shards_for_units(config, metadata, units, blueprint_hash, &prewritten)?;
+    // The per-file AST cache is already on disk (the writer thread has been joined by the caller);
+    // emit the manifest from the identities it recorded, or serialize the units here when the
+    // caller has no writer thread (coordinate-shift tier).
+    match cache_source {
+        CacheShardSource::Prewritten(cache) => {
+            emit_cache_manifest_for_prewritten(config, metadata, blueprint_hash, cache)?
+        }
+        CacheShardSource::Units(units) => emit_cache_shards_for_units(
+            config,
+            metadata,
+            units,
+            blueprint_hash,
+            &FxHashMap::default(),
+        )?,
+    }
 
     // Ensure .claudeignore entry (only when output_dir is inside repo_path)
     ensure_claudeignore_entry(&config.repo_path, output_dir)
@@ -880,7 +900,6 @@ fn write_small_tsv_files(index_dir: &Path, indexes: &BundleIndexes) -> Result<()
 ///
 /// `existing_md` holds the shard file names already present after the stale-shard prune, so those
 /// writes keep the atomic temp-file path while brand-new shards are created directly.
-#[allow(clippy::too_many_arguments)]
 fn write_index_and_sections(
     config: &ConvertConfig,
     metadata: &RepoMetadata,
@@ -889,12 +908,14 @@ fn write_index_and_sections(
     indexes: &BundleIndexes,
     sections_dir: &Path,
     existing_md: &FxHashSet<String>,
-    unit_count: usize,
 ) -> Result<()> {
     let index_md = build_master_index_markdown(metadata, sanity, sections, indexes);
     write_file(&config.output_dir.join("INDEX.md"), &index_md)?;
 
-    let write_shard = |shard: &SectionShard| -> Result<()> {
+    // Section shards are independent small files, but on a rotational disk concurrent writers lose
+    // more to head thrashing than they gain from parallelism (measured: ~8.6 s with two parallel
+    // streams vs ~3 s serial for 1.5k shards). One ordered stream keeps the head moving forward.
+    for shard in sections {
         let rel_md = shard
             .summary
             .md_file
@@ -904,49 +925,8 @@ fn write_index_and_sections(
             &sections_dir.join(rel_md),
             shard.markdown_body.as_bytes(),
             !existing_md.contains(rel_md),
-        )
-    };
-
-    if config.force && (50..=1000).contains(&unit_count) {
-        // Small force-rebuild: flush each shard through a synced temp file first (the historical
-        // behavior for medium repos).
-        for shard in sections {
-            let rel_md = shard
-                .summary
-                .md_file
-                .strip_prefix("sections/")
-                .unwrap_or(&shard.summary.md_file);
-            let tmp_path = sections_dir.join(format!(".{rel_md}.{}.sync.tmp", std::process::id()));
-            let _ = fs::write(&tmp_path, shard.markdown_body.as_bytes());
-            if let Ok(file) = fs::File::options().write(true).open(&tmp_path) {
-                let _ = fs::File::sync_data(&file);
-            }
-            let _ = fs::remove_file(&tmp_path);
-            write_shard(shard)?;
-        }
-        return Ok(());
+        )?;
     }
-
-    // Two streams: the section shards are independent files, and overlapping their writes with
-    // each other measurably shortens this stage on this machine.
-    let mid = sections.len() / 2;
-    let (left, right) = sections.split_at(mid);
-    let (rl, rr) = rayon::join(
-        || -> Result<()> {
-            for shard in left {
-                write_shard(shard)?;
-            }
-            Ok(())
-        },
-        || -> Result<()> {
-            for shard in right {
-                write_shard(shard)?;
-            }
-            Ok(())
-        },
-    );
-    rl?;
-    rr?;
     Ok(())
 }
 
@@ -1254,13 +1234,76 @@ fn build_master_index_markdown(
     lines.join("\n")
 }
 
+/// One snapshot of a bundle's `cache/` directory, taken at most once per convert.
+///
+/// The shard writer and the manifest emitter both need the set of existing shard files and the
+/// previous `manifest.json`; sharing this snapshot means a 12k-shard bundle is listed and parsed
+/// once instead of twice.
+#[derive(Debug, Default)]
+pub struct CacheDirState {
+    existing_json_files: FxHashSet<String>,
+    prev_manifest: Option<CacheManifest>,
+}
+
+impl CacheDirState {
+    /// Lists `cache/`, pruning stale `*.tmp` files, and parses `manifest.json` when present.
+    fn scan(cache_dir: &Path) -> Self {
+        let mut existing_json_files: FxHashSet<String> = FxHashSet::default();
+        if let Ok(entries) = fs::read_dir(cache_dir) {
+            for entry in entries.flatten() {
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if name.ends_with(".json") {
+                    existing_json_files.insert(name);
+                } else if name.ends_with(".tmp") {
+                    let path = entry.path();
+                    if is_stale_tmp_file(&path) {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
+        }
+        let prev_manifest = if existing_json_files.contains("manifest.json") {
+            fs::read(cache_dir.join("manifest.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<CacheManifest>(&b).ok())
+        } else {
+            None
+        };
+        Self {
+            existing_json_files,
+            prev_manifest,
+        }
+    }
+}
+
+/// Shard identities produced by [`write_cache_shards_for_units`], together with the `cache/`
+/// snapshot the writer already paid for, so the manifest can be emitted without a second listing.
+pub struct PrewrittenCache {
+    shards: FxHashMap<String, PrewrittenShard>,
+    state: CacheDirState,
+}
+
+impl PrewrittenCache {
+    /// Number of per-file shards written or reused by the writer.
+    pub fn len(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Returns `true` when no shard was produced.
+    pub fn is_empty(&self) -> bool {
+        self.shards.is_empty()
+    }
+
+    /// Shard identities keyed by repository-relative path.
+    pub fn shards(&self) -> &FxHashMap<String, PrewrittenShard> {
+        &self.shards
+    }
+}
+
 /// Writes `cache/manifest.json` and per-file `cache/<shard_key>.json` shards, deleting
 /// orphaned shards and any legacy `cache.json` file.
-///
-/// Performs a single `fs::read_dir` pass over `cache/` to detect existing shard files,
-/// reuses `structural_digest` from the previous manifest when `blake3_hash` and `shard`
-/// match, writes only missing or changed shards, and prunes orphaned `.json` shards.
-/// Emits `cache/<shard>.json` + `cache/manifest.json` from a parsed-unit cache (`cache`).
 pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Result<()> {
     emit_cache_shards_with_prewritten(output_dir, cache, &FxHashMap::default())
 }
@@ -1307,8 +1350,7 @@ pub fn prepare_cache_shard(unit: &ParsedFileUnit) -> Option<CacheShardPacket> {
 /// the calling thread, so the disk sees one sequential stream of small writes.
 pub struct CacheShardWriter {
     cache_dir: PathBuf,
-    existing_json_files: FxHashSet<String>,
-    prev_manifest: Option<CacheManifest>,
+    state: CacheDirState,
     written: usize,
     reused: usize,
     bytes: usize,
@@ -1329,33 +1371,17 @@ impl CacheShardWriter {
         let cache_dir = output_dir.join("cache");
         create_dir(&cache_dir)?;
 
-        let mut existing_json_files: FxHashSet<String> = FxHashSet::default();
-        if let Ok(entries) = fs::read_dir(&cache_dir) {
-            for entry in entries.flatten() {
-                if let Ok(name) = entry.file_name().into_string() {
-                    if name.ends_with(".json") {
-                        existing_json_files.insert(name);
-                    }
-                }
-            }
-        }
-        let prev_manifest = if existing_json_files.contains("manifest.json") {
-            fs::read(cache_dir.join("manifest.json"))
-                .ok()
-                .and_then(|b| serde_json::from_slice::<CacheManifest>(&b).ok())
-                .filter(|m| {
-                    m.schema_version == schema_version
-                        && m.blueprint_hash == blueprint_hash
-                        && m.vendor_mode == vendor_mode
-                })
-        } else {
-            None
-        };
+        let mut state = CacheDirState::scan(&cache_dir);
+        // Only a manifest written by the same schema/blueprint/vendor mode may drive shard reuse.
+        state.prev_manifest = state.prev_manifest.filter(|m| {
+            m.schema_version == schema_version
+                && m.blueprint_hash == blueprint_hash
+                && m.vendor_mode == vendor_mode
+        });
 
         Ok(Self {
             cache_dir,
-            existing_json_files,
-            prev_manifest,
+            state,
             written: 0,
             reused: 0,
             bytes: 0,
@@ -1373,13 +1399,25 @@ impl CacheShardWriter {
         units: &[ParsedFileUnit],
     ) -> Result<Vec<(String, PrewrittenShard)>> {
         let started = Instant::now();
-        let packets: Vec<CacheShardPacket> =
+        let mut packets: Vec<CacheShardPacket> =
             units.par_iter().filter_map(prepare_cache_shard).collect();
+        if packets.len() != units.len() {
+            // Every unit must have a shard on disk: the manifest is emitted from these identities
+            // after the parsed units are dropped, so a missing shard would silently drop the file.
+            return Err(ChipsrcError::io(
+                &self.cache_dir,
+                std::io::Error::other("failed to serialize a parsed unit into its AST cache shard"),
+            ));
+        }
+        // Hash-named shards land in random order; writing each batch in name order keeps the
+        // directory index updates local, which matters for the 12k-file cold path on NTFS.
+        packets.sort_by(|a, b| a.shard_name.cmp(&b.shard_name));
         let mut out = Vec::with_capacity(packets.len());
         for packet in packets {
-            let exists = self.existing_json_files.contains(&packet.shard_name);
+            let exists = self.state.existing_json_files.contains(&packet.shard_name);
             let reusable = exists
                 && self
+                    .state
                     .prev_manifest
                     .as_ref()
                     .and_then(|m| m.files.get(&packet.rel_path))
@@ -1427,7 +1465,7 @@ pub fn write_cache_shards_for_units(
     schema_version: &str,
     blueprint_hash: &str,
     vendor_mode: VendorMode,
-) -> Result<FxHashMap<String, PrewrittenShard>> {
+) -> Result<PrewrittenCache> {
     let mut writer =
         CacheShardWriter::new(output_dir, schema_version, blueprint_hash, vendor_mode)?;
     let mut available: FxHashMap<String, PrewrittenShard> =
@@ -1442,7 +1480,10 @@ pub fn write_cache_shards_for_units(
         }
         start = end;
     }
-    Ok(available)
+    Ok(PrewrittenCache {
+        shards: available,
+        state: writer.state,
+    })
 }
 
 /// Number of units whose cache shards are serialized together before the writer thread writes
@@ -1472,11 +1513,15 @@ pub fn emit_cache_shards_with_prewritten(
         fingerprint: &cache.fingerprint,
         blueprint_hash: &cache.blueprint_hash,
     };
+    let cache_dir = output_dir.join("cache");
+    create_dir(&cache_dir)?;
+    let state = CacheDirState::scan(&cache_dir);
     emit_cache_manifest(
         output_dir,
         &identity,
         cache.files.iter().map(|(k, v)| (k.as_str(), v)),
         prewritten,
+        &state,
     )
 }
 
@@ -1497,11 +1542,59 @@ pub fn emit_cache_shards_for_units(
         fingerprint: &metadata.fingerprint,
         blueprint_hash,
     };
+    let cache_dir = config.output_dir.join("cache");
+    create_dir(&cache_dir)?;
+    let state = CacheDirState::scan(&cache_dir);
     emit_cache_manifest(
         &config.output_dir,
         &identity,
         units.iter().map(|u| (u.scanned.rel_path.as_str(), u)),
         prewritten,
+        &state,
+    )
+}
+
+/// Emits `cache/manifest.json` for shards that [`write_cache_shards_for_units`] already put on
+/// disk, reusing the `cache/` snapshot the writer took. This lets a structural rebuild drop its
+/// parsed units before the emitter runs; the manifest carries exactly the parse-time digests.
+pub fn emit_cache_manifest_for_prewritten(
+    config: &ConvertConfig,
+    metadata: &RepoMetadata,
+    blueprint_hash: &str,
+    prewritten: &PrewrittenCache,
+) -> Result<()> {
+    let identity = CacheIdentity {
+        schema_version: CACHE_SCHEMA_VERSION,
+        repo_root: &metadata.source_root,
+        vendor_mode: metadata.vendor_mode,
+        fingerprint: &metadata.fingerprint,
+        blueprint_hash,
+    };
+    let cache_dir = config.output_dir.join("cache");
+    create_dir(&cache_dir)?;
+
+    let mut manifest_files: BTreeMap<String, CacheShardEntry> = BTreeMap::new();
+    let mut expected_shard_names: FxHashSet<String> =
+        FxHashSet::with_capacity_and_hasher(prewritten.shards.len(), Default::default());
+    for (rel_path, shard) in &prewritten.shards {
+        expected_shard_names.insert(shard.shard_name.clone());
+        manifest_files.insert(
+            rel_path.clone(),
+            CacheShardEntry {
+                blake3_hash: shard.blake3_hash.clone(),
+                shard: format!("cache/{}", shard.shard_name),
+                structural_digest: shard.structural_digest.clone(),
+            },
+        );
+    }
+
+    write_cache_manifest(
+        &config.output_dir,
+        &cache_dir,
+        &identity,
+        &prewritten.state,
+        manifest_files,
+        &expected_shard_names,
     )
 }
 
@@ -1510,6 +1603,7 @@ fn emit_cache_manifest<'a, I>(
     identity: &CacheIdentity<'_>,
     units: I,
     prewritten: &FxHashMap<String, PrewrittenShard>,
+    state: &CacheDirState,
 ) -> Result<()>
 where
     I: Iterator<Item = (&'a str, &'a ParsedFileUnit)> + ExactSizeIterator,
@@ -1517,34 +1611,9 @@ where
     let cache_dir = output_dir.join("cache");
     create_dir(&cache_dir)?;
 
-    let mut existing_json_files: FxHashSet<String> = FxHashSet::default();
-    if let Ok(entries) = fs::read_dir(&cache_dir) {
-        for entry in entries.flatten() {
-            if !entry.file_type().is_ok_and(|ft| ft.is_file()) {
-                continue;
-            }
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
-            };
-            if name.ends_with(".json") {
-                existing_json_files.insert(name);
-            } else if name.ends_with(".tmp") {
-                let p = entry.path();
-                if is_stale_tmp_file(&p) {
-                    let _ = fs::remove_file(p);
-                }
-            }
-        }
-    }
-
-    let prev_manifest = if existing_json_files.contains("manifest.json") {
-        fs::read(cache_dir.join("manifest.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<CacheManifest>(&b).ok())
-    } else {
-        None
-    };
-    let schema_current = prev_manifest.as_ref().is_some_and(|m| {
+    let existing_json_files = &state.existing_json_files;
+    let prev_manifest = state.prev_manifest.as_ref();
+    let schema_current = prev_manifest.is_some_and(|m| {
         m.schema_version == identity.schema_version
             && m.blueprint_hash == identity.blueprint_hash
             && m.vendor_mode == identity.vendor_mode
@@ -1570,7 +1639,6 @@ where
             None
         } else if schema_current {
             prev_manifest
-                .as_ref()
                 .and_then(|m| m.files.get(rel_path))
                 .filter(|prev| {
                     prev.blake3_hash == *hash
@@ -1607,7 +1675,27 @@ where
         );
     }
 
-    for existing_name in &existing_json_files {
+    write_cache_manifest(
+        output_dir,
+        &cache_dir,
+        identity,
+        state,
+        manifest_files,
+        &expected_shard_names,
+    )
+}
+
+/// Prunes orphaned cache shards (using the directory snapshot taken before this run wrote any
+/// shard) and writes `cache/manifest.json`, removing the legacy `cache.json` when present.
+fn write_cache_manifest(
+    output_dir: &Path,
+    cache_dir: &Path,
+    identity: &CacheIdentity<'_>,
+    state: &CacheDirState,
+    manifest_files: BTreeMap<String, CacheShardEntry>,
+    expected_shard_names: &FxHashSet<String>,
+) -> Result<()> {
+    for existing_name in &state.existing_json_files {
         if existing_name != "manifest.json"
             && existing_name != GRAPH_STATE_FILE
             && !expected_shard_names.contains(existing_name)
@@ -2506,7 +2594,7 @@ mod tests {
         )
         .expect("write_cache_shards_for_units");
         assert_eq!(prewritten.len(), 2);
-        for (rel, shard) in &prewritten {
+        for (rel, shard) in prewritten.shards() {
             assert!(
                 out_dir.join("cache").join(&shard.shard_name).is_file(),
                 "shard for {rel} must be on disk"
@@ -2529,7 +2617,7 @@ mod tests {
         // Backdate both shards: a rewrite would refresh the mtime.
         let past = SystemTime::now() - Duration::from_secs(60);
         let mut mtimes_before = Vec::new();
-        for shard in prewritten.values() {
+        for shard in prewritten.shards().values() {
             let path = out_dir.join("cache").join(&shard.shard_name);
             fs::File::options()
                 .write(true)
@@ -2540,10 +2628,10 @@ mod tests {
             mtimes_before.push(fs::metadata(&path).unwrap().modified().unwrap());
         }
 
-        emit_cache_shards_with_prewritten(&out_dir, &cache, &prewritten)
+        emit_cache_shards_with_prewritten(&out_dir, &cache, prewritten.shards())
             .expect("emit_cache_shards_with_prewritten");
 
-        for (shard, before) in prewritten.values().zip(&mtimes_before) {
+        for (shard, before) in prewritten.shards().values().zip(&mtimes_before) {
             let path = out_dir.join("cache").join(&shard.shard_name);
             assert_eq!(
                 fs::metadata(&path).unwrap().modified().unwrap(),
@@ -2557,12 +2645,101 @@ mod tests {
         )
         .expect("parse manifest");
         assert_eq!(manifest.files.len(), 2);
-        for (rel, shard) in &prewritten {
+        for (rel, shard) in prewritten.shards() {
             assert_eq!(
                 manifest.files[rel].structural_digest, shard.structural_digest,
                 "manifest must carry the parse-time structural digest for {rel}"
             );
         }
+    }
+
+    /// The structural rebuild drops its parsed units before the emitter runs, so the cache manifest
+    /// must be reproducible from the writer's identities alone (and prune stale shards from the
+    /// pre-run directory snapshot).
+    #[test]
+    fn emit_cache_manifest_for_prewritten_matches_units_path_and_prunes_orphans() {
+        let tmp = TestTempDir::new("manifest_prewritten");
+        let out_dir = tmp.0.join("bundle");
+        let make_unit = |rel_path: &str, hash: &str| ParsedFileUnit {
+            scanned: ScannedFile {
+                rel_path: rel_path.to_string(),
+                abs_path: PathBuf::from(rel_path),
+                language: LanguageKind::Python,
+                scope: FileScope::FirstParty,
+                arch_layer: ArchLayer::Domain,
+                size_bytes: 10,
+                mtime_secs: 1_700_000_000,
+                mtime_nanos: 0,
+                blake3_hash: hash.to_string(),
+                line_count: 1,
+            },
+            symbols: Vec::new(),
+            types: Vec::new(),
+            macros: Vec::new(),
+            imports: Vec::new(),
+            raw_calls: Vec::new(),
+            raw_xrefs: Vec::new(),
+            parse_errors: 0,
+        };
+        let units = vec![
+            make_unit("a.py", "aaaaaaaaaaaaaaaa"),
+            make_unit("b.py", "bbbbbbbbbbbbbbbb"),
+        ];
+        let config = ConvertConfig::new(tmp.0.join("repo"), out_dir.clone());
+        let metadata = RepoMetadata {
+            repo_name: "bundle".to_string(),
+            source_root: tmp.0.display().to_string(),
+            fingerprint: "fp".to_string(),
+            vendor_mode: VendorMode::Active,
+            total_files: 2,
+            ..Default::default()
+        };
+
+        fs::create_dir_all(out_dir.join("cache")).unwrap();
+        let orphan = out_dir.join("cache").join("0123456789abcdef.json");
+        fs::write(&orphan, b"{}").unwrap();
+
+        let prewritten = write_cache_shards_for_units(
+            &out_dir,
+            &units,
+            CACHE_SCHEMA_VERSION,
+            "",
+            VendorMode::Active,
+        )
+        .expect("write_cache_shards_for_units");
+        emit_cache_manifest_for_prewritten(&config, &metadata, "", &prewritten)
+            .expect("emit_cache_manifest_for_prewritten");
+        assert!(!orphan.exists(), "orphaned shard must be pruned");
+
+        let manifest: CacheManifest = serde_json::from_slice(
+            &fs::read(out_dir.join("cache").join("manifest.json")).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        assert_eq!(manifest.files.len(), 2);
+        for (rel, shard) in prewritten.shards() {
+            let entry = &manifest.files[rel];
+            assert_eq!(entry.blake3_hash, shard.blake3_hash);
+            assert_eq!(entry.shard, format!("cache/{}", shard.shard_name));
+            assert_eq!(entry.structural_digest, shard.structural_digest);
+
+            assert!(
+                out_dir.join(&entry.shard).is_file(),
+                "shard for {rel} must be on disk"
+            );
+        }
+
+        let from_prewritten = manifest;
+        emit_cache_shards_for_units(&config, &metadata, &units, "", &FxHashMap::default())
+            .expect("emit_cache_shards_for_units");
+        let from_units: CacheManifest = serde_json::from_slice(
+            &fs::read(out_dir.join("cache").join("manifest.json")).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        assert_eq!(
+            serde_json::to_value(&from_prewritten).unwrap(),
+            serde_json::to_value(&from_units).unwrap(),
+            "prewritten and unit-based manifests must be identical"
+        );
     }
 
     #[test]

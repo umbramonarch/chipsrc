@@ -785,9 +785,8 @@ fn try_coordinate_shift_tier(
         &sanity,
         &sections,
         &indexes,
-        all_units,
+        emitter::CacheShardSource::Units(all_units),
         blueprint_hash,
-        &mut || Ok(FxHashMap::default()),
     )?;
     metadata.emit_ms = t_emit.elapsed().as_millis() as u64;
     metadata.elapsed_ms = start.elapsed().as_millis() as u64;
@@ -1265,177 +1264,177 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
     // a failed or partial emit can never leave stale graph annotations next to fresh index tables.
     let _ = fs::remove_file(config.output_dir.join("cache").join(GRAPH_STATE_FILE));
 
-    let units = parsed_units;
-
     // The per-file AST cache is one small file per source file, so writing it is I/O-bound while
     // link → graph → shard → table-emit are CPU- and sequential-I/O-bound. Writing it on a worker
     // thread that runs alongside those stages keeps the cache off the critical path.
-    let (sections, indexes, sanity, mut metadata, emit_started, claudeignore_updated) =
-        std::thread::scope(|scope| -> Result<_> {
-            let units_before_write: &[ParsedFileUnit] = &units;
-            let blueprint_hash_ref: &str = &blueprint_hash;
-            let writer = scope.spawn(|| {
-                emitter::write_cache_shards_for_units(
-                    &config.output_dir,
-                    units_before_write,
-                    CACHE_SCHEMA_VERSION,
-                    blueprint_hash_ref,
+    let (sections, indexes, sanity, mut metadata, emit_started, claudeignore_updated) = {
+        let (sections, indexes, sanity, metadata, emit_started, prewritten) =
+            std::thread::scope(|scope| -> Result<_> {
+                let units_before_write: &[ParsedFileUnit] = &parsed_units;
+                let blueprint_hash_ref: &str = &blueprint_hash;
+                let writer = scope.spawn(|| {
+                    emitter::write_cache_shards_for_units(
+                        &config.output_dir,
+                        units_before_write,
+                        CACHE_SCHEMA_VERSION,
+                        blueprint_hash_ref,
+                        config.vendor_mode,
+                    )
+                });
+
+                let t_link = Instant::now();
+                let (symbols, mut types, mut macros, mut calls, mut xrefs, mut vendor_surface) =
+                    resolver::resolve_and_link(&parsed_units);
+                let link_ms = t_link.elapsed().as_millis() as u64;
+
+                let t_graph = Instant::now();
+                let (mut ranked_symbols, mut god_nodes, mut entrypoints, layer_edges, cycles) =
+                    graph::analyze_graph(symbols, &calls, &parsed_units);
+                let graph_ms = t_graph.elapsed().as_millis() as u64;
+
+                let t_shard = Instant::now();
+                let (section_summaries, sections) = sharder::build_section_shards(
+                    &repo_name,
+                    &parsed_units,
+                    &mut ranked_symbols,
+                    &mut types,
+                    &mut macros,
+                    &mut calls,
+                    &mut xrefs,
+                    &vendor_surface,
                     config.vendor_mode,
-                )
-            });
+                );
+                let shard_ms = t_shard.elapsed().as_millis() as u64;
 
-            let t_link = Instant::now();
-            let (symbols, mut types, mut macros, mut calls, mut xrefs, mut vendor_surface) =
-                resolver::resolve_and_link(&units);
-            let link_ms = t_link.elapsed().as_millis() as u64;
+                // Synchronize numbered section_ids and post-compaction retention onto god_nodes,
+                // entrypoints, and vendor_surface (Bug 9)
+                synchronize_indexed_sections(
+                    &ranked_symbols,
+                    &mut god_nodes,
+                    &mut entrypoints,
+                    &types,
+                    &macros,
+                    &mut vendor_surface,
+                );
 
-            let t_graph = Instant::now();
-            let (mut ranked_symbols, mut god_nodes, mut entrypoints, layer_edges, cycles) =
-                graph::analyze_graph(symbols, &calls, &units);
-            let graph_ms = t_graph.elapsed().as_millis() as u64;
+                let indexes = BundleIndexes {
+                    sections: section_summaries,
+                    symbols: ranked_symbols,
+                    types,
+                    calls,
+                    macros,
+                    xrefs,
+                    god_nodes,
+                    entrypoints,
+                    layer_edges,
+                    cycles,
+                    vendor_surface,
+                };
 
-            let t_shard = Instant::now();
-            let (section_summaries, sections) = sharder::build_section_shards(
-                &repo_name,
-                &units,
-                &mut ranked_symbols,
-                &mut types,
-                &mut macros,
-                &mut calls,
-                &mut xrefs,
-                &vendor_surface,
-                config.vendor_mode,
-            );
-            let shard_ms = t_shard.elapsed().as_millis() as u64;
+                let sanity = sanity::compute_sanity_report(&parsed_units, &indexes, &sections);
 
-            // Synchronize numbered section_ids and post-compaction retention onto god_nodes,
-            // entrypoints, and vendor_surface (Bug 9)
-            synchronize_indexed_sections(
-                &ranked_symbols,
-                &mut god_nodes,
-                &mut entrypoints,
-                &types,
-                &macros,
-                &mut vendor_surface,
-            );
+                let total_files = scanned_files.len();
+                let first_party_files = scanned_files
+                    .iter()
+                    .filter(|f| f.scope == FileScope::FirstParty)
+                    .count();
+                let vendor_files = scanned_files
+                    .iter()
+                    .filter(|f| f.scope == FileScope::VendorSdk)
+                    .count();
+                let test_files = scanned_files
+                    .iter()
+                    .filter(|f| f.scope == FileScope::Test)
+                    .count();
+                let total_lines: usize = scanned_files.iter().map(|f| f.line_count).sum();
+                let languages = compute_language_stats(&scanned_files);
 
-            let indexes = BundleIndexes {
-                sections: section_summaries,
-                symbols: ranked_symbols,
-                types,
-                calls,
-                macros,
-                xrefs,
-                god_nodes,
-                entrypoints,
-                layer_edges,
-                cycles,
-                vendor_surface,
-            };
+                let file_stamps: Vec<FileStamp> = scanned_files
+                    .iter()
+                    .map(|f| FileStamp {
+                        rel_path: f.rel_path.clone(),
+                        size_bytes: f.size_bytes,
+                        mtime_secs: f.mtime_secs,
+                        mtime_nanos: f.mtime_nanos,
+                        line_count: f.line_count,
+                        blake3_hash: f.blake3_hash.clone(),
+                        scope: f.scope,
+                        arch_layer: f.arch_layer,
+                    })
+                    .collect();
 
-            let sanity = sanity::compute_sanity_report(&units, &indexes, &sections);
+                let t_emit = Instant::now();
+                let metadata = RepoMetadata {
+                    repo_name: repo_name.clone(),
+                    source_root: source_root.clone(),
+                    fingerprint: fingerprint.clone(),
+                    vendor_mode: config.vendor_mode,
+                    total_files,
+                    first_party_files,
+                    vendor_files,
+                    test_files,
+                    total_lines,
+                    languages,
+                    section_count: sections.len(),
+                    symbol_count: indexes.symbols.len(),
+                    type_count: indexes.types.len(),
+                    call_edge_count: indexes.calls.len(),
+                    macro_count: indexes.macros.len(),
+                    xref_count: indexes.xrefs.len(),
+                    god_node_count: indexes.god_nodes.len(),
+                    entrypoint_count: indexes.entrypoints.len(),
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                    scan_ms,
+                    parse_ms,
+                    link_ms,
+                    graph_ms,
+                    shard_ms,
+                    emit_ms: 0,
+                    incremental_tier: "structural".to_string(),
+                    incremental_reused_files,
+                    incremental_reparsed_files,
+                    file_stamps,
+                };
 
-            let total_files = scanned_files.len();
-            let first_party_files = scanned_files
-                .iter()
-                .filter(|f| f.scope == FileScope::FirstParty)
-                .count();
-            let vendor_files = scanned_files
-                .iter()
-                .filter(|f| f.scope == FileScope::VendorSdk)
-                .count();
-            let test_files = scanned_files
-                .iter()
-                .filter(|f| f.scope == FileScope::Test)
-                .count();
-            let total_lines: usize = scanned_files.iter().map(|f| f.line_count).sum();
-            let languages = compute_language_stats(&scanned_files);
-
-            let file_stamps: Vec<FileStamp> = scanned_files
-                .iter()
-                .map(|f| FileStamp {
-                    rel_path: f.rel_path.clone(),
-                    size_bytes: f.size_bytes,
-                    mtime_secs: f.mtime_secs,
-                    mtime_nanos: f.mtime_nanos,
-                    line_count: f.line_count,
-                    blake3_hash: f.blake3_hash.clone(),
-                    scope: f.scope,
-                    arch_layer: f.arch_layer,
-                })
-                .collect();
-
-            let t_emit = Instant::now();
-            let metadata = RepoMetadata {
-                repo_name: repo_name.clone(),
-                source_root: source_root.clone(),
-                fingerprint: fingerprint.clone(),
-                vendor_mode: config.vendor_mode,
-                total_files,
-                first_party_files,
-                vendor_files,
-                test_files,
-                total_lines,
-                languages,
-                section_count: sections.len(),
-                symbol_count: indexes.symbols.len(),
-                type_count: indexes.types.len(),
-                call_edge_count: indexes.calls.len(),
-                macro_count: indexes.macros.len(),
-                xref_count: indexes.xrefs.len(),
-                god_node_count: indexes.god_nodes.len(),
-                entrypoint_count: indexes.entrypoints.len(),
-                elapsed_ms: start.elapsed().as_millis() as u64,
-                scan_ms,
-                parse_ms,
-                link_ms,
-                graph_ms,
-                shard_ms,
-                emit_ms: 0,
-                incremental_tier: "structural".to_string(),
-                incremental_reused_files,
-                incremental_reparsed_files,
-                file_stamps,
-            };
-
-            // The per-file AST cache is written by the worker thread above; the emitter awaits it
-            // only after the table artifacts, so the shard writes overlap this stage's output.
-            let mut writer = Some(writer);
-            let mut resolve_prewritten =
-                || -> Result<FxHashMap<String, emitter::PrewrittenShard>> {
-                    // `emit_bundle` invokes this exactly once; a second call means the bundle was
-                    // already finalized and there is nothing left to await.
-                    let Some(handle) = writer.take() else {
-                        return Ok(FxHashMap::default());
-                    };
-                    match handle.join() {
-                        Ok(joined) => joined,
-                        Err(_) => Err(ChipsrcError::io(
+                // `t_emit` is taken before the cache-shard join, so `emit_ms` still charges the
+                // writer's remaining I/O to the emit stage (the timings stay honest).
+                let prewritten = match writer.join() {
+                    Ok(joined) => joined?,
+                    Err(_) => {
+                        return Err(ChipsrcError::io(
                             &config.output_dir,
                             std::io::Error::other("cache shard writer thread panicked"),
-                        )),
+                        ))
                     }
                 };
-            let claudeignore_updated = emitter::emit_bundle(
-                config,
-                &metadata,
-                &sanity,
-                &sections,
-                &indexes,
-                &units,
-                &blueprint_hash,
-                &mut resolve_prewritten,
-            )?;
 
-            Ok((
-                sections,
-                indexes,
-                sanity,
-                metadata,
-                t_emit,
-                claudeignore_updated,
-            ))
-        })?;
+                Ok((sections, indexes, sanity, metadata, t_emit, prewritten))
+            })?;
+
+        // Every cache shard is on disk and its identity is in `prewritten`; the parsed units are
+        // no longer needed by any stage.
+        drop(parsed_units);
+        drop(scanned_files);
+
+        let claudeignore_updated = emitter::emit_bundle(
+            config,
+            &metadata,
+            &sanity,
+            &sections,
+            &indexes,
+            emitter::CacheShardSource::Prewritten(&prewritten),
+            &blueprint_hash,
+        )?;
+
+        (
+            sections,
+            indexes,
+            sanity,
+            metadata,
+            emit_started,
+            claudeignore_updated,
+        )
+    };
 
     metadata.emit_ms = emit_started.elapsed().as_millis() as u64;
     metadata.elapsed_ms = start.elapsed().as_millis() as u64;
