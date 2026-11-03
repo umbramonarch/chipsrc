@@ -540,6 +540,7 @@ fn build_file_stamps(scanned_files: &[ScannedFile]) -> Vec<FileStamp> {
             blake3_hash: f.blake3_hash.clone(),
             scope: f.scope,
             arch_layer: f.arch_layer,
+            language: Some(f.language),
         })
         .collect()
 }
@@ -1251,6 +1252,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                         blake3_hash: f.blake3_hash.clone(),
                         scope: f.scope,
                         arch_layer: f.arch_layer,
+                        language: Some(f.language),
                     })
                     .collect();
 
@@ -1527,6 +1529,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                         blake3_hash: f.blake3_hash.clone(),
                         scope: f.scope,
                         arch_layer: f.arch_layer,
+                        language: Some(f.language),
                     })
                     .collect();
 

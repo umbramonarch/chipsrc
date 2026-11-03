@@ -7,7 +7,8 @@ use chipsrc_core::query::{
 };
 use chipsrc_core::{
     auto_refresh_bundles, convert_repo, ensure_repo, inspect_repo, ArchLayer, BundleMetaFile,
-    ChipsrcError, ConvertConfig, FileScope, MacroKind, ResolutionTier, SymbolKind, VendorMode,
+    ChipsrcError, ConvertConfig, FileScope, LanguageKind, MacroKind, ResolutionTier, SymbolKind,
+    VendorMode,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1401,4 +1402,140 @@ fn concept_search_ranks_sub_tokens_and_gates_fallback_on_converted_repo() {
             .is_empty(),
         "nonsense multi-token queries must stay empty"
     );
+}
+
+#[test]
+fn header_language_detection_ab_probes_and_incremental_parity() {
+    let base = TestTempDir::new("chipsrc_header_lang");
+    let c_probe = base.0.join("c-probe");
+    let cpp_probe = base.0.join("cpp-probe");
+    fs::create_dir_all(&c_probe).unwrap();
+    fs::create_dir_all(&cpp_probe).unwrap();
+
+    // (a) C probe: every C++ keyword lives in a comment or a string literal.
+    fs::write(
+        c_probe.join("plain.h"),
+        r#"/* class Fake; template <typename T>; namespace demo; public:; ns::thing */
+// virtual nullptr constexpr operator
+static const char *s = "class Fake; namespace demo; template<typename T>";
+typedef struct { int raw; } plain_sample_t;
+int plain_compute(plain_sample_t *s, int x);
+"#,
+    )
+    .unwrap();
+    fs::write(
+        c_probe.join("plain.c"),
+        "#include \"plain.h\"\n\nint plain_compute(plain_sample_t *s, int x) {\n    return s->raw + x;\n}\n",
+    )
+    .unwrap();
+
+    // (b) C++ probe: real C++ constructs in code.
+    fs::write(
+        cpp_probe.join("demo.h"),
+        "namespace demo {\ntemplate <typename T>\nclass Box {\npublic:\n    T value;\n    T get() const;\n};\n}\n",
+    )
+    .unwrap();
+    fs::write(cpp_probe.join("helper.py"), "def helper():\n    return 1\n").unwrap();
+
+    let language_files = |report: &chipsrc_core::InspectReport, lang: &str| {
+        report
+            .languages
+            .iter()
+            .find(|l| l.language == lang)
+            .map(|l| l.files)
+            .unwrap_or(0)
+    };
+
+    // A: the C probe stays C (2 files) and never produces a cpp entry.
+    let c_report = inspect_repo(&c_probe, VendorMode::Active).expect("inspect c-probe");
+    assert_eq!(
+        language_files(&c_report, "c"),
+        2,
+        "{:?}",
+        c_report.languages
+    );
+    assert_eq!(language_files(&c_report, "cpp"), 0);
+
+    let c_bundle_dir = base.0.join("c-bundle");
+    convert_repo(&ConvertConfig::new(c_probe.clone(), c_bundle_dir.clone()))
+        .expect("convert c-probe");
+    let c_bundles = vec![c_bundle_dir];
+    let sym_out =
+        query_symbols(&c_bundles, "plain_compute", None, false, 10).expect("query plain_compute");
+    assert!(
+        sym_out.contains("plain_compute"),
+        "plain_compute must be indexed: {sym_out}"
+    );
+    let type_out =
+        query_types(&c_bundles, "plain_sample_t", false, 10).expect("query plain_sample_t");
+    assert!(
+        type_out.contains("plain_sample_t"),
+        "plain_sample_t must be indexed: {type_out}"
+    );
+
+    // B: the C++ probe is reported as cpp only, and the class template is extracted.
+    let cpp_report = inspect_repo(&cpp_probe, VendorMode::Active).expect("inspect cpp-probe");
+    assert_eq!(
+        language_files(&cpp_report, "cpp"),
+        1,
+        "{:?}",
+        cpp_report.languages
+    );
+    assert_eq!(language_files(&cpp_report, "c"), 0);
+
+    let cpp_bundle_dir = base.0.join("cpp-bundle");
+    let cpp_bundle = convert_repo(&ConvertConfig::new(
+        cpp_probe.clone(),
+        cpp_bundle_dir.clone(),
+    ))
+    .expect("convert cpp-probe");
+    assert_eq!(
+        cpp_bundle
+            .metadata
+            .languages
+            .iter()
+            .find(|l| l.language == "cpp")
+            .map(|l| l.files),
+        Some(1)
+    );
+    assert!(cpp_bundle
+        .metadata
+        .languages
+        .iter()
+        .all(|l| l.language != "c"));
+    let cpp_bundles = [cpp_bundle_dir.clone()];
+    let type_out = query_types(&cpp_bundles, "Box", false, 10).expect("query Box type");
+    assert!(type_out.contains("pub class `Box`"), "{type_out}");
+    assert!(type_out.contains("demo.h:3"), "{type_out}");
+
+    // Unrelated edit -> the incremental (stat-only) path must keep the recorded header language,
+    // so the language breakdown of the refreshed bundle equals the full build's.
+    fs::write(cpp_probe.join("helper.py"), "def helper():\n    return 2\n").unwrap();
+    let t = std::time::UNIX_EPOCH + Duration::new(1_700_000_000, 500_000_000);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(cpp_probe.join("helper.py"))
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
+    let refreshed = convert_repo(&ConvertConfig::new(
+        cpp_probe.clone(),
+        cpp_bundle_dir.clone(),
+    ))
+    .expect("incremental convert cpp-probe");
+    assert!(
+        !refreshed.cache_hit,
+        "editing helper.py must not be a cache hit"
+    );
+    assert_eq!(
+        refreshed.metadata.languages, cpp_bundle.metadata.languages,
+        "incremental language counts must match the full build"
+    );
+    let demo_stamp = refreshed
+        .metadata
+        .file_stamps
+        .iter()
+        .find(|s| s.rel_path == "demo.h")
+        .expect("demo.h stamp");
+    assert_eq!(demo_stamp.language, Some(LanguageKind::Cpp));
 }

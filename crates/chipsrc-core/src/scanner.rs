@@ -273,6 +273,152 @@ pub fn count_source_lines(bytes: &[u8]) -> usize {
         + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"))
 }
 
+/// Returns the C/C++ identifier byte class (`[A-Za-z0-9_]`) used for keyword boundary checks.
+fn is_c_ident_byte(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
+}
+
+/// `true` when `kw` starts at `i` in `bytes` and is delimited on both sides by non-identifier
+/// bytes (`class_from_x` never matches `class`).
+fn c_keyword_at(bytes: &[u8], i: usize, kw: &[u8]) -> bool {
+    let end = i + kw.len();
+    if end > bytes.len() || &bytes[i..end] != kw {
+        return false;
+    }
+    (i == 0 || !is_c_ident_byte(bytes[i - 1]))
+        && (end == bytes.len() || !is_c_ident_byte(bytes[end]))
+}
+
+/// Index of the first non-whitespace byte at or after `i`.
+fn skip_ascii_space(bytes: &[u8], mut i: usize) -> usize {
+    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    i
+}
+
+/// `true` when the next non-whitespace byte at or after `i` is `delim`.
+fn delimiter_after_space(bytes: &[u8], i: usize, delim: u8) -> bool {
+    bytes.get(skip_ascii_space(bytes, i)) == Some(&delim)
+}
+
+/// Skips a `"..."` or `'...'` literal opening at `start` and returns the index just past its
+/// closing quote. Escaped bytes are consumed in pairs; a raw newline also ends the literal so an
+/// unterminated quote cannot swallow the rest of the file.
+fn skip_quoted_literal(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'\n' => return i + 1,
+            b if b == quote => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// `true` when a `.h` header contains C++ constructs **in code**, i.e. outside `//` line comments,
+/// `/* ... */` block comments, string/char literals, and C++ raw string literals.
+///
+/// One byte scan; each byte is compared only against the C++ markers that have no valid C source
+/// spelling: `class `, `template<`, `namespace `, `::`, `public:`/`private:`, `typename`,
+/// `nullptr`, `constexpr`, `virtual`, and `operator`.
+fn header_has_cpp_constructs(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = memchr::memchr(b'\n', bytes.get(i + 2..).unwrap_or_default())
+                    .map_or(bytes.len(), |off| i + 2 + off + 1);
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = memchr::memmem::find(bytes.get(i + 2..).unwrap_or_default(), b"*/")
+                    .map_or(bytes.len(), |off| i + 2 + off + 2);
+                continue;
+            }
+            b'"' | b'\'' => {
+                i = skip_quoted_literal(bytes, i);
+                continue;
+            }
+            b'R' if bytes.get(i + 1) == Some(&b'"')
+                && (i == 0 || !is_c_ident_byte(bytes[i - 1])) =>
+            {
+                // C++ raw string literal (`R"(...)"`, `R"delim(...)delim"`): the first `)"` is a
+                // safe upper bound for the cheap heuristic; content is never scanned.
+                i = memchr::memmem::find(bytes.get(i + 2..).unwrap_or_default(), b")\"")
+                    .map_or(bytes.len(), |off| i + 2 + off + 2);
+                continue;
+            }
+            b':' if bytes.get(i + 1) == Some(&b':') => return true,
+            _ => {}
+        }
+
+        match bytes[i] {
+            b'c' => {
+                // `class ` (trailing whitespace keeps C headers that use `class` as a plain
+                // identifier out) and `constexpr`.
+                if (c_keyword_at(bytes, i, b"class")
+                    && bytes.get(i + 5).is_some_and(u8::is_ascii_whitespace))
+                    || c_keyword_at(bytes, i, b"constexpr")
+                {
+                    return true;
+                }
+            }
+            b't' => {
+                if (c_keyword_at(bytes, i, b"template")
+                    && delimiter_after_space(bytes, i + 8, b'<'))
+                    || c_keyword_at(bytes, i, b"typename")
+                {
+                    return true;
+                }
+            }
+            b'n' => {
+                if (c_keyword_at(bytes, i, b"namespace")
+                    && bytes.get(i + 9).is_some_and(u8::is_ascii_whitespace))
+                    || c_keyword_at(bytes, i, b"nullptr")
+                {
+                    return true;
+                }
+            }
+            b'p' => {
+                if (c_keyword_at(bytes, i, b"public") && delimiter_after_space(bytes, i + 6, b':'))
+                    || (c_keyword_at(bytes, i, b"private")
+                        && delimiter_after_space(bytes, i + 7, b':'))
+                {
+                    return true;
+                }
+            }
+            b'v' if c_keyword_at(bytes, i, b"virtual") => return true,
+            b'o' if c_keyword_at(bytes, i, b"operator") => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Detects the effective [`LanguageKind`] for a source path, disambiguating the `.h` header
+/// extension shared by C and C++ by content: a header is parsed as C++ when
+/// [`header_has_cpp_constructs`] finds a C++ marker in code, otherwise as C. Every other
+/// extension keeps its path-based language.
+///
+/// Returns `None` for paths without a recognized source extension.
+pub fn detect_file_language(rel_path: &str, bytes: &[u8]) -> Option<LanguageKind> {
+    let file_name = rel_path.rsplit(['/', '\\']).next().unwrap_or(rel_path);
+    let (stem, ext) = file_name.rsplit_once('.')?;
+    if stem.is_empty() {
+        return None;
+    }
+    let language = LanguageKind::from_extension(ext)?;
+    if ext.eq_ignore_ascii_case("h") && header_has_cpp_constructs(bytes) {
+        return Some(LanguageKind::Cpp);
+    }
+    Some(language)
+}
+
 /// Number of worker threads for `ignore`'s parallel directory walks (`scan_repository`,
 /// `stamp_check`).
 ///
@@ -493,6 +639,9 @@ pub fn scan_repository(
                 if bytes.is_empty() {
                     return None;
                 }
+                // `.h` headers are shared by C and C++; the already-read bytes decide which
+                // grammar parses them (content detection instead of extension guessing).
+                let language = detect_file_language(&rel_path, &bytes).unwrap_or(language);
 
                 let explicit_example_scope = bp_ref
                     .and_then(|bp| match_longest_prefix(&rel_path, &bp.scopes))
@@ -1195,7 +1344,9 @@ impl StampWalkCtx<'_> {
                 acc.built_files.push(ScannedFile {
                     rel_path,
                     abs_path: abs_path.to_path_buf(),
-                    language,
+                    // The stamp carries the language chosen by content detection at the last
+                    // read; legacy stamps fall back to the path-based language.
+                    language: stamp.language.unwrap_or(language),
                     scope: stamp.scope,
                     arch_layer: stamp.arch_layer,
                     size_bytes,
@@ -1217,6 +1368,7 @@ impl StampWalkCtx<'_> {
             acc.can_build_files = false;
             return;
         };
+        let language = detect_file_language(&rel_path, &bytes).unwrap_or(language);
         let full_hash = blake3::hash(&bytes).to_hex();
         let blake3_hash = full_hash[..16].to_string();
         let scope =
@@ -2935,5 +3087,164 @@ mod tests {
         assert_eq!(gamma.symbols[0].file, "gamma/mod.py");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn detect_file_language_marks_cpp_constructs_in_code() {
+        let cases: &[&[u8]] = &[
+            b"class Widget {\n};\n",
+            b"enum class Color { Red };\n",
+            b"template <typename T> T clamp(T v);\n",
+            b"template<typename T> class Box;\n",
+            b"namespace demo {\n}\n",
+            b"void use(demo::Box &b);\n",
+            b"struct S { public: int x; };\n",
+            b"struct S { private: int x; };\n",
+            b"using value_t = typename Box<int>::value_type;\n",
+            b"constexpr int kMax = 4;\n",
+            b"virtual void run() = 0;\n",
+            b"bool operator==(const S &o) const;\n",
+            b"void *p = nullptr;\n",
+        ];
+        for case in cases {
+            assert_eq!(
+                detect_file_language("include/demo.h", case),
+                Some(LanguageKind::Cpp),
+                "expected C++ for: {}",
+                String::from_utf8_lossy(case)
+            );
+        }
+
+        // `.h` is case-insensitive on Windows and in `LanguageKind::from_extension`.
+        assert_eq!(
+            detect_file_language("include/Demo.H", b"class Widget {\n};\n"),
+            Some(LanguageKind::Cpp)
+        );
+    }
+
+    #[test]
+    fn detect_file_language_ignores_cpp_keywords_in_comments_and_strings() {
+        let cases: &[&[u8]] = &[
+            b"/* class Fake; template <typename T>; namespace demo; public:; ns::thing */\nint plain_compute(void);\n",
+            b"// virtual nullptr constexpr operator\nint plain_compute(void);\n",
+            b"static const char *s = \"class Fake; namespace demo; template<typename T>\";\n",
+            b"static const char q = ':'; static const char *s = \"a::b\";\n",
+            b"static const char *r = R\"(class Fake; namespace demo; a::b)\";\n",
+            b"/* unterminated block comment with class Widget; namespace demo;\n",
+        ];
+        for case in cases {
+            assert_eq!(
+                detect_file_language("include/plain.h", case),
+                Some(LanguageKind::C),
+                "expected C for: {}",
+                String::from_utf8_lossy(case)
+            );
+        }
+    }
+
+    #[test]
+    fn detect_file_language_requires_cpp_keyword_boundaries() {
+        // C identifiers that merely contain a C++ keyword are not constructs.
+        let cases: &[&[u8]] = &[
+            b"int class_count; int namespace_id; int operator_name; int virtual_state;\n",
+            b"int template_count; int typename_hint; int constexpr_value; int nullptr_value;\n",
+            b"int public_state; int private_state; int classless;\n",
+        ];
+        for case in cases {
+            assert_eq!(
+                detect_file_language("include/plain.h", case),
+                Some(LanguageKind::C),
+                "expected C for: {}",
+                String::from_utf8_lossy(case)
+            );
+        }
+    }
+
+    #[test]
+    fn detect_file_language_only_disambiguates_plain_h_headers() {
+        // `.c` files are never promoted, even if they contain a C++ marker token.
+        assert_eq!(
+            detect_file_language("src/demo.c", b"class Widget {\n};\n"),
+            Some(LanguageKind::C)
+        );
+        // Explicit C++ extensions keep their language regardless of content.
+        assert_eq!(
+            detect_file_language("src/demo.hpp", b"int plain;\n"),
+            Some(LanguageKind::Cpp)
+        );
+        assert_eq!(
+            detect_file_language("src/demo.cpp", b"int plain;\n"),
+            Some(LanguageKind::Cpp)
+        );
+        // Unknown extensions are not source files.
+        assert_eq!(detect_file_language("README", b"class Widget;"), None);
+        assert_eq!(detect_file_language(".hidden", b"class Widget;"), None);
+    }
+
+    #[test]
+    fn stamp_check_preserves_detected_header_language() {
+        use std::time::Duration;
+
+        let tmp = TestTempDir::new("chipsrc_scanner_header_lang");
+        let repo_dir = tmp.path().join("repo");
+        let out_dir = tmp.path().join("bundle");
+
+        write_src(
+            &repo_dir.join("include/demo.h"),
+            "namespace demo {\ntemplate <typename T>\nclass Box {\npublic:\n    T value;\n};\n}\n",
+        );
+        write_src(
+            &repo_dir.join("include/plain.h"),
+            "/* class Fake; namespace demo; */\nint plain_compute(void);\n",
+        );
+        write_src(
+            &repo_dir.join("include/plain.c"),
+            "#include \"plain.h\"\n\nint plain_compute(void) { return 0; }\n",
+        );
+        write_src(&repo_dir.join("helper.py"), "def helper():\n    return 1\n");
+
+        let cfg = crate::model::ConvertConfig::new(repo_dir.clone(), out_dir);
+        let bundle = crate::convert_repo(&cfg).expect("initial convert_repo");
+        let language_of = |stamps: &[crate::model::FileStamp], rel: &str| {
+            stamps
+                .iter()
+                .find(|s| s.rel_path == rel)
+                .and_then(|s| s.language)
+        };
+        assert_eq!(
+            language_of(&bundle.metadata.file_stamps, "include/demo.h"),
+            Some(LanguageKind::Cpp),
+            "C++ constructs in code must be recorded on the stamp"
+        );
+        assert_eq!(
+            language_of(&bundle.metadata.file_stamps, "include/plain.h"),
+            Some(LanguageKind::C)
+        );
+
+        // Unrelated edit -> the stat-only warm path rebuilds the file list from stamps; the
+        // detected header languages must survive without re-reading unchanged headers.
+        write_src(&repo_dir.join("helper.py"), "def helper():\n    return 2\n");
+        let t = UNIX_EPOCH + Duration::new(1_700_000_000, 500_000_000);
+        set_mtime(&repo_dir.join("helper.py"), t);
+
+        let sc =
+            stamp_check(&repo_dir, &bundle.metadata, DEFAULT_MAX_FILE_BYTES).expect("stamp_check");
+        assert!(!sc.unchanged);
+        let scanned = sc
+            .scanned_files
+            .expect("incremental walk yields scanned files");
+        let header_language = |rel: &str| {
+            scanned
+                .iter()
+                .find(|f| f.rel_path == rel)
+                .map(|f| f.language)
+        };
+        assert_eq!(
+            header_language("include/demo.h"),
+            Some(LanguageKind::Cpp),
+            "stat-only warm path must reuse the detected C++ header language"
+        );
+        assert_eq!(header_language("include/plain.h"), Some(LanguageKind::C));
+        assert_eq!(header_language("include/plain.c"), Some(LanguageKind::C));
     }
 }

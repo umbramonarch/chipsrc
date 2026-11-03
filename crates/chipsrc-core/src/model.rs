@@ -1065,6 +1065,12 @@ pub struct FileStamp {
     pub blake3_hash: String,
     pub scope: FileScope,
     pub arch_layer: ArchLayer,
+    /// Language chosen when the file content was last read (content-based `.h` C/C++
+    /// disambiguation). Stat-only warm walks reuse it so incremental and `--force` builds report
+    /// identical language counts. Absent in bundles written before header detection existed;
+    /// callers fall back to the path extension in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<LanguageKind>,
 }
 
 /// Repository-level metadata serialized in `meta.json`.
