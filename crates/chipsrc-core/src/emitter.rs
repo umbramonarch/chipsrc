@@ -1,15 +1,17 @@
 use crate::error::{ChipsrcError, Result};
 use crate::model::{
     ArchLayer, BundleIndexes, CacheManifest, CacheShardEntry, ConvertConfig, ExtractedType,
-    FileScope, GraphStateFile, GraphSymbolRef, IncrementalAstCache, RankedSymbol, RepoMetadata,
-    SanityReport, SectionShard, SymbolGraphState, SymbolKind, TypeKind, VendorMode, Visibility,
-    CACHE_SCHEMA_VERSION, GRAPH_STATE_FILE,
+    FileScope, GraphStateFile, GraphSymbolRef, IncrementalAstCache, ParsedFileUnit, RankedSymbol,
+    RepoMetadata, SanityReport, SectionShard, SymbolGraphState, SymbolKind, TypeKind, VendorMode,
+    Visibility, CACHE_SCHEMA_VERSION, GRAPH_STATE_FILE,
 };
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -170,6 +172,18 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
             }
         }
     }
+    let tmp_path = temp_sibling_path(path);
+
+    if let Err(source) = fs::write(&tmp_path, bytes) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ChipsrcError::io(path, source));
+    }
+
+    rename_with_retry(&tmp_path, path)
+}
+
+/// Returns `<dir>/.<name>.<pid>.<seq>.tmp`, the temp-file sibling used for atomic writes.
+fn temp_sibling_path(path: &Path) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -177,17 +191,15 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .unwrap_or("bundle");
     let pid = std::process::id();
     let seq = NEXT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = parent.join(format!(".{file_name}.{pid}.{seq}.tmp"));
+    parent.join(format!(".{file_name}.{pid}.{seq}.tmp"))
+}
 
-    if let Err(source) = fs::write(&tmp_path, bytes) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(ChipsrcError::io(path, source));
-    }
-
+/// Renames `tmp_path` over `path`, retrying sharing-violation failures on Windows.
+fn rename_with_retry(tmp_path: &Path, path: &Path) -> Result<()> {
     const BACKOFF_MS: [u64; 4] = [5, 10, 20, 40];
     let mut last_err = None;
     for attempt in 0..5 {
-        match fs::rename(&tmp_path, path) {
+        match fs::rename(tmp_path, path) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 let retryable = !path.is_dir()
@@ -203,11 +215,129 @@ pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         }
     }
 
-    let _ = fs::remove_file(&tmp_path);
+    let _ = fs::remove_file(tmp_path);
     Err(ChipsrcError::io(
         path,
         last_err.unwrap_or_else(|| std::io::Error::other("atomic rename failed")),
     ))
+}
+
+/// Bytes of row text accumulated before a streamed table is flushed to disk.
+const STREAM_ROW_BUFFER_BYTES: usize = 1 << 20;
+
+/// Streaming table writer: callers append rows to [`Self::rows`] and call [`Self::flush_if_full`]
+/// after each row, so a multi-hundred-megabyte table never has to exist in memory.
+struct RowSink<'a> {
+    out: &'a mut HashingWriter<std::io::BufWriter<fs::File>>,
+    path: &'a Path,
+    buf: String,
+}
+
+/// Appends `bytes` to `sink`'s buffered output, keeping the running hash and length in sync.
+fn sink_write(
+    out: &mut HashingWriter<std::io::BufWriter<fs::File>>,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<()> {
+    out.inner
+        .write_all(bytes)
+        .map_err(|e| ChipsrcError::io(path, e))?;
+    out.hasher.update(bytes);
+    out.len += bytes.len() as u64;
+    Ok(())
+}
+
+impl<'a> RowSink<'a> {
+    fn rows(&mut self) -> &mut String {
+        &mut self.buf
+    }
+
+    fn flush_if_full(&mut self) -> Result<()> {
+        if self.buf.len() >= STREAM_ROW_BUFFER_BYTES {
+            let bytes = self.buf.as_bytes();
+            sink_write(self.out, self.path, bytes)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        let bytes = self.buf.as_bytes();
+        sink_write(self.out, self.path, bytes)?;
+        self.buf.clear();
+        self.out
+            .inner
+            .flush()
+            .map_err(|e| ChipsrcError::io(self.path, e))
+    }
+}
+
+/// Writer that hashes and counts everything written through it.
+struct HashingWriter<W: std::io::Write> {
+    inner: W,
+    hasher: blake3::Hasher,
+    len: u64,
+}
+
+/// Writes the table produced by `build` to `path` atomically without materializing it in memory.
+///
+/// Content that is byte-identical to the file already on disk is skipped (the temp file is
+/// discarded), matching [`write_bytes_atomic`]'s write-skip semantics.
+fn write_streamed_file<F>(path: &Path, build: F) -> Result<()>
+where
+    F: FnOnce(&mut RowSink<'_>) -> Result<()>,
+{
+    let existing_len = fs::metadata(path)
+        .ok()
+        .filter(|m| m.is_file())
+        .map(|m| m.len());
+    let tmp_path = temp_sibling_path(path);
+    let hashing = match fs::File::create(&tmp_path) {
+        Ok(file) => HashingWriter {
+            inner: std::io::BufWriter::with_capacity(1 << 20, file),
+            hasher: blake3::Hasher::new(),
+            len: 0,
+        },
+        Err(source) => return Err(ChipsrcError::io(&tmp_path, source)),
+    };
+    let mut hashing = hashing;
+    {
+        let mut sink = RowSink {
+            out: &mut hashing,
+            path,
+            buf: String::with_capacity(STREAM_ROW_BUFFER_BYTES + 4096),
+        };
+        build(&mut sink).and_then(|()| sink.finish())?;
+    }
+    let HashingWriter {
+        hasher,
+        len,
+        mut inner,
+    } = hashing;
+    if existing_len == Some(len) && file_hash(path).is_some_and(|hash| hash == hasher.finalize()) {
+        let _ = fs::remove_file(&tmp_path);
+        return Ok(());
+    }
+    // Flush explicitly instead of `into_inner()` so a flush failure reports the target path.
+    inner.flush().map_err(|e| ChipsrcError::io(path, e))?;
+    drop(inner);
+    rename_with_retry(&tmp_path, path)
+}
+
+/// Streams `path` through BLAKE3 and returns the digest, or `None` when it cannot be read.
+fn file_hash(path: &Path) -> Option<blake3::Hash> {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(hasher.finalize())
 }
 
 fn is_stale_tmp_file(path: &Path) -> bool {
@@ -284,6 +414,24 @@ fn is_clean_tsv_str(value: &str) -> bool {
         }
     }
     true
+}
+
+/// Writes `bytes` to `path`, using a direct create for a file that is known to be absent and the
+/// full atomic temp-file + rename path otherwise.
+///
+/// A bundle writer holds the advisory `BundleLock`, so no other process is mutating the bundle
+/// while a brand-new artifact is created; `File::create` + `write_all` therefore needs neither the
+/// content-compare stat nor the rename round trip. Overwriting an existing file keeps the atomic
+/// path so a concurrent reader never observes a truncated artifact.
+fn write_new_or_existing_file(path: &Path, bytes: &[u8], known_absent: bool) -> Result<()> {
+    if known_absent {
+        return match fs::write(path, bytes) {
+            Ok(()) => Ok(()),
+            // Racing creation (another writer or a leftover file) falls back to the atomic path.
+            Err(_) => write_bytes_atomic(path, bytes),
+        };
+    }
+    write_bytes_atomic(path, bytes)
 }
 
 #[inline]
@@ -384,17 +532,31 @@ pub fn ensure_claudeignore_entry(repo_path: &Path, output_root: &Path) -> Result
 /// `index/*.tsv`, `cache/manifest.json` + `cache/<shard>.json`, optional `<repo_name>.md`,
 /// and `.claudeignore`). `meta.json` is written once by `convert_repo` after final timings
 /// are recorded.
+///
+/// `resolve_prewritten` is invoked after the table artifacts are written and before the per-file
+/// AST cache: the caller uses that point to join the worker thread that streams `cache/<shard>.json`
+/// files, so the (many small, I/O-bound) cache writes overlap the table output instead of
+/// extending the critical path.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_bundle(
     config: &ConvertConfig,
     metadata: &RepoMetadata,
     sanity: &SanityReport,
     sections: &[SectionShard],
     indexes: &BundleIndexes,
-    cache: &IncrementalAstCache,
+    units: &[ParsedFileUnit],
+    blueprint_hash: &str,
+    resolve_prewritten: &mut dyn FnMut() -> Result<FxHashMap<String, PrewrittenShard>>,
 ) -> Result<bool> {
     let output_dir = &config.output_dir;
     let sections_dir = output_dir.join("sections");
     let index_dir = output_dir.join("index");
+
+    // Await the cache-shard worker first, before this thread starts writing tables. On a
+    // rotational disk the two streams would otherwise interleave and lose throughput to seek
+    // contention; serializing them lets the worker run alone during link/graph/shard and the
+    // table writer run alone afterwards, which is measurably faster than overlapping them.
+    let prewritten = resolve_prewritten()?;
 
     create_dir(output_dir)?;
     create_dir(&sections_dir)?;
@@ -412,16 +574,18 @@ pub fn emit_bundle(
                 .unwrap_or(s.summary.md_file.as_str())
         })
         .collect();
+    let mut existing_md: FxHashSet<String> = FxHashSet::default();
     if let Ok(entries) = fs::read_dir(&sections_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
             let ext = p.extension().and_then(|s| s.to_str());
             if ext == Some("md") {
-                let keep = p
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|name| expected_md.contains(name));
-                if !keep {
+                let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if expected_md.contains(name) {
+                    existing_md.insert(name.to_string());
+                } else {
                     let _ = fs::remove_file(p);
                 }
             } else if ext == Some("tmp") && is_stale_tmp_file(&p) {
@@ -430,243 +594,27 @@ pub fn emit_bundle(
         }
     }
 
-    // 1. Format INDEX.md and all 6 index/*.tsv buffers in parallel in memory, then write
-    //    changed artifacts sequentially to avoid Windows NTFS / filter-driver contention.
-    let build_index_md =
-        || -> String { build_master_index_markdown(metadata, sanity, sections, indexes) };
-
-    let build_small_and_sym_tsvs = || -> (String, String, String, String) {
-        // index/sections.tsv
-        let mut sec_tsv = String::with_capacity(128 + indexes.sections.len() * 128);
-        sec_tsv.push_str(
-            "section_id\ttitle\tmodule_path\tarch_layer\tscope\tfile_count\tsymbol_count\ttype_count\tmacro_count\ttoken_estimate\tmd_file\n",
-        );
-        for s in &indexes.sections {
-            let _ = writeln!(
-                sec_tsv,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                sanitize_tsv(&s.section_id),
-                sanitize_tsv(&s.title),
-                sanitize_tsv(&s.module_path),
-                sanitize_tsv(&s.arch_layer),
-                sanitize_tsv(&s.scope),
-                s.file_count,
-                s.symbol_count,
-                s.type_count,
-                s.macro_count,
-                s.token_estimate,
-                sanitize_tsv(&s.md_file),
-            );
-        }
-
-        // index/symbols.tsv
-        let mut sym_tsv = String::with_capacity(180 + indexes.symbols.len() * 160);
-        sym_tsv.push_str(
-            "symbol_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tsignature\tpagerank\tin_deg\tout_deg\tarch_layer\tscope\tsection_id\tdoc_summary\thub_score\tauthority_score\n",
-        );
-        for rs in &indexes.symbols {
-            let s = &rs.symbol;
-            let _ = writeln!(
-                sym_tsv,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}",
-                sanitize_tsv(&s.symbol_id),
-                sanitize_tsv(&s.name),
-                s.kind.as_str(),
-                s.visibility.as_str(),
-                sanitize_tsv(&s.file),
-                s.start_line,
-                s.end_line,
-                sanitize_tsv(&s.signature),
-                rs.pagerank,
-                rs.in_degree,
-                rs.out_degree,
-                s.arch_layer.as_str(),
-                s.scope.as_str(),
-                sanitize_tsv(&s.section_id),
-                sanitize_tsv(&s.doc_summary),
-                rs.hub_score,
-                rs.authority_score,
-            );
-        }
-
-        // index/types.tsv
-        let mut typ_tsv = String::with_capacity(140 + indexes.types.len() * 160);
-        typ_tsv.push_str(
-            "type_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tfields_summary\tarch_layer\tscope\tsection_id\tdoc_summary\n",
-        );
-        for t in &indexes.types {
-            let _ = writeln!(
-                typ_tsv,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                sanitize_tsv(&t.type_id),
-                sanitize_tsv(&t.name),
-                t.kind.as_str(),
-                t.visibility.as_str(),
-                sanitize_tsv(&t.file),
-                t.start_line,
-                t.end_line,
-                sanitize_tsv(&t.fields_summary),
-                t.arch_layer.as_str(),
-                t.scope.as_str(),
-                sanitize_tsv(&t.section_id),
-                sanitize_tsv(&t.doc_summary),
-            );
-        }
-
-        // index/macros.tsv
-        let mut mac_tsv = String::with_capacity(128 + indexes.macros.len() * 128);
-        mac_tsv.push_str(
-            "name\tkind\tvalue_or_args\thex_addr\tfile\tline\tarch_layer\tscope\tsection_id\tdescription\n",
-        );
-        for m in &indexes.macros {
-            let _ = writeln!(
-                mac_tsv,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                sanitize_tsv(&m.name),
-                m.kind.as_str(),
-                sanitize_tsv(&m.value_or_args),
-                sanitize_tsv(m.hex_addr.as_deref().unwrap_or("-")),
-                sanitize_tsv(&m.file),
-                m.line,
-                m.arch_layer.as_str(),
-                m.scope.as_str(),
-                sanitize_tsv(&m.section_id),
-                sanitize_tsv(&m.description),
-            );
-        }
-        (sec_tsv, sym_tsv, typ_tsv, mac_tsv)
-    };
-
-    let build_calls_tsv = || -> String {
-        let mut calls_tsv = String::with_capacity(96 + indexes.calls.len() * 96);
-        calls_tsv.push_str(
-            "caller_id\tcaller_name\tcallee_name\tcallee_id\tfile\tline\ttier\tsection_id\n",
-        );
-        for c in &indexes.calls {
-            calls_tsv.push_str(&sanitize_tsv(&c.caller_id));
-            calls_tsv.push('\t');
-            calls_tsv.push_str(&sanitize_tsv(&c.caller_name));
-            calls_tsv.push('\t');
-            calls_tsv.push_str(&sanitize_tsv(&c.callee_name));
-            calls_tsv.push('\t');
-            calls_tsv.push_str(&sanitize_tsv(&c.callee_id));
-            calls_tsv.push('\t');
-            calls_tsv.push_str(&sanitize_tsv(&c.file));
-            calls_tsv.push('\t');
-            push_usize(&mut calls_tsv, c.line);
-            calls_tsv.push('\t');
-            calls_tsv.push_str(c.tier.as_str());
-            calls_tsv.push('\t');
-            calls_tsv.push_str(&sanitize_tsv(&c.section_id));
-            calls_tsv.push('\n');
-        }
-        calls_tsv
-    };
-
-    let build_xref_tsv = || -> String {
-        let mut xref_tsv = String::with_capacity(96 + indexes.xrefs.len() * 110);
-        xref_tsv.push_str("symbol\tcategory\trelation\ttarget\tfile\tline\tsection_id\tcontext\n");
-        for x in &indexes.xrefs {
-            xref_tsv.push_str(&sanitize_tsv(&x.symbol));
-            xref_tsv.push('\t');
-            xref_tsv.push_str(&sanitize_tsv(&x.category));
-            xref_tsv.push('\t');
-            xref_tsv.push_str(&sanitize_tsv(&x.relation));
-            xref_tsv.push('\t');
-            xref_tsv.push_str(&sanitize_tsv(&x.target));
-            xref_tsv.push('\t');
-            xref_tsv.push_str(&sanitize_tsv(&x.file));
-            xref_tsv.push('\t');
-            push_usize(&mut xref_tsv, x.line);
-            xref_tsv.push('\t');
-            xref_tsv.push_str(&sanitize_tsv(&x.section_id));
-            xref_tsv.push('\t');
-            xref_tsv.push_str(&sanitize_tsv(&x.context));
-            xref_tsv.push('\n');
-        }
-        xref_tsv
-    };
-
-    let ((index_md, (sec_tsv, sym_tsv, typ_tsv, mac_tsv)), (calls_tsv, xref_tsv)) = rayon::join(
-        || rayon::join(build_index_md, build_small_and_sym_tsvs),
-        || rayon::join(build_calls_tsv, build_xref_tsv),
-    );
-
-    let write_md_and_sections = || -> Result<()> {
-        write_file(&output_dir.join("INDEX.md"), &index_md)?;
-        let sync_sections = config.force && (50..=1000).contains(&cache.files.len());
-        if sync_sections {
-            for shard in sections {
-                let rel_md = shard
-                    .summary
-                    .md_file
-                    .strip_prefix("sections/")
-                    .unwrap_or(&shard.summary.md_file);
-                let sec_path = sections_dir.join(rel_md);
-                let tmp_path =
-                    sections_dir.join(format!(".{rel_md}.{}.sync.tmp", std::process::id()));
-                let _ = fs::write(&tmp_path, shard.markdown_body.as_bytes());
-                if let Ok(file) = fs::File::options().write(true).open(&tmp_path) {
-                    let _ = fs::File::sync_data(&file);
-                }
-                let _ = fs::remove_file(&tmp_path);
-                write_file(&sec_path, &shard.markdown_body)?;
-            }
-        } else {
-            let mid = sections.len() / 2;
-            let (left, right) = sections.split_at(mid);
-            let (rl, rr) = rayon::join(
-                || -> Result<()> {
-                    for shard in left {
-                        let rel_md = shard
-                            .summary
-                            .md_file
-                            .strip_prefix("sections/")
-                            .unwrap_or(&shard.summary.md_file);
-                        write_file(&sections_dir.join(rel_md), &shard.markdown_body)?;
-                    }
-                    Ok(())
-                },
-                || -> Result<()> {
-                    for shard in right {
-                        let rel_md = shard
-                            .summary
-                            .md_file
-                            .strip_prefix("sections/")
-                            .unwrap_or(&shard.summary.md_file);
-                        write_file(&sections_dir.join(rel_md), &shard.markdown_body)?;
-                    }
-                    Ok(())
-                },
-            );
-            rl?;
-            rr?;
-        }
-        Ok(())
-    };
-    let write_small_tsvs = || -> Result<()> {
-        write_file(&index_dir.join("sections.tsv"), &sec_tsv)?;
-        write_file(&index_dir.join("symbols.tsv"), &sym_tsv)?;
-        write_file(&index_dir.join("types.tsv"), &typ_tsv)?;
-        write_file(&index_dir.join("macros.tsv"), &mac_tsv)
-    };
-    let write_calls_and_cache = || -> Result<()> {
-        write_file(&index_dir.join("calls.tsv"), &calls_tsv)?;
-        emit_cache_shards(output_dir, cache)
-    };
-    let write_xref = || -> Result<()> { write_file(&index_dir.join("xref.tsv"), &xref_tsv) };
-
-    let ((r1a, r1b), (r2, r3)) = rayon::join(
-        || rayon::join(write_md_and_sections, write_small_tsvs),
-        || rayon::join(write_calls_and_cache, write_xref),
-    );
-    r1a?;
-    r1b?;
-    r2?;
-    r3?;
+    // 1. Stream every generated table straight to disk. A 12k-file bundle produces ~480 MB of TSV
+    //    text, so no table is ever materialized in memory.
+    //    Write largest-first on a single thread: parallel streams do not help on a rotational disk
+    //    (they only add seeks), and the CPU-side formatting is cheap compared to the I/O.
+    write_xref_tsv_file(&index_dir, indexes)?;
+    write_small_tsv_files(&index_dir, indexes)?;
+    write_calls_tsv_file(&index_dir, indexes)?;
+    write_index_and_sections(
+        config,
+        metadata,
+        sanity,
+        sections,
+        indexes,
+        &sections_dir,
+        &existing_md,
+        units.len(),
+    )?;
 
     // Optional <repo_name>.md if config.single_file is true
     if config.single_file {
+        let index_md = build_master_index_markdown(metadata, sanity, sections, indexes);
         let mut combined = String::with_capacity(index_md.len() + sections.len() * 2048);
         combined.push_str(&index_md);
         combined.push_str("\n---\n\n");
@@ -684,9 +632,12 @@ pub fn emit_bundle(
     let graph_state = build_graph_state(indexes, &metadata.fingerprint, metadata.vendor_mode);
     emit_graph_state(output_dir, &graph_state)?;
 
+    // The per-file AST cache may still be streaming on a worker thread; its shards were joined
+    // above. Write the manifest now that every table is on disk.
+    emit_cache_shards_for_units(config, metadata, units, blueprint_hash, &prewritten)?;
+
     // Ensure .claudeignore entry (only when output_dir is inside repo_path)
-    let claudeignore_updated = ensure_claudeignore_entry(&config.repo_path, output_dir)?;
-    Ok(claudeignore_updated)
+    ensure_claudeignore_entry(&config.repo_path, output_dir)
 }
 
 /// Builds the compact linked-graph state persisted at `cache/graph_state.json`.
@@ -754,6 +705,249 @@ pub fn emit_graph_state(output_dir: &Path, state: &GraphStateFile) -> Result<()>
 pub fn load_graph_state(bundle_dir: &Path) -> Option<GraphStateFile> {
     let bytes = fs::read(bundle_dir.join("cache").join(GRAPH_STATE_FILE)).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Streams `index/calls.tsv`.
+fn write_calls_tsv_file(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
+    write_streamed_file(&index_dir.join("calls.tsv"), |sink| {
+        sink.rows().push_str(
+            "caller_id\tcaller_name\tcallee_name\tcallee_id\tfile\tline\ttier\tsection_id\n",
+        );
+        for c in &indexes.calls {
+            let buf = sink.rows();
+            buf.push_str(&sanitize_tsv(&c.caller_id));
+            buf.push('\t');
+            buf.push_str(&sanitize_tsv(&c.caller_name));
+            buf.push('\t');
+            buf.push_str(&sanitize_tsv(&c.callee_name));
+            buf.push('\t');
+            buf.push_str(&sanitize_tsv(&c.callee_id));
+            buf.push('\t');
+            buf.push_str(&sanitize_tsv(&c.file));
+            buf.push('\t');
+            push_usize(buf, c.line);
+            buf.push('\t');
+            buf.push_str(c.tier.as_str());
+            buf.push('\t');
+            buf.push_str(&sanitize_tsv(&c.section_id));
+            buf.push('\n');
+            sink.flush_if_full()?;
+        }
+        Ok(())
+    })
+}
+
+/// Streams `index/xref.tsv`.
+fn write_xref_tsv_file(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
+    write_streamed_file(&index_dir.join("xref.tsv"), |sink| {
+        sink.rows()
+            .push_str("symbol\tcategory\trelation\ttarget\tfile\tline\tsection_id\tcontext\n");
+        for x in &indexes.xrefs {
+            let buf = sink.rows();
+            buf.push_str(&sanitize_tsv(&x.symbol));
+            buf.push('\t');
+            buf.push_str(&sanitize_tsv(&x.category));
+            buf.push('\t');
+            buf.push_str(&sanitize_tsv(&x.relation));
+            buf.push('\t');
+            buf.push_str(&sanitize_tsv(&x.target));
+            buf.push('\t');
+            buf.push_str(&sanitize_tsv(&x.file));
+            buf.push('\t');
+            push_usize(buf, x.line);
+            buf.push('\t');
+            buf.push_str(&sanitize_tsv(&x.section_id));
+            buf.push('\t');
+            buf.push_str(&sanitize_tsv(&x.context));
+            buf.push('\n');
+            sink.flush_if_full()?;
+        }
+        Ok(())
+    })
+}
+
+/// Streams `index/sections.tsv`, `index/symbols.tsv`, `index/types.tsv`, and `index/macros.tsv`.
+fn write_small_tsv_files(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
+    write_streamed_file(&index_dir.join("sections.tsv"), |sink| {
+        sink.rows().push_str(
+            "section_id\ttitle\tmodule_path\tarch_layer\tscope\tfile_count\tsymbol_count\ttype_count\tmacro_count\ttoken_estimate\tmd_file\n",
+        );
+        for s in &indexes.sections {
+            let _ = writeln!(
+                sink.rows(),
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                sanitize_tsv(&s.section_id),
+                sanitize_tsv(&s.title),
+                sanitize_tsv(&s.module_path),
+                sanitize_tsv(&s.arch_layer),
+                sanitize_tsv(&s.scope),
+                s.file_count,
+                s.symbol_count,
+                s.type_count,
+                s.macro_count,
+                s.token_estimate,
+                sanitize_tsv(&s.md_file),
+            );
+            sink.flush_if_full()?;
+        }
+        Ok(())
+    })?;
+
+    write_streamed_file(&index_dir.join("symbols.tsv"), |sink| {
+        sink.rows().push_str(
+            "symbol_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tsignature\tpagerank\tin_deg\tout_deg\tarch_layer\tscope\tsection_id\tdoc_summary\thub_score\tauthority_score\n",
+        );
+        for rs in &indexes.symbols {
+            let s = &rs.symbol;
+            let _ = writeln!(
+                sink.rows(),
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}",
+                sanitize_tsv(&s.symbol_id),
+                sanitize_tsv(&s.name),
+                s.kind.as_str(),
+                s.visibility.as_str(),
+                sanitize_tsv(&s.file),
+                s.start_line,
+                s.end_line,
+                sanitize_tsv(&s.signature),
+                rs.pagerank,
+                rs.in_degree,
+                rs.out_degree,
+                s.arch_layer.as_str(),
+                s.scope.as_str(),
+                sanitize_tsv(&s.section_id),
+                sanitize_tsv(&s.doc_summary),
+                rs.hub_score,
+                rs.authority_score,
+            );
+            sink.flush_if_full()?;
+        }
+        Ok(())
+    })?;
+
+    write_streamed_file(&index_dir.join("types.tsv"), |sink| {
+        sink.rows().push_str(
+            "type_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tfields_summary\tarch_layer\tscope\tsection_id\tdoc_summary\n",
+        );
+        for t in &indexes.types {
+            let _ = writeln!(
+                sink.rows(),
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                sanitize_tsv(&t.type_id),
+                sanitize_tsv(&t.name),
+                t.kind.as_str(),
+                t.visibility.as_str(),
+                sanitize_tsv(&t.file),
+                t.start_line,
+                t.end_line,
+                sanitize_tsv(&t.fields_summary),
+                t.arch_layer.as_str(),
+                t.scope.as_str(),
+                sanitize_tsv(&t.section_id),
+                sanitize_tsv(&t.doc_summary),
+            );
+            sink.flush_if_full()?;
+        }
+        Ok(())
+    })?;
+
+    write_streamed_file(&index_dir.join("macros.tsv"), |sink| {
+        sink.rows().push_str(
+            "name\tkind\tvalue_or_args\thex_addr\tfile\tline\tarch_layer\tscope\tsection_id\tdescription\n",
+        );
+        for m in &indexes.macros {
+            let _ = writeln!(
+                sink.rows(),
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                sanitize_tsv(&m.name),
+                m.kind.as_str(),
+                sanitize_tsv(&m.value_or_args),
+                sanitize_tsv(m.hex_addr.as_deref().unwrap_or("-")),
+                sanitize_tsv(&m.file),
+                m.line,
+                m.arch_layer.as_str(),
+                m.scope.as_str(),
+                sanitize_tsv(&m.section_id),
+                sanitize_tsv(&m.description),
+            );
+            sink.flush_if_full()?;
+        }
+        Ok(())
+    })
+}
+
+/// Writes `INDEX.md` and every `sections/*.md` shard.
+///
+/// `existing_md` holds the shard file names already present after the stale-shard prune, so those
+/// writes keep the atomic temp-file path while brand-new shards are created directly.
+#[allow(clippy::too_many_arguments)]
+fn write_index_and_sections(
+    config: &ConvertConfig,
+    metadata: &RepoMetadata,
+    sanity: &SanityReport,
+    sections: &[SectionShard],
+    indexes: &BundleIndexes,
+    sections_dir: &Path,
+    existing_md: &FxHashSet<String>,
+    unit_count: usize,
+) -> Result<()> {
+    let index_md = build_master_index_markdown(metadata, sanity, sections, indexes);
+    write_file(&config.output_dir.join("INDEX.md"), &index_md)?;
+
+    let write_shard = |shard: &SectionShard| -> Result<()> {
+        let rel_md = shard
+            .summary
+            .md_file
+            .strip_prefix("sections/")
+            .unwrap_or(&shard.summary.md_file);
+        write_new_or_existing_file(
+            &sections_dir.join(rel_md),
+            shard.markdown_body.as_bytes(),
+            !existing_md.contains(rel_md),
+        )
+    };
+
+    if config.force && (50..=1000).contains(&unit_count) {
+        // Small force-rebuild: flush each shard through a synced temp file first (the historical
+        // behavior for medium repos).
+        for shard in sections {
+            let rel_md = shard
+                .summary
+                .md_file
+                .strip_prefix("sections/")
+                .unwrap_or(&shard.summary.md_file);
+            let tmp_path = sections_dir.join(format!(".{rel_md}.{}.sync.tmp", std::process::id()));
+            let _ = fs::write(&tmp_path, shard.markdown_body.as_bytes());
+            if let Ok(file) = fs::File::options().write(true).open(&tmp_path) {
+                let _ = fs::File::sync_data(&file);
+            }
+            let _ = fs::remove_file(&tmp_path);
+            write_shard(shard)?;
+        }
+        return Ok(());
+    }
+
+    // Two streams: the section shards are independent files, and overlapping their writes with
+    // each other measurably shortens this stage on this machine.
+    let mid = sections.len() / 2;
+    let (left, right) = sections.split_at(mid);
+    let (rl, rr) = rayon::join(
+        || -> Result<()> {
+            for shard in left {
+                write_shard(shard)?;
+            }
+            Ok(())
+        },
+        || -> Result<()> {
+            for shard in right {
+                write_shard(shard)?;
+            }
+            Ok(())
+        },
+    );
+    rl?;
+    rr?;
+    Ok(())
 }
 
 fn build_master_index_markdown(
@@ -1066,7 +1260,260 @@ fn build_master_index_markdown(
 /// Performs a single `fs::read_dir` pass over `cache/` to detect existing shard files,
 /// reuses `structural_digest` from the previous manifest when `blake3_hash` and `shard`
 /// match, writes only missing or changed shards, and prunes orphaned `.json` shards.
+/// Emits `cache/<shard>.json` + `cache/manifest.json` from a parsed-unit cache (`cache`).
 pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Result<()> {
+    emit_cache_shards_with_prewritten(output_dir, cache, &FxHashMap::default())
+}
+
+/// Identity of a cache shard that was already written to disk earlier in the same run.
+#[derive(Debug, Clone)]
+pub struct PrewrittenShard {
+    pub blake3_hash: String,
+    pub shard_name: String,
+    pub structural_digest: String,
+}
+
+/// One parsed unit's per-file AST cache shard, prepared on a parse worker (CPU only) so the
+/// I/O-bound write can happen on a dedicated writer thread.
+#[derive(Debug)]
+pub struct CacheShardPacket {
+    pub rel_path: String,
+    pub blake3_hash: String,
+    pub shard_name: String,
+    pub structural_digest: String,
+    pub json: String,
+}
+
+/// Serializes one parsed unit into a [`CacheShardPacket`]. Returns `None` if the unit cannot be
+/// serialized; the caller then falls back to the regular cache-shard emission path.
+pub fn prepare_cache_shard(unit: &ParsedFileUnit) -> Option<CacheShardPacket> {
+    let rel_path = unit.scanned.rel_path.as_str();
+    let hash = unit.scanned.blake3_hash.as_str();
+    let json = serde_json::to_string(unit).ok()?;
+    Some(CacheShardPacket {
+        rel_path: rel_path.to_string(),
+        blake3_hash: hash.to_string(),
+        shard_name: format!("{}.json", CacheShardEntry::shard_key(rel_path, hash)),
+        structural_digest: unit.structural_digest(),
+        json,
+    })
+}
+
+/// Streaming per-file AST cache writer for one bundle.
+///
+/// Construct once per convert (it lists `cache/` and parses the previous `cache/manifest.json`
+/// exactly once), then hand it successive batches of parsed units as they become available. Each
+/// [`Self::write_units`] call serializes its batch in parallel (pure CPU) and writes the shards on
+/// the calling thread, so the disk sees one sequential stream of small writes.
+pub struct CacheShardWriter {
+    cache_dir: PathBuf,
+    existing_json_files: FxHashSet<String>,
+    prev_manifest: Option<CacheManifest>,
+    written: usize,
+    reused: usize,
+    bytes: usize,
+    elapsed: Duration,
+}
+
+impl CacheShardWriter {
+    /// Opens the bundle's `cache/` directory for streaming writes.
+    ///
+    /// Shards whose content hash and shard path already match the previous `cache/manifest.json`
+    /// are reused in place, so a rebuild of an unchanged tree rewrites no cache files at all.
+    pub fn new(
+        output_dir: &Path,
+        schema_version: &str,
+        blueprint_hash: &str,
+        vendor_mode: VendorMode,
+    ) -> Result<Self> {
+        let cache_dir = output_dir.join("cache");
+        create_dir(&cache_dir)?;
+
+        let mut existing_json_files: FxHashSet<String> = FxHashSet::default();
+        if let Ok(entries) = fs::read_dir(&cache_dir) {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if name.ends_with(".json") {
+                        existing_json_files.insert(name);
+                    }
+                }
+            }
+        }
+        let prev_manifest = if existing_json_files.contains("manifest.json") {
+            fs::read(cache_dir.join("manifest.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<CacheManifest>(&b).ok())
+                .filter(|m| {
+                    m.schema_version == schema_version
+                        && m.blueprint_hash == blueprint_hash
+                        && m.vendor_mode == vendor_mode
+                })
+        } else {
+            None
+        };
+
+        Ok(Self {
+            cache_dir,
+            existing_json_files,
+            prev_manifest,
+            written: 0,
+            reused: 0,
+            bytes: 0,
+            elapsed: Duration::ZERO,
+        })
+    }
+
+    /// Serializes and writes the cache shards of `units`, returning their identity keyed by
+    /// repository-relative path.
+    ///
+    /// JSON encoding and structural-digest hashing are pure CPU and run in parallel; the
+    /// (I/O-bound) file writes stay on this thread so the disk sees one ordered stream.
+    pub fn write_units(
+        &mut self,
+        units: &[ParsedFileUnit],
+    ) -> Result<Vec<(String, PrewrittenShard)>> {
+        let started = Instant::now();
+        let packets: Vec<CacheShardPacket> =
+            units.par_iter().filter_map(prepare_cache_shard).collect();
+        let mut out = Vec::with_capacity(packets.len());
+        for packet in packets {
+            let exists = self.existing_json_files.contains(&packet.shard_name);
+            let reusable = exists
+                && self
+                    .prev_manifest
+                    .as_ref()
+                    .and_then(|m| m.files.get(&packet.rel_path))
+                    .is_some_and(|prev| {
+                        prev.blake3_hash == packet.blake3_hash
+                            && prev.structural_digest == packet.structural_digest
+                    });
+            if reusable {
+                self.reused += 1;
+            } else {
+                write_new_or_existing_file(
+                    &self.cache_dir.join(&packet.shard_name),
+                    packet.json.as_bytes(),
+                    !exists,
+                )?;
+                self.written += 1;
+                self.bytes += packet.json.len();
+            }
+            out.push((
+                packet.rel_path,
+                PrewrittenShard {
+                    blake3_hash: packet.blake3_hash,
+                    shard_name: packet.shard_name,
+                    structural_digest: packet.structural_digest,
+                },
+            ));
+        }
+        self.elapsed += started.elapsed();
+        Ok(out)
+    }
+
+    /// Shards written/reused so far and the bytes written; used for `--timings` diagnostics.
+    pub fn stats(&self) -> (usize, usize, usize, Duration) {
+        (self.written, self.reused, self.bytes, self.elapsed)
+    }
+}
+
+/// Serializes every parsed unit and writes its cache shard, returning the identity of each shard
+/// that is on disk and matches its unit. Callers run this on a dedicated thread so the I/O-bound
+/// per-file cache overlaps the CPU-bound link/graph/shard stages instead of extending the critical
+/// path, and so the disk only ever sees one sequential stream of small shard writes.
+pub fn write_cache_shards_for_units(
+    output_dir: &Path,
+    units: &[ParsedFileUnit],
+    schema_version: &str,
+    blueprint_hash: &str,
+    vendor_mode: VendorMode,
+) -> Result<FxHashMap<String, PrewrittenShard>> {
+    let mut writer =
+        CacheShardWriter::new(output_dir, schema_version, blueprint_hash, vendor_mode)?;
+    let mut available: FxHashMap<String, PrewrittenShard> =
+        FxHashMap::with_capacity_and_hasher(units.len(), Default::default());
+    // Serialize in parallel (pure CPU) but write on this single thread so the disk sees one
+    // sequential stream instead of a dozen competing ones; the chunk bounds serialized memory.
+    let mut start = 0usize;
+    while start < units.len() {
+        let end = (start + CACHE_SHARD_WRITE_CHUNK).min(units.len());
+        for (rel_path, shard) in writer.write_units(&units[start..end])? {
+            available.insert(rel_path, shard);
+        }
+        start = end;
+    }
+    Ok(available)
+}
+
+/// Number of units whose cache shards are serialized together before the writer thread writes
+/// them; bounds the serialized (JSON) memory held at once.
+const CACHE_SHARD_WRITE_CHUNK: usize = 256;
+
+/// Cache identity written into `cache/manifest.json` and used to decide shard reuse.
+struct CacheIdentity<'a> {
+    schema_version: &'a str,
+    repo_root: &'a str,
+    vendor_mode: VendorMode,
+    fingerprint: &'a str,
+    blueprint_hash: &'a str,
+}
+
+/// Emits `cache/<shard>.json` for every file in `cache`, trusting shards already written earlier
+/// in this run (`prewritten`, keyed by repository-relative path).
+pub fn emit_cache_shards_with_prewritten(
+    output_dir: &Path,
+    cache: &IncrementalAstCache,
+    prewritten: &FxHashMap<String, PrewrittenShard>,
+) -> Result<()> {
+    let identity = CacheIdentity {
+        schema_version: &cache.schema_version,
+        repo_root: &cache.repo_root,
+        vendor_mode: cache.vendor_mode,
+        fingerprint: &cache.fingerprint,
+        blueprint_hash: &cache.blueprint_hash,
+    };
+    emit_cache_manifest(
+        output_dir,
+        &identity,
+        cache.files.iter().map(|(k, v)| (k.as_str(), v)),
+        prewritten,
+    )
+}
+
+/// Emits `cache/<shard>.json` + `cache/manifest.json` for a rel_path-sorted unit slice, deriving the
+/// cache identity from [`RepoMetadata`]. This is the path used by a full structural rebuild, whose
+/// units are already sorted and are not wrapped in an [`IncrementalAstCache`] BTreeMap.
+pub fn emit_cache_shards_for_units(
+    config: &ConvertConfig,
+    metadata: &RepoMetadata,
+    units: &[ParsedFileUnit],
+    blueprint_hash: &str,
+    prewritten: &FxHashMap<String, PrewrittenShard>,
+) -> Result<()> {
+    let identity = CacheIdentity {
+        schema_version: CACHE_SCHEMA_VERSION,
+        repo_root: &metadata.source_root,
+        vendor_mode: metadata.vendor_mode,
+        fingerprint: &metadata.fingerprint,
+        blueprint_hash,
+    };
+    emit_cache_manifest(
+        &config.output_dir,
+        &identity,
+        units.iter().map(|u| (u.scanned.rel_path.as_str(), u)),
+        prewritten,
+    )
+}
+
+fn emit_cache_manifest<'a, I>(
+    output_dir: &Path,
+    identity: &CacheIdentity<'_>,
+    units: I,
+    prewritten: &FxHashMap<String, PrewrittenShard>,
+) -> Result<()>
+where
+    I: Iterator<Item = (&'a str, &'a ParsedFileUnit)> + ExactSizeIterator,
+{
     let cache_dir = output_dir.join("cache");
     create_dir(&cache_dir)?;
 
@@ -1098,22 +1545,30 @@ pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Resu
         None
     };
     let schema_current = prev_manifest.as_ref().is_some_and(|m| {
-        m.schema_version == cache.schema_version
-            && m.blueprint_hash == cache.blueprint_hash
-            && m.vendor_mode == cache.vendor_mode
+        m.schema_version == identity.schema_version
+            && m.blueprint_hash == identity.blueprint_hash
+            && m.vendor_mode == identity.vendor_mode
     });
 
     let mut manifest_files: BTreeMap<String, CacheShardEntry> = BTreeMap::new();
     let mut expected_shard_names: FxHashSet<String> =
-        FxHashSet::with_capacity_and_hasher(cache.files.len(), Default::default());
+        FxHashSet::with_capacity_and_hasher(units.len(), Default::default());
 
-    for (rel_path, unit) in &cache.files {
+    for (rel_path, unit) in units {
         let hash = &unit.scanned.blake3_hash;
         let shard_key = CacheShardEntry::shard_key(rel_path, hash);
         let shard_fname = format!("{shard_key}.json");
         let shard_rel = format!("cache/{shard_fname}");
 
-        let matched_prev = if schema_current {
+        // A shard streamed to disk earlier in this run is authoritative: it was serialized from
+        // exactly this unit, so neither the digest nor the file needs to be recomputed.
+        let pre = prewritten
+            .get(rel_path)
+            .filter(|p| p.blake3_hash == *hash && p.shard_name == shard_fname);
+
+        let matched_prev = if pre.is_some() {
+            None
+        } else if schema_current {
             prev_manifest
                 .as_ref()
                 .and_then(|m| m.files.get(rel_path))
@@ -1126,13 +1581,14 @@ pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Resu
             None
         };
 
-        let structural_digest = match matched_prev {
-            Some(prev) => prev.structural_digest.clone(),
-            None => unit.structural_digest(),
+        let structural_digest = match (pre, matched_prev) {
+            (Some(pre), _) => pre.structural_digest.clone(),
+            (None, Some(prev)) => prev.structural_digest.clone(),
+            (None, None) => unit.structural_digest(),
         };
 
         let reuse_existing_shard =
-            matched_prev.is_some() && existing_json_files.contains(&shard_fname);
+            pre.is_some() || (matched_prev.is_some() && existing_json_files.contains(&shard_fname));
 
         if !reuse_existing_shard {
             let shard_path = cache_dir.join(&shard_fname);
@@ -1142,7 +1598,7 @@ pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Resu
 
         expected_shard_names.insert(shard_fname);
         manifest_files.insert(
-            rel_path.clone(),
+            rel_path.to_string(),
             CacheShardEntry {
                 blake3_hash: hash.clone(),
                 shard: shard_rel,
@@ -1161,11 +1617,11 @@ pub fn emit_cache_shards(output_dir: &Path, cache: &IncrementalAstCache) -> Resu
     }
 
     let manifest = CacheManifest {
-        schema_version: cache.schema_version.clone(),
-        repo_root: cache.repo_root.clone(),
-        vendor_mode: cache.vendor_mode,
-        fingerprint: cache.fingerprint.clone(),
-        blueprint_hash: cache.blueprint_hash.clone(),
+        schema_version: identity.schema_version.to_string(),
+        repo_root: identity.repo_root.to_string(),
+        vendor_mode: identity.vendor_mode,
+        fingerprint: identity.fingerprint.to_string(),
+        blueprint_hash: identity.blueprint_hash.to_string(),
         files: manifest_files,
     };
     let manifest_json = serde_json::to_string(&manifest)?;
@@ -1467,8 +1923,8 @@ fn write_file(path: &Path, content: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::model::{
-        ExtractedSymbol, LanguageKind, ParsedFileUnit, ScannedFile, VendorMode,
-        CACHE_SCHEMA_VERSION,
+        ExtractedImport, ExtractedMacro, ExtractedSymbol, LanguageKind, ParsedFileUnit,
+        RawCallSite, RawXrefSite, ScannedFile, VendorMode, CACHE_SCHEMA_VERSION,
     };
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
@@ -1765,6 +2221,348 @@ mod tests {
             updated_manifest.files["a.py"].structural_digest, "sentinel_digest0",
             "structural_digest must be reused from previous manifest when blake3_hash matches"
         );
+    }
+
+    /// Cache shards store the owning path once (the unit's `scanned.rel_path`) instead of once per
+    /// entry, and use compact one-letter field names. This test pins the on-disk shape: the path is
+    /// omitted from every entry, every other field survives, and load restores the path plus
+    /// `symbol_id`.
+    #[test]
+    fn cache_shard_omits_owning_path_and_restores_it_on_load() {
+        let tmp = TestTempDir::new("shard_format");
+        let out_dir = tmp.0.join("bundle");
+        let rel_path = "src/app.c";
+
+        let unit = ParsedFileUnit {
+            scanned: ScannedFile {
+                rel_path: rel_path.to_string(),
+                abs_path: PathBuf::from(rel_path),
+                language: LanguageKind::C,
+                scope: FileScope::FirstParty,
+                arch_layer: ArchLayer::App,
+                size_bytes: 42,
+                mtime_secs: 1_700_000_000,
+                mtime_nanos: 7,
+                blake3_hash: "abcdefabcdefabcd".to_string(),
+                line_count: 3,
+            },
+            symbols: vec![ExtractedSymbol {
+                symbol_id: format!("{rel_path}::main"),
+                name: "main".to_string(),
+                qualified_name: "main".to_string(),
+                kind: SymbolKind::Entrypoint,
+                visibility: Visibility::Public,
+                file: rel_path.to_string(),
+                start_line: 1,
+                end_line: 3,
+                signature: "int main(void)".to_string(),
+                doc_summary: String::new(),
+                enclosing_type: None,
+                arch_layer: ArchLayer::App,
+                scope: FileScope::FirstParty,
+                section_id: "01-app".to_string(),
+            }],
+            types: vec![ExtractedType {
+                type_id: "Cfg".to_string(),
+                name: "Cfg".to_string(),
+                kind: TypeKind::Struct,
+                visibility: Visibility::Public,
+                file: rel_path.to_string(),
+                start_line: 5,
+                end_line: 8,
+                fields_summary: "a: int".to_string(),
+                doc_summary: String::new(),
+                arch_layer: ArchLayer::App,
+                scope: FileScope::FirstParty,
+                section_id: "01-app".to_string(),
+            }],
+            macros: vec![ExtractedMacro {
+                name: "LIMIT".to_string(),
+                kind: crate::model::MacroKind::Constant,
+                value_or_args: "10".to_string(),
+                hex_addr: None,
+                file: rel_path.to_string(),
+                line: 2,
+                arch_layer: ArchLayer::App,
+                scope: FileScope::FirstParty,
+                section_id: "01-app".to_string(),
+                description: "limit".to_string(),
+            }],
+            imports: vec![ExtractedImport {
+                file: rel_path.to_string(),
+                line: 1,
+                raw_path: "\"cfg.h\"".to_string(),
+                imported_names: vec!["Cfg".to_string()],
+                is_system: false,
+            }],
+            raw_calls: vec![RawCallSite {
+                caller_file: rel_path.to_string(),
+                caller_name: "main".to_string(),
+                caller_start_line: 1,
+                callee_name: "helper".to_string(),
+                receiver_or_qualifier: None,
+                call_line: 2,
+            }],
+            raw_xrefs: vec![RawXrefSite {
+                file: rel_path.to_string(),
+                line: 2,
+                enclosing_symbol: Some("main".to_string()),
+                target_name: "LIMIT".to_string(),
+                category: "macro_ref".to_string(),
+                context: "10".to_string(),
+            }],
+            parse_errors: 0,
+        };
+
+        let digest_before = unit.structural_digest();
+        let packet = prepare_cache_shard(&unit).expect("serialize shard");
+        let json: serde_json::Value = serde_json::from_str(&packet.json).expect("parse shard");
+
+        // The owning path survives only inside the unit's `scanned` block (`rel_path` + `abs_path`),
+        // never on a symbol/type/macro/import/call/xref entry.
+        assert_eq!(
+            packet.json.matches(rel_path).count(),
+            2,
+            "owning path must only appear in the scanned block: {}",
+            packet.json
+        );
+        assert!(json["symbols"][0].get("file").is_none());
+        assert!(json["symbols"][0].get("symbol_id").is_none());
+        assert!(json["types"][0].get("file").is_none());
+        assert!(json["macros"][0].get("file").is_none());
+        assert!(json["imports"][0].get("file").is_none());
+        assert!(json["raw_calls"][0].get("caller_file").is_none());
+        assert!(json["raw_xrefs"][0].get("file").is_none());
+
+        let cache_dir = out_dir.join("cache");
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+        write_file(&cache_dir.join(&packet.shard_name), &packet.json).expect("write shard");
+        let loaded =
+            crate::scanner::load_cache_shard(&out_dir, &format!("cache/{}", packet.shard_name))
+                .expect("load shard");
+        assert_eq!(loaded.scanned.rel_path, rel_path);
+        assert_eq!(loaded.symbols.len(), 1);
+        assert_eq!(loaded.symbols[0].file, rel_path);
+        assert_eq!(loaded.symbols[0].symbol_id, format!("{rel_path}::main"));
+        assert_eq!(loaded.symbols[0].start_line, 1);
+        assert_eq!(loaded.types[0].file, rel_path);
+        assert_eq!(loaded.types[0].fields_summary, "a: int");
+        assert_eq!(loaded.macros[0].file, rel_path);
+        assert_eq!(loaded.macros[0].value_or_args, "10");
+        assert_eq!(loaded.imports[0].file, rel_path);
+        assert_eq!(loaded.raw_calls[0].caller_file, rel_path);
+        assert_eq!(loaded.raw_calls[0].callee_name, "helper");
+        assert_eq!(loaded.raw_xrefs[0].file, rel_path);
+        assert_eq!(loaded.raw_xrefs[0].category, "macro_ref");
+        assert_eq!(
+            loaded.structural_digest(),
+            digest_before,
+            "digest must ignore the omitted owning path"
+        );
+    }
+
+    #[test]
+    fn write_streamed_file_matches_in_memory_bytes_and_skips_identical_content() {
+        let tmp = TestTempDir::new("streamed_tsv");
+        let path = tmp.0.join("index").join("demo.tsv");
+        fs::create_dir_all(path.parent().unwrap()).expect("create index dir");
+
+        let rows: Vec<(String, usize)> = (0..5_000)
+            .map(|i| (format!("symbol_{i}\twith\ttabs"), i * 7))
+            .collect();
+        let build_reference = || {
+            let mut reference = String::new();
+            reference.push_str("name\tline\n");
+            for (name, line) in &rows {
+                reference.push_str(name);
+                reference.push('\t');
+                push_usize(&mut reference, *line);
+                reference.push('\n');
+            }
+            reference
+        };
+        let stream = |sink: &mut RowSink<'_>| -> Result<()> {
+            sink.rows().push_str("name\tline\n");
+            for (name, line) in &rows {
+                sink.rows().push_str(name);
+                sink.rows().push('\t');
+                push_usize(sink.rows(), *line);
+                sink.rows().push('\n');
+                // Force many flushes through the 1 MB row buffer.
+                sink.flush_if_full()?;
+            }
+            Ok(())
+        };
+
+        write_streamed_file(&path, stream).expect("first streamed write");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read streamed"),
+            build_reference(),
+            "streamed rows must equal the in-memory reference table"
+        );
+
+        // Identical rewrite must be skipped (mtime preserved) and leave no .tmp behind.
+        let past = SystemTime::now() - Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
+
+        write_streamed_file(&path, stream).expect("identical streamed write");
+        assert_eq!(
+            mtime_before,
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            "identical streamed content must not be rewritten"
+        );
+
+        // Different, same-length content must be written through.
+        let mut changed = rows.clone();
+        changed[0].0 = "symbol_X".to_string();
+        write_streamed_file(&path, move |sink| -> Result<()> {
+            sink.rows().push_str("name\tline\n");
+            for (name, line) in &changed {
+                sink.rows().push_str(name);
+                sink.rows().push('\t');
+                push_usize(sink.rows(), *line);
+                sink.rows().push('\n');
+                sink.flush_if_full()?;
+            }
+            Ok(())
+        })
+        .expect("changed streamed write");
+        assert!(fs::read_to_string(&path)
+            .expect("read changed")
+            .contains("symbol_X"));
+
+        let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .expect("read index dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no .tmp files may remain: {leftovers:?}"
+        );
+    }
+
+    /// Shards streamed during parse must be authoritative: the emitter must not reserialize or
+    /// rewrite them, and the manifest must carry the digests computed on the parse side.
+    #[test]
+    fn emit_cache_shards_trusts_prewritten_shards() {
+        let tmp = TestTempDir::new("prewritten_shards");
+        let out_dir = tmp.0.join("bundle");
+
+        let make_unit = |rel_path: &str, hash: &str, sym_name: &str| ParsedFileUnit {
+            scanned: ScannedFile {
+                rel_path: rel_path.to_string(),
+                abs_path: PathBuf::from(rel_path),
+                language: LanguageKind::Python,
+                scope: FileScope::FirstParty,
+                arch_layer: ArchLayer::Domain,
+                size_bytes: 100,
+                mtime_secs: 1_700_000_000,
+                mtime_nanos: 0,
+                blake3_hash: hash.to_string(),
+                line_count: 10,
+            },
+            symbols: vec![ExtractedSymbol {
+                symbol_id: format!("{rel_path}::{sym_name}"),
+                name: sym_name.to_string(),
+                qualified_name: sym_name.to_string(),
+                kind: SymbolKind::Function,
+                visibility: Visibility::Public,
+                file: rel_path.to_string(),
+                start_line: 1,
+                end_line: 5,
+                signature: format!("def {sym_name}():"),
+                doc_summary: String::new(),
+                enclosing_type: None,
+                arch_layer: ArchLayer::Domain,
+                scope: FileScope::FirstParty,
+                section_id: "01-domain".to_string(),
+            }],
+            types: Vec::new(),
+            macros: Vec::new(),
+            imports: Vec::new(),
+            raw_calls: Vec::new(),
+            raw_xrefs: Vec::new(),
+            parse_errors: 0,
+        };
+
+        let units = vec![
+            make_unit("a.py", "1111111111111111", "fn_a"),
+            make_unit("b.py", "2222222222222222", "fn_b"),
+        ];
+        let prewritten = write_cache_shards_for_units(
+            &out_dir,
+            &units,
+            CACHE_SCHEMA_VERSION,
+            "",
+            VendorMode::Active,
+        )
+        .expect("write_cache_shards_for_units");
+        assert_eq!(prewritten.len(), 2);
+        for (rel, shard) in &prewritten {
+            assert!(
+                out_dir.join("cache").join(&shard.shard_name).is_file(),
+                "shard for {rel} must be on disk"
+            );
+        }
+
+        let mut files = BTreeMap::new();
+        for unit in &units {
+            files.insert(unit.scanned.rel_path.clone(), unit.clone());
+        }
+        let cache = IncrementalAstCache {
+            schema_version: CACHE_SCHEMA_VERSION.to_string(),
+            repo_root: "/repo".to_string(),
+            vendor_mode: VendorMode::Active,
+            fingerprint: "fp".to_string(),
+            blueprint_hash: String::new(),
+            files,
+        };
+
+        // Backdate both shards: a rewrite would refresh the mtime.
+        let past = SystemTime::now() - Duration::from_secs(60);
+        let mut mtimes_before = Vec::new();
+        for shard in prewritten.values() {
+            let path = out_dir.join("cache").join(&shard.shard_name);
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+            mtimes_before.push(fs::metadata(&path).unwrap().modified().unwrap());
+        }
+
+        emit_cache_shards_with_prewritten(&out_dir, &cache, &prewritten)
+            .expect("emit_cache_shards_with_prewritten");
+
+        for (shard, before) in prewritten.values().zip(&mtimes_before) {
+            let path = out_dir.join("cache").join(&shard.shard_name);
+            assert_eq!(
+                fs::metadata(&path).unwrap().modified().unwrap(),
+                *before,
+                "prewritten shard must not be rewritten by the emitter"
+            );
+        }
+
+        let manifest: CacheManifest = serde_json::from_slice(
+            &fs::read(out_dir.join("cache").join("manifest.json")).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        assert_eq!(manifest.files.len(), 2);
+        for (rel, shard) in &prewritten {
+            assert_eq!(
+                manifest.files[rel].structural_digest, shard.structural_digest,
+                "manifest must carry the parse-time structural digest for {rel}"
+            );
+        }
     }
 
     #[test]

@@ -1198,13 +1198,30 @@ fn source_extension(path: &str) -> Option<String> {
     Some(ext.to_ascii_lowercase())
 }
 
+/// Allocation-free variant of [`source_extension`] for hot per-symbol path classification.
+fn source_extension_borrowed(path: &str) -> Option<&str> {
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let (stem, ext) = file_name.rsplit_once('.')?;
+    if stem.is_empty() {
+        return None;
+    }
+    Some(ext)
+}
+
 fn is_c_family_header(path: &str) -> bool {
-    source_extension(path).is_some_and(|ext| C_FAMILY_HEADER_EXTENSIONS.contains(&ext.as_str()))
+    source_extension_borrowed(path).is_some_and(|ext| {
+        C_FAMILY_HEADER_EXTENSIONS
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(ext))
+    })
 }
 
 fn is_c_family_implementation(path: &str) -> bool {
-    source_extension(path)
-        .is_some_and(|ext| C_FAMILY_IMPLEMENTATION_EXTENSIONS.contains(&ext.as_str()))
+    source_extension_borrowed(path).is_some_and(|ext| {
+        C_FAMILY_IMPLEMENTATION_EXTENSIONS
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(ext))
+    })
 }
 
 /// Collapses C/C++ header prototypes into the `.c`/`.cc`/`.cpp`/`.cxx` symbol that implements them.
@@ -1217,27 +1234,44 @@ fn merge_c_family_header_prototypes(symbols: &mut Vec<ExtractedSymbol>) {
         return;
     }
 
-    // Index implementation symbols by exact (leaf name, enclosing type).
-    let mut implementations: FxHashMap<(String, Option<String>), Vec<usize>> = FxHashMap::default();
+    // Per-symbol metadata is computed once instead of once per candidate comparison: path
+    // classification (alloc-free), parameter arity, the lowercase file stem, and whether the
+    // signature mentions `inline`.
+    let mut is_impl = vec![false; symbols.len()];
+    let mut is_header = vec![false; symbols.len()];
+    let mut arity: Vec<Option<usize>> = Vec::with_capacity(symbols.len());
+    let mut stem: Vec<Option<String>> = Vec::with_capacity(symbols.len());
     for (idx, sym) in symbols.iter().enumerate() {
-        if !is_c_family_implementation(&sym.file) || sym.visibility == Visibility::Static {
+        let impl_file = is_c_family_implementation(&sym.file);
+        is_impl[idx] = impl_file && sym.visibility != Visibility::Static;
+        is_header[idx] = !impl_file && is_c_family_header(&sym.file);
+        arity.push(signature_param_arity(&sym.signature));
+        stem.push(is_impl[idx].then(|| file_stem_lower(&sym.file)));
+    }
+
+    // Index implementation symbols by exact (leaf name, enclosing type).
+    let mut implementations: FxHashMap<(&str, Option<&str>), Vec<u32>> = FxHashMap::default();
+    for (idx, sym) in symbols.iter().enumerate() {
+        if !is_impl[idx] {
             continue;
         }
         implementations
-            .entry(symbol_key(sym))
+            .entry((sym.name.as_str(), sym.enclosing_type.as_deref()))
             .or_default()
-            .push(idx);
+            .push(idx as u32);
     }
     if implementations.is_empty() {
         return;
     }
 
-    let mut doc_transfers: Vec<(usize, String)> = Vec::new();
-    let mut removed: FxHashSet<usize> = FxHashSet::default();
+    let mut doc_transfers: Vec<(u32, String)> = Vec::new();
+    let mut removed: FxHashSet<u32> = FxHashSet::default();
+    // `is_inline` is only needed for header prototypes; compute it lazily per proto signature.
+    let mut compatible: Vec<u32> = Vec::new();
 
     for (proto_idx, proto) in symbols.iter().enumerate() {
         // Only a non-static, non-inline declaration in a C/C++ header can be a forward prototype.
-        if !is_c_family_header(&proto.file) || proto.visibility == Visibility::Static {
+        if !is_header[proto_idx] || proto.visibility == Visibility::Static {
             continue;
         }
         if proto
@@ -1248,34 +1282,35 @@ fn merge_c_family_header_prototypes(symbols: &mut Vec<ExtractedSymbol>) {
             continue;
         }
 
-        let Some(candidates) = implementations.get(&symbol_key(proto)) else {
+        let Some(candidates) =
+            implementations.get(&(proto.name.as_str(), proto.enclosing_type.as_deref()))
+        else {
             continue;
         };
 
-        let proto_arity = signature_param_arity(&proto.signature);
+        let proto_arity = arity[proto_idx];
         let proto_stem = file_stem_lower(&proto.file);
 
         // Filter candidates with compatible parameter arity (so C++ overloads are never collapsed).
-        let compatible_candidates: Vec<usize> = candidates
-            .iter()
-            .copied()
-            .filter(
-                |&idx| match (proto_arity, signature_param_arity(&symbols[idx].signature)) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => true,
-                },
-            )
-            .collect();
+        compatible.clear();
+        compatible.extend(candidates.iter().copied().filter(|&idx| {
+            match (proto_arity, arity[idx as usize]) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+        }));
 
-        if compatible_candidates.is_empty() {
+        if compatible.is_empty() {
             continue;
         }
 
         // Prefer matching file stem (`drvAdc.h` <-> `drvAdc.c`), then same shard, then
         // first-party over vendor/test code, then lexicographically first symbol id.
-        let best = compatible_candidates.iter().copied().min_by(|&a, &b| {
-            let stem_a = file_stem_lower(&symbols[a].file) != proto_stem;
-            let stem_b = file_stem_lower(&symbols[b].file) != proto_stem;
+        let best = compatible.iter().copied().min_by(|&a, &b| {
+            let a = a as usize;
+            let b = b as usize;
+            let stem_a = stem[a].as_deref() != Some(proto_stem.as_str());
+            let stem_b = stem[b].as_deref() != Some(proto_stem.as_str());
             let sec_a = symbols[a].section_id != proto.section_id;
             let sec_b = symbols[b].section_id != proto.section_id;
             stem_a
@@ -1289,7 +1324,7 @@ fn merge_c_family_header_prototypes(symbols: &mut Vec<ExtractedSymbol>) {
             if !proto.doc_summary.is_empty() {
                 doc_transfers.push((best, proto.doc_summary.clone()));
             }
-            removed.insert(proto_idx);
+            removed.insert(proto_idx as u32);
         }
     }
 
@@ -1298,7 +1333,7 @@ fn merge_c_family_header_prototypes(symbols: &mut Vec<ExtractedSymbol>) {
     }
 
     for (idx, doc_summary) in doc_transfers {
-        let target = &mut symbols[idx];
+        let target = &mut symbols[idx as usize];
         if target.doc_summary.is_empty() {
             target.doc_summary = doc_summary;
         }
@@ -1308,17 +1343,12 @@ fn merge_c_family_header_prototypes(symbols: &mut Vec<ExtractedSymbol>) {
     *symbols = kept
         .drain(..)
         .enumerate()
-        .filter_map(|(idx, sym)| (!removed.contains(&idx)).then_some(sym))
+        .filter_map(|(idx, sym)| (!removed.contains(&(idx as u32))).then_some(sym))
         .collect();
 }
 
-fn symbol_key(sym: &ExtractedSymbol) -> (String, Option<String>) {
-    (sym.name.clone(), sym.enclosing_type.clone())
-}
-
 fn file_stem_lower(path: &str) -> String {
-    let norm = path.replace('\\', "/");
-    let fname = norm.rsplit('/').next().unwrap_or(norm.as_str());
+    let fname = path.rsplit(['/', '\\']).next().unwrap_or(path);
     fname
         .rsplit_once('.')
         .map(|(s, _)| s)
@@ -2239,6 +2269,20 @@ fn compute_vendor_surface(
         }
     }
 
+    // Precompute every segment-aligned suffix of every vendor path once, so an import
+    // (`#include "stm32f4xx_hal.h"` or `#include "Drivers/STM32F4xx_HAL_Driver/Inc/x.h"`) can be
+    // matched with one hash lookup instead of scanning every vendor path with `ends_with`.
+    let mut vendor_path_suffixes: FxHashSet<&str> = FxHashSet::default();
+    for path in &vendor_file_paths {
+        vendor_path_suffixes.insert(path.as_str());
+        let mut idx = 0usize;
+        while let Some(pos) = path[idx..].find('/') {
+            let start = idx + pos + 1;
+            vendor_path_suffixes.insert(&path[start..]);
+            idx = start;
+        }
+    }
+
     let mut active_vendor_symbols: BTreeSet<String> = BTreeSet::new();
     let mut active_mmio_registers: BTreeSet<String> = BTreeSet::new();
     let mut active_vendor_headers: BTreeSet<String> = BTreeSet::new();
@@ -2366,12 +2410,15 @@ fn compute_vendor_surface(
                 .unwrap_or("")
                 .to_ascii_lowercase();
 
+            // A segment-aligned suffix of a known vendor path (`Inc/x.h`, `x.h`) matches the
+            // import. Generic header stems (`hal.h`, `config.h`) only match an exact vendor path
+            // unless the import carries a directory component, which keeps the previous rule.
             let is_generic_stem = GENERIC_HEADER_STEMS.contains(&stem_lower.as_str());
-            let path_boundary_match = vendor_file_paths.iter().any(|vp| {
-                vp == &raw_clean
-                    || ((!is_generic_stem || raw_clean.contains('/'))
-                        && vp.ends_with(&format!("/{raw_clean}")))
-            });
+            let path_boundary_match = if is_generic_stem && !raw_clean.contains('/') {
+                vendor_file_paths.contains(raw_clean.as_str())
+            } else {
+                vendor_path_suffixes.contains(raw_clean.as_str())
+            };
             let stem_fallback_match = !is_generic_stem
                 && ((!fname_lower.is_empty() && vendor_file_stems.contains(&fname_lower))
                     || (!stem_lower.is_empty() && vendor_file_stems.contains(&stem_lower)));

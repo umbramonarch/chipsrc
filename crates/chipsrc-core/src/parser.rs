@@ -37,6 +37,17 @@ pub fn parse_files_incremental_with_blueprint(
 ) -> Result<(Vec<ParsedFileUnit>, usize, usize)> {
     let mut cache_map: std::collections::BTreeMap<String, ParsedFileUnit> =
         existing_cache.map(|c| c.files).unwrap_or_default();
+    parse_files_into_cache_map(scanned_files, &mut cache_map, blueprint)
+}
+
+/// Parses `scanned_files`, reusing (and consuming) entries of `cache_map` whose content hash and
+/// classification still match. Splitting a large parse across several calls with the same
+/// `cache_map` lets a caller overlap the per-file cache writes with the remaining parse work.
+pub fn parse_files_into_cache_map(
+    scanned_files: &[ScannedFile],
+    cache_map: &mut std::collections::BTreeMap<String, ParsedFileUnit>,
+    blueprint: Option<&RepoBlueprint>,
+) -> Result<(Vec<ParsedFileUnit>, usize, usize)> {
     let mut reused_units = Vec::new();
     let mut to_parse = Vec::new();
 

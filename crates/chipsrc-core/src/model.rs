@@ -418,85 +418,151 @@ pub struct ScannedFile {
 }
 
 /// Extracted function, method, constructor, entrypoint, or ISR definition.
+///
+/// Cache shards use one-letter field names (they are 30-40% of a 12k-file bundle's bytes and that
+/// bundle is rewritten on every cold build) and omit the owning path: every entry in a shard
+/// belongs to the shard's own file, so `file`/`symbol_id` are restored by
+/// [`ParsedFileUnit::restore_per_file_fields`] on load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedSymbol {
+    /// `{file}::{name}`, never serialized (reconstructed on load by
+    /// [`ParsedFileUnit::restore_per_file_fields`]).
+    #[serde(default, skip_serializing)]
     pub symbol_id: String,
+    #[serde(rename = "n")]
     pub name: String,
+    #[serde(rename = "q")]
     pub qualified_name: String,
+    #[serde(rename = "k")]
     pub kind: SymbolKind,
+    #[serde(rename = "v")]
     pub visibility: Visibility,
+    /// Owning file, never serialized (the shard's own `scanned.rel_path`).
+    #[serde(default, skip_serializing)]
     pub file: String,
+    #[serde(rename = "s")]
     pub start_line: usize,
+    #[serde(rename = "e")]
     pub end_line: usize,
+    #[serde(rename = "g")]
     pub signature: String,
+    #[serde(rename = "d")]
     pub doc_summary: String,
+    #[serde(rename = "t")]
     pub enclosing_type: Option<String>,
+    #[serde(rename = "c")]
     pub scope: FileScope,
+    #[serde(rename = "a")]
     pub arch_layer: ArchLayer,
+    #[serde(rename = "i")]
     pub section_id: String,
 }
 
 /// Extracted struct, enum, union, trait, interface, class, or typedef definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedType {
+    #[serde(rename = "i")]
     pub type_id: String,
+    #[serde(rename = "n")]
     pub name: String,
+    #[serde(rename = "k")]
     pub kind: TypeKind,
+    #[serde(rename = "v")]
     pub visibility: Visibility,
+    /// Owning file, never serialized (the shard's own `scanned.rel_path`).
+    #[serde(default, skip_serializing)]
     pub file: String,
+    #[serde(rename = "s")]
     pub start_line: usize,
+    #[serde(rename = "e")]
     pub end_line: usize,
+    #[serde(rename = "f")]
     pub fields_summary: String,
+    #[serde(rename = "d")]
     pub doc_summary: String,
+    #[serde(rename = "c")]
     pub scope: FileScope,
+    #[serde(rename = "a")]
     pub arch_layer: ArchLayer,
+    #[serde(rename = "t")]
     pub section_id: String,
 }
 
 /// Extracted `#define` macro, compile-time constant, hex MMIO address, bitmask, or hardware register access.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedMacro {
+    #[serde(rename = "n")]
     pub name: String,
+    #[serde(rename = "k")]
     pub kind: MacroKind,
+    #[serde(rename = "v")]
     pub value_or_args: String,
+    #[serde(rename = "h")]
     pub hex_addr: Option<String>,
+    /// Owning file, never serialized (the shard's own `scanned.rel_path`).
+    #[serde(default, skip_serializing)]
     pub file: String,
+    #[serde(rename = "l")]
     pub line: usize,
+    #[serde(rename = "c")]
     pub scope: FileScope,
+    #[serde(rename = "a")]
     pub arch_layer: ArchLayer,
+    #[serde(rename = "t")]
     pub section_id: String,
+    #[serde(rename = "d")]
     pub description: String,
 }
 
 /// Extracted import, `use`, or `#include` directive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedImport {
+    /// Owning file, never serialized (the shard's own `scanned.rel_path`).
+    #[serde(default, skip_serializing)]
     pub file: String,
+    #[serde(rename = "l")]
     pub line: usize,
+    #[serde(rename = "p")]
     pub raw_path: String,
+    #[serde(rename = "i")]
     pub imported_names: Vec<String>,
+    #[serde(rename = "s")]
     pub is_system: bool,
 }
 
 /// Unresolved syntactic call expression attributed to its enclosing function/method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawCallSite {
+    /// Owning file, never serialized (the shard's own `scanned.rel_path`).
+    #[serde(default, skip_serializing)]
     pub caller_file: String,
+    #[serde(rename = "n")]
     pub caller_name: String,
+    #[serde(rename = "s")]
     pub caller_start_line: usize,
+    #[serde(rename = "c")]
     pub callee_name: String,
+    #[serde(rename = "r")]
     pub receiver_or_qualifier: Option<String>,
+    #[serde(rename = "l")]
     pub call_line: usize,
 }
 
 /// Raw cross-reference occurrence extracted from a file AST.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawXrefSite {
+    /// Owning file, never serialized (the shard's own `scanned.rel_path`).
+    #[serde(default, skip_serializing)]
     pub file: String,
+    #[serde(rename = "l")]
     pub line: usize,
+    #[serde(rename = "e")]
     pub enclosing_symbol: Option<String>,
+    #[serde(rename = "n")]
     pub target_name: String,
+    #[serde(rename = "c")]
     pub category: String,
+    #[serde(rename = "x")]
     pub context: String,
 }
 
@@ -514,6 +580,52 @@ pub struct ParsedFileUnit {
 }
 
 impl ParsedFileUnit {
+    /// Re-attaches the per-file fields that [`crate::emitter::prepare_cache_shard`] omits from a
+    /// cache shard: every entry belongs to `self.scanned.rel_path`, so the paths are stored once
+    /// (as the unit's `scanned.rel_path`) instead of once per symbol/type/macro/call/xref.
+    ///
+    /// Idempotent, and a no-op for units that already carry the values (in-memory parses and
+    /// shards written before this compaction).
+    pub fn restore_per_file_fields(&mut self) {
+        let rel_path = self.scanned.rel_path.as_str();
+        if rel_path.is_empty() {
+            return;
+        }
+        for s in &mut self.symbols {
+            if s.file.is_empty() {
+                s.file = rel_path.to_string();
+            }
+            if s.symbol_id.is_empty() {
+                s.symbol_id = format!("{}::{}", s.file, s.qualified_name);
+            }
+        }
+        for t in &mut self.types {
+            if t.file.is_empty() {
+                t.file = rel_path.to_string();
+            }
+        }
+        for m in &mut self.macros {
+            if m.file.is_empty() {
+                m.file = rel_path.to_string();
+            }
+        }
+        for imp in &mut self.imports {
+            if imp.file.is_empty() {
+                imp.file = rel_path.to_string();
+            }
+        }
+        for c in &mut self.raw_calls {
+            if c.caller_file.is_empty() {
+                c.caller_file = rel_path.to_string();
+            }
+        }
+        for x in &mut self.raw_xrefs {
+            if x.file.is_empty() {
+                x.file = rel_path.to_string();
+            }
+        }
+    }
+
     /// Computes a deterministic 16-character BLAKE3 structural digest over extracted symbols,
     /// types, macros, imports, raw calls, and raw xrefs while excluding line numbers and doc
     /// comments so comment-only or line-shift edits can short-circuit full graph relinking.

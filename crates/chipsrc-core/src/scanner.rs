@@ -546,10 +546,15 @@ pub fn load_cache_manifest_any_version(bundle_dir: &Path) -> Option<CacheManifes
 }
 
 /// Loads a single per-file AST cache shard (`cache/<blake3_hash>.json`) from `bundle_dir`.
+///
+/// Shards store the owning path once (the unit's `scanned.rel_path`) and omit it from every
+/// symbol/type/macro/import/call/xref row, so the per-file fields are re-attached here.
 pub fn load_cache_shard(bundle_dir: &Path, shard_rel: &str) -> Option<ParsedFileUnit> {
     let shard_path = bundle_dir.join(shard_rel);
     let bytes = fs::read(shard_path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let mut unit: ParsedFileUnit = serde_json::from_slice(&bytes).ok()?;
+    unit.restore_per_file_fields();
+    Some(unit)
 }
 
 /// Returns `true` when `bundle_dir` has a valid `cache/manifest.json` matching `CACHE_SCHEMA_VERSION`.
@@ -900,7 +905,6 @@ impl StampWalkCtx<'_> {
         let Some(&stamp_idx) = self.stamp_index.get(rel_path.as_str()) else {
             // Candidate new file: check if it would be filtered by VendorMode::None or vendor
             // example rules, mirroring the full scanner's scope classification.
-            acc.can_build_files = false;
             let explicit_example_scope = self
                 .blueprint
                 .and_then(|bp| match_longest_prefix(&rel_path, &bp.scopes))
@@ -947,6 +951,10 @@ impl StampWalkCtx<'_> {
                     }
                 }
             }
+            // A file that only the vendor-side filters would have excluded is not a real change:
+            // the full scan never indexes it either. Only files that survive the filters and are
+            // genuinely new invalidate the reusable file list.
+            acc.can_build_files = false;
             acc.suspects.push(abs_path.to_path_buf());
             acc.suspect_rel_paths.push(rel_path);
             acc.added += 1;
@@ -2321,6 +2329,66 @@ mod tests {
             .suspect_rel_paths
             .iter()
             .any(|p| p == "mod3/nested/new_file.c"));
+    }
+
+    /// A vendor-SDK example/demo file that appears after indexing is excluded by the full scan
+    /// (it is never indexed), so it must not invalidate `StampCheck::scanned_files`. Before the
+    /// fix the `can_build_files = false` flag was set before the vendor-example filters ran, so
+    /// extracting a vendor SDK's `examples/` tree forced a full rescan during self-heal.
+    #[test]
+    fn stamp_check_vendor_example_files_do_not_invalidate_scanned_files() {
+        let tmp = TestTempDir::new("chipsrc_scanner_vendor_examples");
+        let repo_dir = tmp.path().join("repo");
+        let out_dir = tmp.path().join("bundle");
+        write_src(&repo_dir.join("src/app.c"), "int app(void) { return 0; }\n");
+        write_src(
+            &repo_dir.join("vendor/sdk/inc/sdk_core.h"),
+            "int sdk_init(void);\n",
+        );
+
+        let cfg = crate::model::ConvertConfig::new(repo_dir.clone(), out_dir);
+        let bundle = crate::convert_repo(&cfg).expect("initial convert_repo");
+
+        let clean =
+            stamp_check(&repo_dir, &bundle.metadata, DEFAULT_MAX_FILE_BYTES).expect("stamp_check");
+        let baseline = clean
+            .scanned_files
+            .expect("clean walk yields scanned files");
+        assert_eq!(baseline.len(), 2, "first-party + vendor SDK source");
+
+        // A vendor example file appears (as when a vendor SDK submodule is extracted).
+        write_src(
+            &repo_dir.join("vendor/sdk/examples/blinky/main.c"),
+            "int main(void) { return 0; }\n",
+        );
+
+        let after =
+            stamp_check(&repo_dir, &bundle.metadata, DEFAULT_MAX_FILE_BYTES).expect("stamp_check");
+        assert!(
+            after.unchanged,
+            "a filtered-out vendor example file is not an indexed change"
+        );
+        assert_eq!(after.added, 0, "vendor example files are not indexed adds");
+        assert!(after.suspects.is_empty());
+        let files = after
+            .scanned_files
+            .expect("filtered-out vendor example must not invalidate scanned_files");
+        assert_eq!(files.len(), 2);
+        assert!(!files.iter().any(|f| f.rel_path.contains("examples/blinky")));
+
+        // Control: a genuinely new first-party file *does* invalidate the reusable list, because
+        // the full scan would have to index it.
+        write_src(
+            &repo_dir.join("src/extra.c"),
+            "int extra(void) { return 1; }\n",
+        );
+        let real_add =
+            stamp_check(&repo_dir, &bundle.metadata, DEFAULT_MAX_FILE_BYTES).expect("stamp_check");
+        assert_eq!(real_add.added, 1);
+        assert!(
+            real_add.scanned_files.is_none(),
+            "a real new source file cannot be served from the previous file list"
+        );
     }
 
     #[test]
