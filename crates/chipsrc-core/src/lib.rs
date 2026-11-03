@@ -946,6 +946,8 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                     scanner::BundleArtifactSources {
                         meta: Some(&existing_meta),
                         manifest: None,
+                        meta_attempted: true,
+                        manifest_attempted: false,
                     },
                 )
             });
@@ -1075,7 +1077,13 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
     // Shard-reuse policy for the writer thread. A full rebuild (no previous manifest, `--force`,
     // or a missing `meta.json`) never reuses a previous shard; the incremental branch below
     // enables reuse and lists every clean file whose shard had to be reparsed.
-    let mut shard_write_policy = emitter::CacheShardWritePolicy::default();
+    // The writer runs on its own thread while the main thread keeps the global rayon pool busy with
+    // link/graph/shard, so its serialization work uses a dedicated pool (see
+    // `CacheShardWritePolicy::background_writer`).
+    let mut shard_write_policy = emitter::CacheShardWritePolicy {
+        background_writer: true,
+        ..emitter::CacheShardWritePolicy::default()
+    };
 
     let (parsed_units, incremental_reused_files, incremental_reparsed_files) =
         if let Some(mut manifest) = prev_manifest_opt {
@@ -1533,7 +1541,8 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
             })?;
 
         // Every cache shard is on disk and its identity is in `prewritten`; the parsed units are
-        // no longer needed by any stage.
+        // no longer needed by any stage. Releasing the ~400 MB AST before emitting the tables keeps
+        // the cold-path peak working set inside its budget (the tables are rebuilt from `indexes`).
         drop(parsed_units);
         drop(scanned_files);
 
@@ -1642,6 +1651,8 @@ pub fn auto_refresh_bundles(bundles: &[PathBuf]) -> Result<usize> {
                 scanner::BundleArtifactSources {
                     meta: meta_opt.as_ref(),
                     manifest: manifest_opt.as_ref(),
+                    meta_attempted: meta_opt.is_some(),
+                    manifest_attempted: manifest_opt.is_some(),
                 },
             ) {
             true

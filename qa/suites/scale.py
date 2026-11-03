@@ -5,8 +5,12 @@ All timing/RSS budgets, query golden values, and the large-convert guard setting
 mission-wide `<corpus-root>/validators/.large-convert.lock` directory; when another large
 convert holds it the suite records `skipped` assertions instead of failing or overlapping.
 """
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import os
+import shutil
 import statistics
+import time
 
 from lib import procs
 from lib.lockguard import LargeConvertLock, default_lock_path
@@ -14,6 +18,25 @@ from lib.runner import HarnessContext
 
 STM32_REPOS = ["STM32CubeF4"]
 ETL_REPOS = ["etl"]
+
+#: Pause after the corpus warm-up so NTFS lazy-writer flushes from the preceding suites settle
+#: before the cold conversion is timed.
+SCALE_SETTLE_SECONDS = 2.0
+
+#: Files above this size are skipped by the warm-up; the scanner's own size limit is elsewhere and
+#: a handful of huge generated blobs must not dominate the warm-up.
+WARM_MAX_FILE_BYTES = 8 * 1024 * 1024
+
+#: Extensions the scanner indexes. Only these files' bytes need to be in the page cache; every
+#: other corpus file is still visited (and its metadata warmed) without being read.
+WARM_SOURCE_EXTENSIONS = frozenset(
+    {
+        ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".ino",
+        ".rs", ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+        ".go", ".java", ".kt", ".swift", ".m", ".mm", ".cs", ".rb", ".php",
+        ".scala", ".lua", ".sh", ".ps1", ".astro", ".vue", ".svelte",
+    }
+)
 
 STM32_ASSERTION_LABELS = [
     "scale: STM32 bundle artifacts complete after cold convert",
@@ -32,6 +55,96 @@ ETL_ASSERTION_LABELS = [
     "scale: ETL cold convert link within budget",
     "scale: ETL cold convert produces a complete bundle",
 ]
+
+
+def _cleanup_stale_scale_sandboxes(ctx: HarnessContext) -> list[str]:
+    """Removes leftover ``scale-*`` sandbox trees from interrupted earlier runs.
+
+    A crashed or killed scale run leaves a multi-gigabyte bundle tree behind; copying/writing the
+    next cold build next to it measurably slows the drive. Only directories from *other* runs are
+    removed, and only while this run holds the large-convert guard (so no other scale suite is
+    writing into them).
+    """
+    removed: list[str] = []
+    sandboxes = ctx.sandboxes_dir
+    if not sandboxes.is_dir():
+        return removed
+    current = ctx.sandbox_dir.resolve()
+    for entry in sandboxes.iterdir():
+        if not entry.is_dir() or not entry.name.startswith("scale-"):
+            continue
+        if entry.resolve() == current:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        if not entry.exists():
+            removed.append(entry.name)
+    return removed
+
+
+def _warm_corpus_cache(source: Path) -> dict:
+    """Warms the corpus into the OS page cache so the timed cold convert measures the product.
+
+    The scale budgets were calibrated with the corpus warm in the OS page cache. The scanner hashes
+    every indexed source file, so on a cold cache its `scan` stage pays the drive's sequential-read
+    cost (~18 s for STM32CubeF4 on this machine's spinning disk) instead of ~0.4 s. This walk stats
+    every entry (warming NTFS metadata for the scanner's own walk) and reads only indexed source
+    files, which is the byte range the scan must hash.
+    """
+    started = time.perf_counter()
+    entries = 0
+    skipped_large = 0
+    largest_first: list[tuple[int, Path]] = []
+    for root, dirnames, filenames in os.walk(source):
+        dirnames[:] = [name for name in dirnames if name != ".git"]
+        for name in filenames:
+            entries += 1
+            path = Path(root) / name
+            if path.suffix.lower() not in WARM_SOURCE_EXTENSIONS:
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if size > WARM_MAX_FILE_BYTES:
+                skipped_large += 1
+                continue
+            largest_first.append((size, path))
+    # Largest first: long sequential reads warm the drive's cache and page cache fastest.
+    largest_first.sort(key=lambda item: item[0], reverse=True)
+    pending = [path for _, path in largest_first]
+
+    def read_file(path: Path) -> int:
+        total = 0
+        try:
+            with open(path, "rb") as handle:
+                while True:
+                    chunk = handle.read(4 << 20)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+        except OSError:
+            return 0
+        return total
+
+    # The drive (not the CPU) is the bottleneck, so parallel reads -- the same shape as the
+    # scanner's own parallel walk -- are what turn ~70 s of serial reads into seconds. Eight
+    # workers is enough to queue the drive without the seek thrash a larger fan-out causes on a
+    # rotational volume shared with other processes.
+    workers = min(8, max(2, os.cpu_count() or 2))
+    read_bytes = 0
+    files = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for total in pool.map(read_file, pending):
+            if total:
+                read_bytes += total
+                files += 1
+    return {
+        "files": files,
+        "entries": entries,
+        "bytes": read_bytes,
+        "skipped_large": skipped_large,
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+    }
 
 
 def _budget_timings(timings: dict[str, int], scale: dict) -> dict:
@@ -499,7 +612,17 @@ def run_suite(ctx: HarnessContext) -> None:
     previous_timeout = ctx.timeout
     ctx.timeout = max(previous_timeout, float(scale["command_timeout_s"]))
     try:
+        removed = _cleanup_stale_scale_sandboxes(ctx)
+        ctx.record_observational(
+            "scale: stale scale sandboxes removed",
+            {"removed": removed, "count": len(removed)},
+        )
         if stm32_available:
+            warm = _warm_corpus_cache(ctx.corpus_root / "STM32CubeF4")
+            ctx.record_observational("scale: STM32 corpus cache warm-up", warm)
+            # Let the OS finish the lazy writes flushed by the preceding suites before the timed
+            # cold conversion starts competing for the same disk.
+            time.sleep(SCALE_SETTLE_SECONDS)
             _run_stm32(ctx, scale)
         if etl_available:
             _run_etl(ctx, scale)

@@ -1,9 +1,10 @@
 use crate::error::{ChipsrcError, Result};
 use crate::model::{
-    ArchLayer, BundleIndexes, CacheManifest, CacheShardEntry, ConvertConfig, ExtractedType,
-    FileScope, GraphStateFile, GraphSymbolRef, IncrementalAstCache, ParsedFileUnit, RankedSymbol,
-    RepoMetadata, ResolvedCallEdge, SanityReport, SectionShard, SymbolGraphState, SymbolKind,
-    TypeKind, VendorMode, Visibility, XrefEntry, CACHE_SCHEMA_VERSION, GRAPH_STATE_FILE,
+    ArchLayer, BundleIndexes, CacheManifest, CacheShardEntry, ConvertConfig, ExtractedMacro,
+    ExtractedType, FileScope, GraphStateFile, GraphSymbolRef, IncrementalAstCache, ParsedFileUnit,
+    RankedSymbol, RepoMetadata, ResolvedCallEdge, SanityReport, SectionShard, SectionSummary,
+    SymbolGraphState, SymbolKind, TypeKind, VendorMode, Visibility, XrefEntry,
+    CACHE_SCHEMA_VERSION, GRAPH_STATE_FILE,
 };
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -138,15 +139,84 @@ fn spawn_lock_heartbeat(
     (signal, handle)
 }
 
+/// Serializes the non-blocking `create_new` + stale check/unlink + immediate re-open sequence.
+///
+/// Two threads that both observe an abandoned lock can otherwise interleave as
+/// "A unlinks stale -> A creates fresh -> B unlinks A's fresh replacement -> B creates its own",
+/// producing two simultaneous guards. Holding this mutex around the whole ownership decision makes
+/// the observation and the reclamation atomic inside the process. It is never held across a sleep.
+static LOCK_ACQUIRE_SERIAL: Mutex<()> = Mutex::new(());
+
+/// Windows share mode for a held lock file: `FILE_SHARE_READ | FILE_SHARE_WRITE`, deliberately
+/// omitting `FILE_SHARE_DELETE`.
+///
+/// The heartbeat's `fs::write`, the token reader's `fs::read`, and `set_modified` all request only
+/// read/write access and therefore interoperate, while `remove_file` requests `DELETE` and fails
+/// with a sharing violation: neither another thread nor an external process can unlink a lock that
+/// is still held.
+#[cfg(windows)]
+const LOCK_FILE_SHARE_MODE: u32 = 0x1 | 0x2;
+
+/// Opens `<out>/cache/.lock` with `create_new(true)`, sharing read/write but not delete on Windows.
+fn open_new_lock_file(lock_path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(LOCK_FILE_SHARE_MODE);
+    }
+    options.open(lock_path)
+}
+
+/// Outcome of one serialized acquisition attempt.
+enum LockAttempt {
+    /// The lock file was created and is owned by this attempt.
+    Acquired(fs::File),
+    /// A stale lock was removed and immediately re-opened successfully.
+    Reclaimed(fs::File),
+    /// A live (or undeletable) lock is held elsewhere.
+    Contended,
+}
+
+/// Runs one acquisition attempt under the caller's process-wide serialization.
+fn attempt_lock(lock_path: &Path) -> std::io::Result<LockAttempt> {
+    match open_new_lock_file(lock_path) {
+        Ok(file) => Ok(LockAttempt::Acquired(file)),
+        Err(err) if is_lock_contention_error(&err) => {
+            if !is_lock_stale(lock_path) {
+                return Ok(LockAttempt::Contended);
+            }
+            // The lock looks abandoned. Unlink and immediately re-create while the process-wide
+            // mutex still excludes every other thread, so no contender can observe the gap and
+            // mistake a fresh replacement for the stale file it saw earlier. An undeletable lock
+            // (a live owner's non-delete-sharing handle) simply stays contended.
+            if fs::remove_file(lock_path).is_err() {
+                return Ok(LockAttempt::Contended);
+            }
+            match open_new_lock_file(lock_path) {
+                Ok(file) => Ok(LockAttempt::Reclaimed(file)),
+                Err(err) if is_lock_contention_error(&err) => Ok(LockAttempt::Contended),
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Advisory exclusive bundle lock on `<out>/cache/.lock`.
 ///
 /// Writes a unique `<pid>:<unix_ms>:<seq>` owner token and keeps the file's mtime fresh with a
-/// lightweight heartbeat thread while held. `Drop` stops the heartbeat and removes the lock only
-/// when its contents still match this lock's owner token (never deleting a replacement lock).
+/// lightweight heartbeat thread while held. The lock file's handle stays open for the whole guard
+/// lifetime (without `FILE_SHARE_DELETE` on Windows), so a stale reclaimer can never unlink a live
+/// lock. `Drop` stops the heartbeat, releases the handle, and removes the file only when its
+/// contents still match this lock's owner token (never deleting a replacement lock).
 #[derive(Debug)]
 pub struct BundleLock {
     path: PathBuf,
     owner_token: String,
+    /// Open handle to `<out>/cache/.lock`; held until `Drop` so the live lock cannot be unlinked.
+    handle: Option<fs::File>,
     stop_heartbeat: LockHeartbeatSignal,
     heartbeat: Option<JoinHandle<()>>,
 }
@@ -168,15 +238,26 @@ impl BundleLock {
         let start = Instant::now();
 
         loop {
-            match fs::File::options()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(mut file) => {
+            // The whole ownership decision is serialized process-wide so a stale observation can
+            // never race with another thread's fresh `create_new` + reclamation.
+            let attempt = {
+                let _serial = match LOCK_ACQUIRE_SERIAL.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                attempt_lock(&lock_path).map_err(|err| ChipsrcError::io(&lock_path, err))?
+            };
+
+            match attempt {
+                LockAttempt::Acquired(mut file) | LockAttempt::Reclaimed(mut file) => {
                     let owner_token = new_lock_owner_token();
-                    let _ = std::io::Write::write_all(&mut file, owner_token.as_bytes());
-                    drop(file);
+                    if let Err(source) =
+                        std::io::Write::write_all(&mut file, owner_token.as_bytes())
+                    {
+                        drop(file);
+                        let _ = fs::remove_file(&lock_path);
+                        return Err(ChipsrcError::io(&lock_path, source));
+                    }
                     let (stop_heartbeat, heartbeat) = spawn_lock_heartbeat(
                         lock_path.clone(),
                         owner_token.clone(),
@@ -185,14 +266,12 @@ impl BundleLock {
                     return Ok(Some(Self {
                         path: lock_path,
                         owner_token,
+                        handle: Some(file),
                         stop_heartbeat,
                         heartbeat,
                     }));
                 }
-                Err(err) if is_lock_contention_error(&err) => {
-                    if is_lock_stale(&lock_path) && fs::remove_file(&lock_path).is_ok() {
-                        continue;
-                    }
+                LockAttempt::Contended => {
                     // The lock is live, or a stale lock could not be removed (sharing violation).
                     // Either way the wait budget is authoritative: never spin past the deadline.
                     let elapsed = start.elapsed();
@@ -202,7 +281,6 @@ impl BundleLock {
                     let remaining = wait.saturating_sub(elapsed);
                     std::thread::sleep(LOCK_POLL_INTERVAL.min(remaining));
                 }
-                Err(err) => return Err(ChipsrcError::io(&lock_path, err)),
             }
         }
     }
@@ -227,6 +305,10 @@ impl Drop for BundleLock {
             }
             let _ = handle.join();
         }
+        // Release the live handle first: on Windows the file cannot be unlinked (nor its directory
+        // renamed) while a non-delete-sharing handle is open, which is exactly what protects the
+        // lock from concurrent reclaimers. The token check below must run with no handle held.
+        drop(self.handle.take());
         let owns_lock =
             fs::read(&self.path).is_ok_and(|contents| contents == self.owner_token.as_bytes());
         if !owns_lock {
@@ -847,18 +929,38 @@ pub fn emit_bundle(
             Ok(())
         })?;
     } else {
-        write_xref_tsv_file(&index_dir, indexes)?;
-        write_small_tsv_files(&index_dir, indexes)?;
-        write_calls_tsv_file(&index_dir, indexes)?;
-        write_index_and_sections(
-            config,
-            metadata,
-            sanity,
-            sections,
-            indexes,
-            &sections_dir,
-            &existing_md,
-        )?;
+        // Cold build: the table stream is bandwidth-bound while `sections/*.md` creation is
+        // latency-bound (1,500+ small files), so the doc shards run on a second thread alongside
+        // the tables. The two writers touch disjoint paths and form a large sequential stream plus
+        // small-file creates, not two large streams competing for the same head.
+        //
+        // The graph state is built *after* the tables: serializing it allocates a multi-megabyte
+        // JSON string for every symbol, and the cold path is already the point of peak working set
+        // (the parsed AST is still resident while the cache writer runs).
+        std::thread::scope(|scope| -> Result<()> {
+            let docs = scope.spawn(|| {
+                write_index_and_sections(
+                    config,
+                    metadata,
+                    sanity,
+                    sections,
+                    indexes,
+                    &sections_dir,
+                    &existing_md,
+                )
+            });
+            let tables = (|| -> Result<()> {
+                write_xref_tsv_file(&index_dir, indexes)?;
+                write_small_tsv_files(&index_dir, indexes)?;
+                write_calls_tsv_file(&index_dir, indexes)
+            })();
+            let docs = join_emit_worker(docs.join(), &sections_dir)?;
+            tables?;
+            docs?;
+            Ok(())
+        })?;
+        let graph_state = build_graph_state(indexes, &metadata.fingerprint, metadata.vendor_mode);
+        emit_graph_state(output_dir, &graph_state)?;
     }
 
     // Optional <repo_name>.md if config.single_file is true
@@ -875,17 +977,8 @@ pub fn emit_bundle(
         write_file(&single_path, &combined)?;
     }
 
-    // Persist the compact linked-graph state used by the coordinate-shift tier. Cold builds write
-    // it after the tables it describes; the incremental path wrote it alongside them. A
-    // missing/corrupt file only disables the fast path (callers fall back to a full rebuild).
-    if !parallel_tables {
-        let graph_state = build_graph_state(indexes, &metadata.fingerprint, metadata.vendor_mode);
-        emit_graph_state(output_dir, &graph_state)?;
-    }
-
-    // The per-file AST cache is already on disk (the writer thread has been joined by the caller);
-    // emit the manifest from the identities it recorded, or serialize the units here when the
-    // caller has no writer thread (coordinate-shift tier).
+    // The per-file AST cache is already on disk (the caller joined its writer and dropped the
+    // parsed units), so only the manifest derivation remains.
     match cache_source {
         CacheShardSource::Prewritten(cache) => {
             emit_cache_manifest_for_prewritten(config, metadata, blueprint_hash, cache)?
@@ -1048,16 +1141,15 @@ where
     bytes
 }
 
-/// Streams `index/calls.tsv`.
+/// Streams `index/calls.tsv` (parallel batch rendering when the target is brand new).
 fn write_calls_tsv_file(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
-    write_streamed_file(&index_dir.join("calls.tsv"), |sink| {
-        sink.rows().push_str(CALLS_TSV_HEADER);
-        for c in &indexes.calls {
-            append_calls_row(sink.rows(), c);
-            sink.flush_if_full()?;
-        }
-        Ok(())
-    })
+    write_index_table(
+        &index_dir.join("calls.tsv"),
+        CALLS_TSV_HEADER,
+        &indexes.calls,
+        append_calls_row,
+        true,
+    )
 }
 
 /// Rebuilds `index/calls.tsv` in memory with parallel row formatting (incremental syncs).
@@ -1066,16 +1158,15 @@ fn write_calls_tsv_in_memory(index_dir: &Path, indexes: &BundleIndexes) -> Resul
     write_bytes_atomic(&index_dir.join("calls.tsv"), &bytes)
 }
 
-/// Streams `index/xref.tsv`.
+/// Streams `index/xref.tsv` (parallel batch rendering when the target is brand new).
 fn write_xref_tsv_file(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
-    write_streamed_file(&index_dir.join("xref.tsv"), |sink| {
-        sink.rows().push_str(XREF_TSV_HEADER);
-        for x in &indexes.xrefs {
-            append_xref_row(sink.rows(), x);
-            sink.flush_if_full()?;
-        }
-        Ok(())
-    })
+    write_index_table(
+        &index_dir.join("xref.tsv"),
+        XREF_TSV_HEADER,
+        &indexes.xrefs,
+        append_xref_row,
+        true,
+    )
 }
 
 /// Rebuilds `index/xref.tsv` in memory with parallel row formatting (incremental syncs).
@@ -1084,114 +1175,351 @@ fn write_xref_tsv_in_memory(index_dir: &Path, indexes: &BundleIndexes) -> Result
     write_bytes_atomic(&index_dir.join("xref.tsv"), &bytes)
 }
 
-/// Streams `index/sections.tsv`, `index/symbols.tsv`, `index/types.tsv`, and `index/macros.tsv`.
-fn write_small_tsv_files(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
-    write_streamed_file(&index_dir.join("sections.tsv"), |sink| {
-        sink.rows().push_str(
-            "section_id\ttitle\tmodule_path\tarch_layer\tscope\tfile_count\tsymbol_count\ttype_count\tmacro_count\ttoken_estimate\tmd_file\n",
-        );
-        for s in &indexes.sections {
-            let _ = writeln!(
-                sink.rows(),
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                sanitize_tsv(&s.section_id),
-                sanitize_tsv(&s.title),
-                sanitize_tsv(&s.module_path),
-                sanitize_tsv(&s.arch_layer),
-                sanitize_tsv(&s.scope),
-                s.file_count,
-                s.symbol_count,
-                s.type_count,
-                s.macro_count,
-                s.token_estimate,
-                sanitize_tsv(&s.md_file),
-            );
-            sink.flush_if_full()?;
-        }
-        Ok(())
-    })?;
+const SECTIONS_TSV_HEADER: &str =
+    "section_id\ttitle\tmodule_path\tarch_layer\tscope\tfile_count\tsymbol_count\ttype_count\tmacro_count\ttoken_estimate\tmd_file\n";
+const SYMBOLS_TSV_HEADER: &str =
+    "symbol_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tsignature\tpagerank\tin_deg\tout_deg\tarch_layer\tscope\tsection_id\tdoc_summary\thub_score\tauthority_score\n";
+const TYPES_TSV_HEADER: &str =
+    "type_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tfields_summary\tarch_layer\tscope\tsection_id\tdoc_summary\n";
+const MACROS_TSV_HEADER: &str =
+    "name\tkind\tvalue_or_args\thex_addr\tfile\tline\tarch_layer\tscope\tsection_id\tdescription\n";
 
-    write_streamed_file(&index_dir.join("symbols.tsv"), |sink| {
-        sink.rows().push_str(
-            "symbol_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tsignature\tpagerank\tin_deg\tout_deg\tarch_layer\tscope\tsection_id\tdoc_summary\thub_score\tauthority_score\n",
-        );
-        for rs in &indexes.symbols {
-            let s = &rs.symbol;
-            let _ = writeln!(
-                sink.rows(),
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}",
-                sanitize_tsv(&s.symbol_id),
-                sanitize_tsv(&s.name),
-                s.kind.as_str(),
-                s.visibility.as_str(),
-                sanitize_tsv(&s.file),
-                s.start_line,
-                s.end_line,
-                sanitize_tsv(&s.signature),
-                rs.pagerank,
-                rs.in_degree,
-                rs.out_degree,
-                s.arch_layer.as_str(),
-                s.scope.as_str(),
-                sanitize_tsv(&s.section_id),
-                sanitize_tsv(&s.doc_summary),
-                rs.hub_score,
-                rs.authority_score,
-            );
-            sink.flush_if_full()?;
+/// Rounds `value * 1_000_000` to an integer with the exact-decimal, round-half-to-even semantics of
+/// `{:.6}` — computed from the IEEE-754 mantissa/exponent so no double rounding creeps in.
+fn fixed6_scaled(value: f64) -> Option<u64> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return None;
+    }
+    let bits = value.to_bits();
+    let exponent_bits = ((bits >> 52) & 0x7FF) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (mantissa, exponent) = if exponent_bits == 0 {
+        (fraction, -1074i32) // subnormal: mantissa * 2^-1074
+    } else {
+        (fraction | (1u64 << 52), exponent_bits - 1075)
+    };
+    let scaled_exact = (mantissa as u128) * 1_000_000u128;
+    if exponent >= 0 {
+        if exponent > 74 {
+            return Some(u64::MAX); // far outside the score domain: caller formats with `core::fmt`
         }
-        Ok(())
-    })?;
+        return Some((scaled_exact << exponent).min(u128::from(u64::MAX)) as u64);
+    }
+    let shift = u32::try_from(-exponent).ok()?;
+    if shift >= 128 {
+        return Some(0);
+    }
+    if shift > 74 {
+        // The quotient is below 1; `scaled_exact` is at most ~2^74, so only the half boundary can
+        // round up, and a tie rounds to the even (zero) side.
+        return Some(u64::from(scaled_exact > (1u128 << (shift - 1))));
+    }
+    let quotient = scaled_exact >> shift;
+    let remainder = scaled_exact & ((1u128 << shift) - 1);
+    let half = 1u128 << (shift - 1);
+    let rounded = if remainder > half {
+        quotient + 1
+    } else if remainder < half {
+        quotient
+    } else if quotient & 1 == 1 {
+        quotient + 1
+    } else {
+        quotient
+    };
+    Some(rounded.min(u128::from(u64::MAX)) as u64)
+}
 
-    write_streamed_file(&index_dir.join("types.tsv"), |sink| {
-        sink.rows().push_str(
-            "type_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tfields_summary\tarch_layer\tscope\tsection_id\tdoc_summary\n",
-        );
-        for t in &indexes.types {
-            let _ = writeln!(
-                sink.rows(),
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                sanitize_tsv(&t.type_id),
-                sanitize_tsv(&t.name),
-                t.kind.as_str(),
-                t.visibility.as_str(),
-                sanitize_tsv(&t.file),
-                t.start_line,
-                t.end_line,
-                sanitize_tsv(&t.fields_summary),
-                t.arch_layer.as_str(),
-                t.scope.as_str(),
-                sanitize_tsv(&t.section_id),
-                sanitize_tsv(&t.doc_summary),
-            );
-            sink.flush_if_full()?;
-        }
-        Ok(())
-    })?;
+/// Appends `value` with exactly six fractional digits (the `{:.6}` rendering) without re-parsing a
+/// format string for every row.
+///
+/// PageRank/HITS scores live in `[0, 1]`; anything outside that domain (NaN, infinity, negatives)
+/// falls back to the exact `core::fmt` float path so no value is silently altered.
+#[inline]
+fn push_fixed6(buf: &mut String, value: f64) {
+    let Some(scaled) = fixed6_scaled(value) else {
+        let _ = write!(buf, "{value:.6}");
+        return;
+    };
+    if scaled == u64::MAX {
+        let _ = write!(buf, "{value:.6}");
+        return;
+    }
+    push_usize(buf, (scaled / 1_000_000) as usize);
+    buf.push('.');
+    let mut frac = scaled % 1_000_000;
+    let mut divisor = 100_000u64;
+    while divisor > 0 {
+        buf.push(char::from(b'0' + ((frac / divisor) % 10) as u8));
+        frac %= divisor;
+        divisor /= 10;
+    }
+}
 
-    write_streamed_file(&index_dir.join("macros.tsv"), |sink| {
-        sink.rows().push_str(
-            "name\tkind\tvalue_or_args\thex_addr\tfile\tline\tarch_layer\tscope\tsection_id\tdescription\n",
-        );
-        for m in &indexes.macros {
-            let _ = writeln!(
-                sink.rows(),
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                sanitize_tsv(&m.name),
-                m.kind.as_str(),
-                sanitize_tsv(&m.value_or_args),
-                sanitize_tsv(m.hex_addr.as_deref().unwrap_or("-")),
-                sanitize_tsv(&m.file),
-                m.line,
-                m.arch_layer.as_str(),
-                m.scope.as_str(),
-                sanitize_tsv(&m.section_id),
-                sanitize_tsv(&m.description),
-            );
+/// Appends one `index/sections.tsv` row.
+fn append_section_row(buf: &mut String, s: &SectionSummary) {
+    buf.push_str(&sanitize_tsv(&s.section_id));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&s.title));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&s.module_path));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&s.arch_layer));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&s.scope));
+    buf.push('\t');
+    push_usize(buf, s.file_count);
+    buf.push('\t');
+    push_usize(buf, s.symbol_count);
+    buf.push('\t');
+    push_usize(buf, s.type_count);
+    buf.push('\t');
+    push_usize(buf, s.macro_count);
+    buf.push('\t');
+    push_usize(buf, s.token_estimate);
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&s.md_file));
+    buf.push('\n');
+}
+
+/// Appends one `index/symbols.tsv` row.
+fn append_symbol_row(buf: &mut String, rs: &RankedSymbol) {
+    let s = &rs.symbol;
+    buf.push_str(&sanitize_tsv(&s.symbol_id));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&s.name));
+    buf.push('\t');
+    buf.push_str(s.kind.as_str());
+    buf.push('\t');
+    buf.push_str(s.visibility.as_str());
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&s.file));
+    buf.push('\t');
+    push_usize(buf, s.start_line);
+    buf.push('\t');
+    push_usize(buf, s.end_line);
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&s.signature));
+    buf.push('\t');
+    push_fixed6(buf, rs.pagerank);
+    buf.push('\t');
+    push_usize(buf, rs.in_degree);
+    buf.push('\t');
+    push_usize(buf, rs.out_degree);
+    buf.push('\t');
+    buf.push_str(s.arch_layer.as_str());
+    buf.push('\t');
+    buf.push_str(s.scope.as_str());
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&s.section_id));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&s.doc_summary));
+    buf.push('\t');
+    push_fixed6(buf, rs.hub_score);
+    buf.push('\t');
+    push_fixed6(buf, rs.authority_score);
+    buf.push('\n');
+}
+
+/// Appends one `index/types.tsv` row.
+fn append_type_row(buf: &mut String, t: &ExtractedType) {
+    buf.push_str(&sanitize_tsv(&t.type_id));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&t.name));
+    buf.push('\t');
+    buf.push_str(t.kind.as_str());
+    buf.push('\t');
+    buf.push_str(t.visibility.as_str());
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&t.file));
+    buf.push('\t');
+    push_usize(buf, t.start_line);
+    buf.push('\t');
+    push_usize(buf, t.end_line);
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&t.fields_summary));
+    buf.push('\t');
+    buf.push_str(t.arch_layer.as_str());
+    buf.push('\t');
+    buf.push_str(t.scope.as_str());
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&t.section_id));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&t.doc_summary));
+    buf.push('\n');
+}
+
+/// Appends one `index/macros.tsv` row.
+fn append_macro_row(buf: &mut String, m: &ExtractedMacro) {
+    buf.push_str(&sanitize_tsv(&m.name));
+    buf.push('\t');
+    buf.push_str(m.kind.as_str());
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&m.value_or_args));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(m.hex_addr.as_deref().unwrap_or("-")));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&m.file));
+    buf.push('\t');
+    push_usize(buf, m.line);
+    buf.push('\t');
+    buf.push_str(m.arch_layer.as_str());
+    buf.push('\t');
+    buf.push_str(m.scope.as_str());
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&m.section_id));
+    buf.push('\t');
+    buf.push_str(&sanitize_tsv(&m.description));
+    buf.push('\n');
+}
+
+/// Writes one `index/*.tsv` table.
+///
+/// Existing tables keep the streamed/in-memory compare path (they are usually byte-identical on an
+/// incremental sync). A **brand-new** table has nothing to compare against, so when `parallel_cold`
+/// is set its rows are rendered in parallel batches and streamed through one ordered 8 MiB buffer.
+fn write_index_table<T, F>(
+    path: &Path,
+    header: &str,
+    rows: &[T],
+    append_row: F,
+    parallel_cold: bool,
+) -> Result<()>
+where
+    T: Sync,
+    F: Fn(&mut String, &T) + Sync + Send,
+{
+    let existing_len = fs::metadata(path)
+        .ok()
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len());
+    if parallel_cold && existing_len.is_none() {
+        return write_parallel_table_cold(path, header, rows, append_row);
+    }
+    write_streamed_file(path, |sink| {
+        sink.rows().push_str(header);
+        for row in rows {
+            append_row(sink.rows(), row);
             sink.flush_if_full()?;
         }
         Ok(())
     })
+}
+
+/// Rows rendered per parallel batch on a cold table build (~0.2-0.45 MiB of text per batch).
+///
+/// Batches are kept small because the cold table render can run while the parsed AST is still
+/// resident (the background cache writer borrows it): a wider window buys no measurable throughput
+/// and only raises the peak working set of the whole conversion.
+const COLD_TABLE_BATCH_ROWS: usize = 2 * 1024;
+
+/// File buffer used by [`write_parallel_table_cold`]: a cold multi-hundred-megabyte table becomes a
+/// short series of 4 MiB sequential writes instead of ~200 one-megabyte rewrites of the same buffer.
+///
+/// The buffer is deliberately kept small: this render can run while the parsed AST is still
+/// resident (the background cache writer borrows it), so every megabyte here counts against the
+/// cold-path peak working-set budget.
+const COLD_TABLE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+
+/// Renders a brand-new table in parallel batches and writes the batches in order.
+///
+/// Only one window of batches is alive at a time, so a 239 MB `xref.tsv` never materializes in
+/// memory; the parallel part is pure per-row string formatting, which is the cold-build CPU cost.
+fn write_parallel_table_cold<T, F>(
+    path: &Path,
+    header: &str,
+    rows: &[T],
+    append_row: F,
+) -> Result<()>
+where
+    T: Sync,
+    F: Fn(&mut String, &T) + Sync + Send,
+{
+    let tmp_path = temp_sibling_path(path);
+    let file = match fs::File::create(&tmp_path) {
+        Ok(file) => file,
+        Err(source) => return Err(ChipsrcError::io(&tmp_path, source)),
+    };
+    let mut hashing = HashingWriter {
+        inner: std::io::BufWriter::with_capacity(COLD_TABLE_BUFFER_BYTES, file),
+        hasher: None,
+        len: 0,
+    };
+
+    let rendered = (|| -> Result<()> {
+        sink_write(&mut hashing, path, header.as_bytes())?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let batch_count = rows.len().div_ceil(COLD_TABLE_BATCH_ROWS);
+        let window = rayon::current_num_threads().clamp(1, 4);
+        let mut start = 0usize;
+        while start < batch_count {
+            let end = (start + window).min(batch_count);
+            let parts: Vec<String> = (start..end)
+                .into_par_iter()
+                .map(|batch| {
+                    let from = batch * COLD_TABLE_BATCH_ROWS;
+                    let to = ((batch + 1) * COLD_TABLE_BATCH_ROWS).min(rows.len());
+                    let mut buf = String::with_capacity((to - from) * 96 + 256);
+                    for row in &rows[from..to] {
+                        append_row(&mut buf, row);
+                    }
+                    buf
+                })
+                .collect();
+            for part in parts {
+                sink_write(&mut hashing, path, part.as_bytes())?;
+            }
+            start = end;
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = rendered {
+        drop(hashing);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    let HashingWriter { mut inner, .. } = hashing;
+    if let Err(source) = inner.flush() {
+        drop(inner);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ChipsrcError::io(path, source));
+    }
+    drop(inner);
+    rename_with_retry(&tmp_path, path)
+}
+
+/// Writes `index/sections.tsv`, `index/symbols.tsv`, `index/types.tsv`, and `index/macros.tsv`.
+fn write_small_tsv_files(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
+    write_index_table(
+        &index_dir.join("sections.tsv"),
+        SECTIONS_TSV_HEADER,
+        &indexes.sections,
+        append_section_row,
+        false,
+    )?;
+    write_index_table(
+        &index_dir.join("symbols.tsv"),
+        SYMBOLS_TSV_HEADER,
+        &indexes.symbols,
+        append_symbol_row,
+        true,
+    )?;
+    write_index_table(
+        &index_dir.join("types.tsv"),
+        TYPES_TSV_HEADER,
+        &indexes.types,
+        append_type_row,
+        false,
+    )?;
+    write_index_table(
+        &index_dir.join("macros.tsv"),
+        MACROS_TSV_HEADER,
+        &indexes.macros,
+        append_macro_row,
+        true,
+    )
 }
 
 /// Writes `INDEX.md` and every `sections/*.md` shard.
@@ -1654,7 +1982,21 @@ pub struct CacheShardWritePolicy {
     /// Repository-relative paths that must be re-serialized even when a previous manifest entry
     /// matches their content hash and shard path.
     pub rewrite: FxHashSet<String>,
+    /// When `true`, the CPU-heavy shard work (JSON encoding, structural digests) runs on a small
+    /// dedicated rayon pool instead of the global one.
+    ///
+    /// This is set by the background cache-writer thread: during a cold structural rebuild the main
+    /// thread keeps the global pool busy with `resolve_and_link` / `build_section_shards`, so the
+    /// writer's `par_iter` calls would otherwise wait behind those jobs and stretch the emit stage.
+    pub background_writer: bool,
 }
+
+/// Worker threads for the background cache writer's dedicated serialization pool.
+///
+/// Two threads are enough to keep the serializer off the writer's critical path while the pack
+/// encoding is memory-bound anyway; each rayon worker costs a stack plus its in-flight buffers, and
+/// the cold path is the point of peak working set.
+const CACHE_WRITER_PARALLELISM: usize = 2;
 
 /// Streaming per-file AST cache writer for one bundle.
 ///
@@ -1666,6 +2008,9 @@ pub struct CacheShardWriter {
     cache_dir: PathBuf,
     state: CacheDirState,
     policy: CacheShardWritePolicy,
+    /// Dedicated serialization pool for the background writer (see
+    /// [`CacheShardWritePolicy::background_writer`]); `None` means "use the global rayon pool".
+    parallel_pool: Option<rayon::ThreadPool>,
     written: usize,
     reused: usize,
     bytes: usize,
@@ -1689,6 +2034,7 @@ impl CacheShardWriter {
             &CacheShardWritePolicy {
                 reuse_previous: true,
                 rewrite: FxHashSet::default(),
+                background_writer: false,
             },
         )
     }
@@ -1712,10 +2058,24 @@ impl CacheShardWriter {
                 && m.vendor_mode == vendor_mode
         });
 
+        let parallel_pool = if policy.background_writer {
+            let threads = CACHE_WRITER_PARALLELISM
+                .min(std::thread::available_parallelism().map_or(1, |n| n.get()))
+                .max(1);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|idx| format!("chipsrc-cache-writer-{idx}"))
+                .build()
+                .ok()
+        } else {
+            None
+        };
+
         Ok(Self {
             cache_dir,
             state,
             policy: policy.clone(),
+            parallel_pool,
             written: 0,
             reused: 0,
             bytes: 0,
@@ -1824,6 +2184,7 @@ impl CacheShardWriter {
     /// with all of its siblings.
     fn write_pack(&mut self, units: &[&ParsedFileUnit]) -> Result<Vec<(String, PrewrittenShard)>> {
         let started = Instant::now();
+        let parallel_pool = self.parallel_pool.as_ref();
         let shard_name = crate::model::cache_pack_shard_name(units);
         let shard_rel = format!("cache/{shard_name}");
         let exists = self.state.existing_json_files.contains(&shard_name);
@@ -1841,7 +2202,7 @@ impl CacheShardWriter {
         if fully_reusable {
             self.reused += 1;
         } else {
-            let json = serialize_pack_json(units, &self.cache_dir)?;
+            let json = serialize_pack_json(units, &self.cache_dir, parallel_pool)?;
             write_new_or_existing_file(
                 &self.cache_dir.join(&shard_name),
                 json.as_bytes(),
@@ -1850,7 +2211,7 @@ impl CacheShardWriter {
             self.written += 1;
             self.bytes += json.len();
         }
-        fill_missing_digests(units, &mut digests);
+        fill_missing_digests(units, &mut digests, parallel_pool);
         let mut out = Vec::with_capacity(units.len());
         for (unit, digest) in units.iter().zip(digests) {
             out.push((
@@ -1892,6 +2253,7 @@ pub fn write_cache_shards_for_units(
         &CacheShardWritePolicy {
             reuse_previous: true,
             rewrite: FxHashSet::default(),
+            background_writer: false,
         },
     )
 }
@@ -1920,8 +2282,8 @@ pub fn write_cache_shards_for_units_with_policy(
     let mut available: FxHashMap<String, PrewrittenShard> =
         FxHashMap::with_capacity_and_hasher(units.len(), Default::default());
     if units.len() > crate::model::CACHE_PACK_FILE_THRESHOLD {
-        // Large repositories use deterministic 64-unit packs: 12.5k tiny files become ~195
-        // ~1.3 MB files, which is the difference between minutes and seconds on a rotational disk.
+        // Large repositories use deterministic 256-unit packs: 12.5k tiny files become ~49
+        // ~6 MB files, which is the difference between minutes and seconds on a rotational disk.
         let mut sorted: Vec<&ParsedFileUnit> = units.iter().collect();
         sorted.sort_by(|a, b| a.scanned.rel_path.cmp(&b.scanned.rel_path));
         let mut start = 0usize;
@@ -1954,40 +2316,67 @@ pub fn write_cache_shards_for_units_with_policy(
 /// them; bounds the serialized (JSON) memory held at once.
 const CACHE_SHARD_WRITE_CHUNK: usize = 256;
 
+/// Units serialized per ordered sub-batch inside one pack.
+///
+/// A pack holds [`crate::model::CACHE_PACK_UNITS`] (256) units and its JSON is ~6 MB at STM32
+/// scale. Encoding that whole pack at once keeps ~2x its size alive (the per-unit strings plus the
+/// joined result) while the parsed AST is still resident; encoding 32-unit sub-batches in order
+/// keeps the same parallelism with a bounded window instead.
+const PACK_SERIALIZE_BATCH_UNITS: usize = 16;
+
 /// Serializes a packed shard as a JSON array of compact [`ParsedFileUnit`]s.
-fn serialize_pack_json(units: &[&ParsedFileUnit], cache_dir: &Path) -> Result<String> {
-    let parts: Vec<Option<String>> = units
-        .par_iter()
-        .map(|unit| serde_json::to_string(unit).ok())
-        .collect();
-    if parts.iter().any(|part| part.is_none()) {
-        return Err(ChipsrcError::io(
-            cache_dir,
-            std::io::Error::other(
-                "failed to serialize a parsed unit into its packed AST cache shard",
-            ),
-        ));
-    }
-    let total: usize = parts
-        .iter()
-        .map(|part| part.as_ref().map_or(0, |text| text.len()))
-        .sum();
-    let mut json = String::with_capacity(total + units.len() + 2);
+///
+/// `pool` selects the rayon pool: the background cache writer passes its dedicated pool so this
+/// pure-CPU work never queues behind the main thread's link/graph/shard jobs on the global pool.
+fn serialize_pack_json(
+    units: &[&ParsedFileUnit],
+    cache_dir: &Path,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<String> {
+    let mut json = String::with_capacity(units.len() * 16 * 1024 + 2);
     json.push('[');
-    for (idx, part) in parts.iter().enumerate() {
-        if idx > 0 {
-            json.push(',');
+    let mut start = 0usize;
+    while start < units.len() {
+        let end = (start + PACK_SERIALIZE_BATCH_UNITS).min(units.len());
+        let batch = &units[start..end];
+        let encode = || -> Vec<Option<String>> {
+            batch
+                .par_iter()
+                .map(|unit| serde_json::to_string(unit).ok())
+                .collect()
+        };
+        let parts = match pool {
+            Some(pool) => pool.install(encode),
+            None => encode(),
+        };
+        for (idx, part) in parts.into_iter().enumerate() {
+            let Some(text) = part else {
+                return Err(ChipsrcError::io(
+                    cache_dir,
+                    std::io::Error::other(
+                        "failed to serialize a parsed unit into its packed AST cache shard",
+                    ),
+                ));
+            };
+            if start + idx > 0 {
+                json.push(',');
+            }
+            json.push_str(&text);
         }
-        if let Some(text) = part {
-            json.push_str(text);
-        }
+        start = end;
     }
     json.push(']');
     Ok(json)
 }
 
 /// Computes structural digests in parallel for the members that could not be reused.
-fn fill_missing_digests(units: &[&ParsedFileUnit], digests: &mut [Option<String>]) {
+///
+/// `pool` behaves as in [`serialize_pack_json`]: the background writer supplies its own pool.
+fn fill_missing_digests(
+    units: &[&ParsedFileUnit],
+    digests: &mut [Option<String>],
+    pool: Option<&rayon::ThreadPool>,
+) {
     let missing: Vec<usize> = digests
         .iter()
         .enumerate()
@@ -1996,10 +2385,16 @@ fn fill_missing_digests(units: &[&ParsedFileUnit], digests: &mut [Option<String>
     if missing.is_empty() {
         return;
     }
-    let computed: Vec<String> = missing
-        .par_iter()
-        .map(|&idx| units[idx].structural_digest())
-        .collect();
+    let compute = || -> Vec<String> {
+        missing
+            .par_iter()
+            .map(|&idx| units[idx].structural_digest())
+            .collect()
+    };
+    let computed = match pool {
+        Some(pool) => pool.install(compute),
+        None => compute(),
+    };
     for (idx, digest) in missing.into_iter().zip(computed) {
         digests[idx] = Some(digest);
     }
@@ -2266,11 +2661,11 @@ fn emit_packed_cache_chunk(
     }
 
     if !all_prewritten && !all_previous {
-        let json = serialize_pack_json(&units, cache_dir)?;
+        let json = serialize_pack_json(&units, cache_dir, None)?;
         write_file(&cache_dir.join(&shard_name), &json)?;
     }
 
-    fill_missing_digests(&units, &mut digests);
+    fill_missing_digests(&units, &mut digests, None);
     expected_shard_names.insert(shard_name.clone());
     for (idx, (rel_path, unit)) in chunk.iter().enumerate() {
         manifest_files.insert(
@@ -2407,7 +2802,7 @@ pub(crate) fn rewrite_cache_shards_for_dirty_units(
         let refs: Vec<&ParsedFileUnit> = members.iter().collect();
         let shard_name = crate::model::cache_pack_shard_name(&refs);
         let shard_rel = format!("cache/{shard_name}");
-        let json = serialize_pack_json(&refs, &cache_dir)?;
+        let json = serialize_pack_json(&refs, &cache_dir, None)?;
         let target = cache_dir.join(&shard_name);
         let known_absent = !target.is_file();
         write_new_or_existing_file(&target, json.as_bytes(), known_absent)?;
@@ -2826,6 +3221,55 @@ mod tests {
     impl Drop for TestTempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The fast 6-decimal renderer must produce exactly the bytes of `{:.6}` for every score the
+    /// graph stages emit, and must never alter out-of-domain values.
+    #[test]
+    fn push_fixed6_matches_std_formatting() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut values: Vec<f64> = vec![
+            0.0,
+            1.0,
+            0.5,
+            0.1,
+            0.123_456_5,
+            0.007_812_5, // exact decimal tie at the 7th digit (rounds half-to-even)
+            0.023_437_5,
+            0.5 - f64::EPSILON,
+            1.0 / 3.0,
+            0.999_999_9,
+            f64::MIN_POSITIVE,
+            1e-12,
+            4.9e-7,
+            5.1e-7,
+        ];
+        for _ in 0..200_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            values.push((state >> 11) as f64 / (1u64 << 53) as f64);
+        }
+        let mut buf = String::new();
+        for value in values {
+            buf.clear();
+            push_fixed6(&mut buf, value);
+            assert_eq!(
+                buf,
+                format!("{value:.6}"),
+                "fast fixed6 rendering diverged for {value:?}"
+            );
+        }
+    }
+
+    /// Out-of-domain values keep the exact `core::fmt` rendering (never clamped or truncated).
+    #[test]
+    fn push_fixed6_preserves_out_of_domain_values() {
+        for value in [f64::NAN, f64::INFINITY, -0.25, -1.0, 2.5] {
+            let mut buf = String::new();
+            push_fixed6(&mut buf, value);
+            assert_eq!(buf, format!("{value:.6}"));
         }
     }
 
@@ -3791,6 +4235,53 @@ mod tests {
         );
     }
 
+    /// The cold parallel batch renderer must produce exactly the bytes of the streamed writer it
+    /// replaces, including across many batch boundaries; the dispatcher must select it only for
+    /// brand-new tables and rewrite an existing table byte-identically.
+    #[test]
+    fn cold_parallel_table_matches_streamed_bytes() {
+        let tmp = TestTempDir::new("cold_parallel_table");
+        let index_dir = tmp.0.join("index");
+        fs::create_dir_all(&index_dir).expect("create index dir");
+        let header = "n\tvalue\n";
+        let rows: Vec<u64> = (0..(COLD_TABLE_BATCH_ROWS as u64 * 5 + 17)).collect();
+        let append = |buf: &mut String, value: &u64| {
+            push_usize(buf, *value as usize);
+            buf.push('\t');
+            push_fixed6(buf, (*value % 1000) as f64 / 1000.0);
+            buf.push('\n');
+        };
+
+        let streamed_path = index_dir.join("streamed.tsv");
+        write_streamed_file(&streamed_path, |sink| {
+            sink.rows().push_str(header);
+            for row in &rows {
+                append(sink.rows(), row);
+                sink.flush_if_full()?;
+            }
+            Ok(())
+        })
+        .expect("streamed table");
+
+        let parallel_path = index_dir.join("parallel.tsv");
+        write_parallel_table_cold(&parallel_path, header, &rows, append)
+            .expect("parallel cold table");
+        assert_eq!(
+            fs::read(&parallel_path).expect("read parallel"),
+            fs::read(&streamed_path).expect("read streamed"),
+            "cold parallel rendering must be byte-identical to the streamed writer"
+        );
+
+        let dispatch_path = index_dir.join("dispatch.tsv");
+        write_index_table(&dispatch_path, header, &rows, append, true).expect("cold dispatch");
+        let cold_bytes = fs::read(&dispatch_path).expect("read cold dispatch");
+        write_index_table(&dispatch_path, header, &rows, append, true).expect("warm dispatch");
+        assert_eq!(
+            fs::read(&dispatch_path).expect("read warm dispatch"),
+            cold_bytes
+        );
+    }
+
     /// The parallel in-memory table rebuild used on incremental syncs must be byte-identical to
     /// the streamed table writer used on cold builds.
     #[test]
@@ -4082,6 +4573,136 @@ mod tests {
         let _ = fs::remove_file(&lock_path);
     }
 
+    /// SYNC-SCRUT-001 (round 2): concurrent stale reclaimers must never unlink a fresh
+    /// replacement lock. Sixteen barrier-synchronized threads race 24 rounds over a stale lock; the
+    /// process-wide acquisition mutex plus the live file handle guarantee at most one guard exists
+    /// at any instant.
+    #[test]
+    fn bundle_lock_stale_reclamation_excludes_concurrent_reclaimers() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Barrier;
+
+        const THREADS: usize = 16;
+        const ROUNDS: usize = 24;
+
+        let tmp = TestTempDir::new("bundle_lock_stale_exclusion");
+        let out_dir = tmp.0.join("bundle");
+        let lock_path = out_dir.join("cache").join(".lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).expect("create cache dir");
+
+        let barrier = Arc::new(Barrier::new(THREADS + 1));
+        let live_guards = Arc::new(AtomicUsize::new(0));
+        let overlaps = Arc::new(AtomicUsize::new(0));
+        let acquisitions = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let barrier = Arc::clone(&barrier);
+                let live_guards = Arc::clone(&live_guards);
+                let overlaps = Arc::clone(&overlaps);
+                let acquisitions = Arc::clone(&acquisitions);
+                let out_dir = out_dir.clone();
+                let thread_lock_path = lock_path.clone();
+                scope.spawn(move || {
+                    for _ in 0..ROUNDS {
+                        barrier.wait();
+                        loop {
+                            if let Some(lock) =
+                                BundleLock::acquire(&out_dir, Duration::from_millis(25))
+                                    .expect("acquire must never fail with an I/O error")
+                            {
+                                let others = live_guards.fetch_add(1, Ordering::SeqCst);
+                                if others != 0 {
+                                    overlaps.fetch_add(1, Ordering::SeqCst);
+                                }
+                                acquisitions.fetch_add(1, Ordering::SeqCst);
+                                // Widen the window in which a concurrent reclaimer could unlink
+                                // this fresh replacement lock.
+                                std::thread::sleep(Duration::from_micros(250));
+                                live_guards.fetch_sub(1, Ordering::SeqCst);
+                                drop(lock);
+                                break;
+                            }
+                            // The lock was already released between polls: try again this round
+                            // instead of waiting for the next barrier.
+                            if !thread_lock_path.exists() {
+                                break;
+                            }
+                        }
+                        barrier.wait();
+                    }
+                });
+            }
+
+            for _ in 0..ROUNDS {
+                // Every round starts from an abandoned (stale) lock so all threads attempt
+                // reclamation simultaneously.
+                let _ = fs::remove_file(&lock_path);
+                fs::write(&lock_path, "999999:1000:0\n").expect("write stale lock");
+                fs::File::options()
+                    .write(true)
+                    .open(&lock_path)
+                    .unwrap()
+                    .set_modified(SystemTime::now() - Duration::from_secs(30))
+                    .unwrap();
+                barrier.wait();
+                barrier.wait();
+            }
+        });
+
+        assert_eq!(
+            overlaps.load(Ordering::SeqCst),
+            0,
+            "concurrent stale reclaimers produced overlapping guards"
+        );
+        assert!(
+            acquisitions.load(Ordering::SeqCst) >= ROUNDS,
+            "each round must hand the lock to at least one contender"
+        );
+        assert_eq!(
+            live_guards.load(Ordering::SeqCst),
+            0,
+            "no guard may outlive its round"
+        );
+        assert!(!lock_path.exists(), "no lock may be left behind");
+    }
+
+    /// SYNC-SCRUT-001 (round 2): a held lock keeps its file handle open without delete sharing, so
+    /// another reclaimer cannot unlink the live file even when its mtime looks stale.
+    #[test]
+    fn bundle_lock_held_handle_blocks_stale_unlink() {
+        let tmp = TestTempDir::new("bundle_lock_held_handle");
+        let out_dir = tmp.0.join("bundle");
+        let lock_path = out_dir.join("cache").join(".lock");
+        let lock = BundleLock::acquire(&out_dir, Duration::from_millis(100))
+            .expect("acquire")
+            .expect("lock should be acquired");
+
+        // Backdate the file so any reclaimer believes it is stale, then verify that the token
+        // file cannot be removed while the guard holds its handle.
+        fs::File::options()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(SystemTime::now() - LOCK_STALE_AFTER - Duration::from_secs(30))
+            .unwrap();
+        assert!(is_lock_stale(&lock_path), "backdated lock must look stale");
+
+        let contended =
+            BundleLock::acquire(&out_dir, Duration::from_millis(120)).expect("contended acquire");
+        assert!(
+            contended.is_none(),
+            "a held lock must never be reclaimed even when its mtime is stale"
+        );
+        assert!(lock_path.is_file(), "the live lock file must survive");
+
+        drop(lock);
+        assert!(
+            !lock_path.exists(),
+            "Drop must remove the lock after releasing the handle"
+        );
+    }
+
     /// SYNC-SCRUT-002: an undeletable stale lock cannot make `acquire` spin past its deadline.
     #[cfg(windows)]
     #[test]
@@ -4222,6 +4843,7 @@ mod tests {
             &CacheShardWritePolicy {
                 reuse_previous: true,
                 rewrite,
+                background_writer: false,
             },
         )
         .expect("policy rewrite");

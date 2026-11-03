@@ -1205,3 +1205,46 @@ fn workspace_status_reuses_one_parsed_manifest() {
         "expected missing meta.json reason, got {reason:?}"
     );
 }
+
+/// SYNC-SCRUT-013: a leading-underscore Unicode macro name must never panic the peripheral
+/// normalization path. `#define _abcé 1` trims to the five-byte `abcé`, which used to be sliced at
+/// byte index 4 (inside `é`) by `strip_periph_instance_slice`.
+#[test]
+fn unicode_macro_name_query_never_panics() {
+    let tmp = TestTempDir::new("unicode_macro");
+    let repo_dir = tmp.0.join("repo");
+    fs::create_dir_all(repo_dir.join("src")).expect("create src dir");
+    fs::write(
+        repo_dir.join("src/config.h"),
+        "#ifndef CONFIG_H\n#define CONFIG_H\n\n#define _abcé 1\n#define ČEŠTINA_CONFIG 2\n\n#endif\n",
+    )
+    .expect("write source");
+    let out_root = tmp.0.join("out");
+    let bundle = ensure_repo(&repo_dir, &out_root, false, VendorMode::Active).expect("ensure_repo");
+    let bundles: Vec<PathBuf> = vec![bundle.output_dir.clone()];
+
+    for query in ["_abcé", "abcé", "ČEŠTINA_CONFIG", "ČEŠTINA"] {
+        let text = query_macros(&bundles, query, false, 10)
+            .unwrap_or_else(|err| panic!("text query {query:?} failed: {err}"));
+        assert!(
+            text.contains(query),
+            "text query {query:?} must return the macro row, got: {text}"
+        );
+
+        let json = query_subcommand_json("macro", &bundles, query, None, None, 3, 10)
+            .unwrap_or_else(|err| panic!("json query {query:?} failed: {err}"));
+        let rows: serde_json::Value =
+            serde_json::from_str(&json).unwrap_or_else(|err| panic!("json parse {query:?}: {err}"));
+        let names: Vec<String> = rows
+            .as_array()
+            .expect("macro JSON must be an array")
+            .iter()
+            .filter_map(|row| row.get("name").and_then(|n| n.as_str()))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            names.iter().any(|name| name.contains(query)),
+            "json query {query:?} must return the macro row, got {names:?}"
+        );
+    }
+}

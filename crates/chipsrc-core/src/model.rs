@@ -735,11 +735,15 @@ impl CacheShardEntry {
 }
 
 /// Number of per-file cache units grouped into one packed shard on large repositories.
-pub const CACHE_PACK_UNITS: usize = 64;
+///
+/// 256 units keeps the pack count low (STM32CubeF4: 12,471 units -> 49 packs of ~5-7 MB instead of
+/// 195 packs of ~1.3 MB), which halves the small-file creation cost on the cold path without
+/// exceeding the ~8 MiB budget of a single sequential write.
+pub const CACHE_PACK_UNITS: usize = 256;
 
 /// Repositories with more source files than this store their per-file AST cache as packed shards
 /// (`cache/pack-<16hex>.json`, [`CACHE_PACK_UNITS`] units each) instead of one small file per
-/// source file. Creating 12k tiny files costs minutes on a rotational disk; 195 packs do not.
+/// source file. Creating 12k tiny files costs minutes on a rotational disk; 49 packs do not.
 pub const CACHE_PACK_FILE_THRESHOLD: usize = 500;
 
 /// File-name prefix of a packed cache shard.

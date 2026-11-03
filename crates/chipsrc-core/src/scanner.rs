@@ -13,6 +13,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
 /// Excluded build/artifact/cache and generated documentation/static-asset directories
@@ -272,10 +273,134 @@ pub fn count_source_lines(bytes: &[u8]) -> usize {
         + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"))
 }
 
+/// Number of worker threads for `ignore`'s parallel directory walks (`scan_repository`,
+/// `stamp_check`).
+///
+/// One worker per logical CPU keeps both the cold walk (directory traversal plus per-entry stat) and
+/// the stat-only warm walk saturated; the cap bounds thread creation on very large hosts.
+pub fn walk_parallel_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 16)
+}
+
+/// One candidate source file discovered by the parallel walk:
+/// `(abs_path, rel_path, language, size_bytes, mtime_secs, mtime_nanos)`.
+type ScanCandidate = (PathBuf, String, LanguageKind, u64, u64, u32);
+
+/// Immutable shared state for [`scan_repository`]'s parallel walk.
+struct ScanWalkCtx<'a> {
+    repo_root: &'a Path,
+    blueprint: Option<&'a RepoBlueprint>,
+    max_file_bytes: u64,
+}
+
+impl ScanWalkCtx<'_> {
+    /// Applies the extension / generated-asset / scope-independent filters to one walked entry.
+    fn candidate(&self, entry: &ignore::DirEntry) -> Option<ScanCandidate> {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            return None;
+        }
+        let abs_path = entry.path().to_path_buf();
+        let ext = abs_path.extension().and_then(|e| e.to_str())?;
+        let language = LanguageKind::from_extension(ext)?;
+
+        // Skip minified / bundled third-party documentation JavaScript assets.
+        let lower_filename = abs_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_ascii_lowercase())
+            .unwrap_or_default();
+        if is_bundled_js_asset(&lower_filename) {
+            return None;
+        }
+
+        let meta = entry.metadata().ok()?;
+        let size_bytes = meta.len();
+        if size_bytes == 0 || size_bytes > self.max_file_bytes {
+            return None;
+        }
+
+        let (mtime_secs, mtime_nanos) = file_mtime_secs_nanos(&meta);
+
+        let rel_path = match abs_path.strip_prefix(self.repo_root) {
+            Ok(rel) => normalize_rel_path(rel),
+            Err(_) => normalize_rel_path(&abs_path),
+        };
+        if rel_path.is_empty() || is_generated_doc_asset(&rel_path, &lower_filename) {
+            return None;
+        }
+        if let Some(bp) = self.blueprint {
+            if path_matches_ignore_dirs(&rel_path, &bp.ignore_dirs) {
+                return None;
+            }
+        }
+
+        Some((
+            abs_path,
+            rel_path,
+            language,
+            size_bytes,
+            mtime_secs,
+            mtime_nanos,
+        ))
+    }
+}
+
+/// Parallel walker visitor that collects [`ScanCandidate`]s for [`scan_repository`].
+struct ScanVisitor<'a> {
+    ctx: &'a ScanWalkCtx<'a>,
+    acc: Vec<ScanCandidate>,
+    sink: &'a Mutex<Vec<Vec<ScanCandidate>>>,
+}
+
+impl ignore::ParallelVisitor for ScanVisitor<'_> {
+    fn visit(
+        &mut self,
+        result: std::result::Result<ignore::DirEntry, ignore::Error>,
+    ) -> ignore::WalkState {
+        if let Ok(entry) = result {
+            if let Some(candidate) = self.ctx.candidate(&entry) {
+                self.acc.push(candidate);
+            }
+        }
+        ignore::WalkState::Continue
+    }
+}
+
+impl Drop for ScanVisitor<'_> {
+    fn drop(&mut self) {
+        let acc = std::mem::take(&mut self.acc);
+        if let Ok(mut sink) = self.sink.lock() {
+            sink.push(acc);
+        }
+    }
+}
+
+struct ScanVisitorBuilder<'a> {
+    ctx: &'a ScanWalkCtx<'a>,
+    sink: &'a Mutex<Vec<Vec<ScanCandidate>>>,
+}
+
+impl<'s> ignore::ParallelVisitorBuilder<'s> for ScanVisitorBuilder<'s> {
+    fn build(&mut self) -> Box<dyn ignore::ParallelVisitor + 's> {
+        Box::new(ScanVisitor {
+            ctx: self.ctx,
+            acc: Vec::new(),
+            sink: self.sink,
+        })
+    }
+}
+
 /// Walks `repo_path` respecting `.gitignore`, `.claudeignore`, and `.chipsrc.json`, skips generated
 /// documentation assets and minified/bundled third-party JavaScript, classifies each
 /// supported source file by language, ownership scope, and architectural layer, and returns the
 /// sorted file list along with a 16-character BLAKE3 repository fingerprint.
+///
+/// The walk itself is parallel (`ignore::WalkParallel`): gitignore matching and per-entry stat run
+/// on [`walk_parallel_threads`] workers instead of one thread, and the collected candidates are
+/// sorted by relative path before the parallel file reads so sibling files are read back to back.
 pub fn scan_repository(
     repo_path: &Path,
     vendor_mode: VendorMode,
@@ -333,72 +458,32 @@ pub fn scan_repository(
             true
         });
 
-    let mut candidate_paths: Vec<(PathBuf, String, LanguageKind, u64, u64, u32)> = Vec::new();
     let bp_ref = blueprint_opt.as_ref().map(|(bp, _)| bp);
-
-    for entry_res in walker.build() {
-        let entry = match entry_res {
-            Ok(e) => e,
-            Err(_) => continue,
+    let ctx = ScanWalkCtx {
+        repo_root: repo_path,
+        blueprint: bp_ref,
+        max_file_bytes,
+    };
+    let sink: Mutex<Vec<Vec<ScanCandidate>>> = Mutex::new(Vec::new());
+    {
+        let mut builder = ScanVisitorBuilder {
+            ctx: &ctx,
+            sink: &sink,
         };
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
-        let abs_path = entry.path().to_path_buf();
-        let ext = match abs_path.extension().and_then(|e| e.to_str()) {
-            Some(e) => e,
-            None => continue,
-        };
-        let Some(language) = LanguageKind::from_extension(ext) else {
-            continue;
-        };
-
-        // Skip minified / bundled third-party documentation JavaScript assets.
-        let lower_filename = abs_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.to_ascii_lowercase())
-            .unwrap_or_default();
-        if is_bundled_js_asset(&lower_filename) {
-            continue;
-        }
-
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let size_bytes = meta.len();
-        if size_bytes == 0 || size_bytes > max_file_bytes {
-            continue;
-        }
-
-        let (mtime_secs, mtime_nanos) = file_mtime_secs_nanos(&meta);
-
-        let rel_path = match abs_path.strip_prefix(repo_path) {
-            Ok(rel) => normalize_rel_path(rel),
-            Err(_) => normalize_rel_path(&abs_path),
-        };
-        if rel_path.is_empty() {
-            continue;
-        }
-        if is_generated_doc_asset(&rel_path, &lower_filename) {
-            continue;
-        }
-        if let Some(bp) = bp_ref {
-            if path_matches_ignore_dirs(&rel_path, &bp.ignore_dirs) {
-                continue;
-            }
-        }
-
-        candidate_paths.push((
-            abs_path,
-            rel_path,
-            language,
-            size_bytes,
-            mtime_secs,
-            mtime_nanos,
-        ));
+        walker
+            .threads(walk_parallel_threads())
+            .build_parallel()
+            .visit(&mut builder);
     }
+    let mut candidate_paths: Vec<ScanCandidate> = sink
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .into_iter()
+        .flatten()
+        .collect();
+    // Deterministic order *and* read locality: the parallel parse below then reads sibling files
+    // back to back instead of in walker-completion order.
+    candidate_paths.sort_by(|a, b| a.1.cmp(&b.1));
 
     let mut scanned_files: Vec<ScannedFile> = candidate_paths
         .into_par_iter()
@@ -540,9 +625,43 @@ pub fn load_cache_manifest(bundle_dir: &Path) -> Option<CacheManifest> {
 /// Loads `cache/manifest.json` from `bundle_dir` regardless of `schema_version` (used to recover
 /// `repo_root` and `vendor_mode` when `meta.json` is missing or truncated).
 pub fn load_cache_manifest_any_version(bundle_dir: &Path) -> Option<CacheManifest> {
+    #[cfg(test)]
+    manifest_load_probe::note();
     let manifest_path = bundle_dir.join("cache").join("manifest.json");
     let bytes = fs::read(manifest_path).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Test-only per-thread counter for `cache/manifest.json` parses.
+///
+/// The probe is opt-in per thread, so parallel unit tests that also call
+/// [`load_cache_manifest_any_version`] cannot pollute another test's count.
+#[cfg(test)]
+pub(crate) mod manifest_load_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Enables counting and resets the counter on the calling thread.
+    pub(crate) fn start() {
+        ENABLED.with(|enabled| enabled.set(true));
+        COUNT.with(|count| count.set(0));
+    }
+
+    /// Disables counting and returns the number of parses observed on this thread.
+    pub(crate) fn finish() -> usize {
+        ENABLED.with(|enabled| enabled.set(false));
+        COUNT.with(|count| count.get())
+    }
+
+    pub(crate) fn note() {
+        if ENABLED.with(Cell::get) {
+            COUNT.with(|count| count.set(count.get() + 1));
+        }
+    }
 }
 
 /// Parses the bytes of a cache shard: either one compact `ParsedFileUnit` (`cache/<key>.json`) or
@@ -696,10 +815,19 @@ fn read_tsv_header_line(path: &Path) -> Option<String> {
 /// re-reading `meta.json` or `cache/manifest.json` more than once per command.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BundleArtifactSources<'a> {
-    /// Result of `load_meta_file(bundle_dir)`; `None` means "read it here".
+    /// Result of `load_meta_file(bundle_dir)`; `None` means "read it here" unless
+    /// [`Self::meta_attempted`] says the caller already tried.
     pub meta: Option<&'a BundleMetaFile>,
-    /// Result of `load_cache_manifest(bundle_dir)` (schema-validated); `None` means "read it here".
+    /// Result of `load_cache_manifest(bundle_dir)` (schema-validated); `None` means "read it here"
+    /// unless [`Self::manifest_attempted`] says the caller already tried.
     pub manifest: Option<&'a CacheManifest>,
+    /// `true` when the caller already attempted `load_meta_file(bundle_dir)`: a `None` [`Self::meta`]
+    /// then means "missing or invalid", never "not supplied", so the gate must not read it again.
+    pub meta_attempted: bool,
+    /// `true` when the caller already attempted `load_cache_manifest(bundle_dir)` (any schema
+    /// version): a `None` [`Self::manifest`] then means "missing, invalid, or wrong schema", never
+    /// "not supplied", so the gate must not read/parse it again.
+    pub manifest_attempted: bool,
 }
 
 /// Returns the relative path of the first missing or invalid required bundle artifact in `bundle_dir`,
@@ -720,7 +848,7 @@ pub fn first_missing_bundle_artifact_with(
     if !bundle_dir.is_dir() {
         return Some("bundle directory".to_string());
     }
-    let local_meta = if sources.meta.is_none() {
+    let local_meta = if sources.meta.is_none() && !sources.meta_attempted {
         load_meta_file(bundle_dir)
     } else {
         None
@@ -798,7 +926,7 @@ pub fn first_missing_bundle_artifact_with(
         }
     }
 
-    let local_manifest = if sources.manifest.is_none() {
+    let local_manifest = if sources.manifest.is_none() && !sources.manifest_attempted {
         load_cache_manifest(bundle_dir)
     } else {
         None
@@ -1267,13 +1395,16 @@ pub fn stamp_check(
         max_file_bytes,
         blueprint_changed,
     };
-    let sink: std::sync::Mutex<Vec<StampThreadAcc>> = std::sync::Mutex::new(Vec::new());
+    let sink: Mutex<Vec<StampThreadAcc>> = Mutex::new(Vec::new());
     {
         let mut builder = StampVisitorBuilder {
             ctx: &ctx,
             sink: &sink,
         };
-        walker.build_parallel().visit(&mut builder);
+        walker
+            .threads(walk_parallel_threads())
+            .build_parallel()
+            .visit(&mut builder);
     }
     // A poisoned sink means a walker worker already panicked (which propagates out of `visit`);
     // recover the accumulated results anyway rather than reporting every file as deleted.
@@ -2538,6 +2669,7 @@ mod tests {
         let sources = BundleArtifactSources {
             meta: Some(&meta),
             manifest: Some(&manifest),
+            ..BundleArtifactSources::default()
         };
         assert!(bundle_artifacts_complete_with(&bundle_dir, sources));
 

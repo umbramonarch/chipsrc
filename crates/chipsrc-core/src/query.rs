@@ -198,11 +198,18 @@ pub fn workspace_status(workspace: &Path) -> Result<Vec<BundleStatusEntry>> {
         // drive the artifact-integrity gate, the cache-presence gate, and `repo_root` recovery.
         let meta_file_opt = load_meta_file(&bundle_dir);
         let manifest = load_cache_manifest_any_version(&bundle_dir);
+        // `meta_attempted`/`manifest_attempted` tell the gate that a `None` source means "missing
+        // or invalid", not "not supplied": a missing or invalid-JSON manifest is therefore read and
+        // parsed at most once per bundle. Only a schema-current manifest satisfies the gate.
         let missing_artifact = first_missing_bundle_artifact_with(
             &bundle_dir,
             BundleArtifactSources {
                 meta: meta_file_opt.as_ref(),
-                manifest: manifest.as_ref(),
+                manifest: manifest
+                    .as_ref()
+                    .filter(|m| m.schema_version == CACHE_SCHEMA_VERSION),
+                meta_attempted: true,
+                manifest_attempted: true,
             },
         );
         let has_valid_cache = manifest
@@ -2689,7 +2696,9 @@ fn strip_periph_instance_slice(tok: &str) -> &str {
         return &tok[..tok.len() - 1];
     }
     if tok.len() == 5
-        && tok[..4].eq_ignore_ascii_case("GPIO")
+        && tok
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GPIO"))
         && tok.as_bytes()[4].is_ascii_alphabetic()
     {
         return &tok[..4];
@@ -3352,6 +3361,110 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// SYNC-SCRUT-013: peripheral-instance trimming must be UTF-8 safe. `#define _abcé 1` trims the
+    /// leading underscore and feeds the five-byte `abcé` here; a byte slice at index 4 splits `é`.
+    #[test]
+    fn strip_periph_instance_slice_is_utf8_safe() {
+        for (input, expected) in [
+            ("GPIOA", "GPIO"),
+            ("gpioa", "gpio"),
+            ("GPIO", "GPIO"),
+            ("abcé", "abcé"),
+            ("_abcé", "_abcé"),
+            ("éééé", "éééé"),
+            ("TIM2", "TIM"),
+            ("USART1", "USART"),
+            ("ñandú", "ñandú"),
+        ] {
+            assert_eq!(
+                strip_periph_instance_slice(input),
+                expected,
+                "input={input:?}"
+            );
+        }
+        // The compatibility helper must not panic either.
+        assert!(periph_stems_compatible("abcé", "abcé"));
+        assert!(periph_stems_compatible("_abcé", "abcé"));
+    }
+
+    /// SYNC-SCRUT-007 (round 2): `workspace_status` must read/parse `cache/manifest.json` at most
+    /// once per bundle even when the file is missing, invalid JSON, or a foreign schema version.
+    #[test]
+    fn workspace_status_loads_failed_manifest_once() {
+        use crate::model::ConvertConfig;
+        use crate::scanner::manifest_load_probe;
+
+        let tmp = TestTempDir::new("status_manifest_failed_once");
+        let repo_dir = tmp.0.join("repo");
+        fs::create_dir_all(repo_dir.join("src")).expect("create src dir");
+        fs::write(
+            repo_dir.join("src/main.c"),
+            "int probe_value(int x) { return x + 1; }\n",
+        )
+        .expect("write source");
+        let bundle_dir = tmp.0.join("bundle");
+        let cfg = ConvertConfig::new(repo_dir, bundle_dir.clone());
+        crate::convert_repo(&cfg).expect("convert");
+        let manifest_path = bundle_dir.join("cache/manifest.json");
+        let saved_manifest = fs::read(&manifest_path).expect("read manifest");
+
+        // 1. Invalid JSON: the failed load must be memoized by `manifest_attempted`.
+        fs::write(&manifest_path, b"{\"files\": [").expect("write invalid manifest");
+        manifest_load_probe::start();
+        let invalid = workspace_status(&bundle_dir).expect("status invalid manifest");
+        let invalid_loads = manifest_load_probe::finish();
+        assert_eq!(
+            invalid_loads, 1,
+            "an invalid-JSON manifest must be parsed once, not once per gate"
+        );
+        assert!(!invalid[0].is_fresh);
+        assert!(
+            invalid[0]
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cache/manifest.json"),
+            "reason must name the manifest: {:?}",
+            invalid[0].reason
+        );
+
+        // 2. A foreign schema version: schema filtering must not trigger a second parse.
+        let foreign = serde_json::json!({
+            "schema_version": "9.9.9",
+            "repo_root": "D:/elsewhere",
+            "vendor_mode": "active",
+            "fingerprint": "0000000000000000",
+            "blueprint_hash": "",
+            "files": {"src/other.c": {"blake3_hash": "x", "shard": "cache/none.json"}}
+        });
+        fs::write(&manifest_path, serde_json::to_vec(&foreign).unwrap())
+            .expect("write foreign manifest");
+        manifest_load_probe::start();
+        let foreign_status = workspace_status(&bundle_dir).expect("status foreign manifest");
+        let foreign_loads = manifest_load_probe::finish();
+        assert_eq!(
+            foreign_loads, 1,
+            "a wrong-schema manifest must be parsed once, not once per gate"
+        );
+        assert!(!foreign_status[0].is_fresh);
+
+        // 3. A missing manifest file: the failed load is still attempted exactly once.
+        fs::remove_file(&manifest_path).expect("remove manifest");
+        manifest_load_probe::start();
+        let missing = workspace_status(&bundle_dir).expect("status missing manifest");
+        let missing_loads = manifest_load_probe::finish();
+        assert_eq!(missing_loads, 1, "a missing manifest must be probed once");
+        assert!(!missing[0].is_fresh);
+
+        // 4. Control: a valid manifest is parsed once as well.
+        fs::write(&manifest_path, &saved_manifest).expect("restore manifest");
+        manifest_load_probe::start();
+        let valid = workspace_status(&bundle_dir).expect("status valid manifest");
+        let valid_loads = manifest_load_probe::finish();
+        assert_eq!(valid_loads, 1, "a valid manifest must be parsed once");
+        assert!(valid[0].is_fresh, "restored bundle: {:?}", valid[0].reason);
     }
 
     #[test]
