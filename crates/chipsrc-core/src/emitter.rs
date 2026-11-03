@@ -14,6 +14,8 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Advisory lock staleness threshold (`10 s`). Locks older than this are reclaimed automatically.
@@ -25,24 +27,139 @@ pub const LOCK_WAIT_AUTO_SYNC: Duration = Duration::from_millis(150);
 /// Maximum lock wait budget for explicit CLI commands (`convert`, `ensure`).
 pub const LOCK_WAIT_EXPLICIT: Duration = Duration::from_secs(5);
 
+/// Interval at which a held lock refreshes its `<out>/cache/.lock` mtime/payload so conversions
+/// longer than [`LOCK_STALE_AFTER`] are never mistaken for crashed writers.
+pub const LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Poll interval while waiting for a contended (or undeletable stale) lock.
+pub const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(15);
+
 /// Stale temporary file threshold (`60 s`). Pruners delete `*.tmp` files older than this.
 const STALE_TMP_MAX_AGE: Duration = Duration::from_secs(60);
 
 static NEXT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+static NEXT_LOCK_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Advisory exclusive bundle lock on `<out>/cache/.lock`. Removes the lock file on `Drop`.
+/// Signals the lock heartbeat thread to stop (the boolean) and wakes it immediately (`Condvar`).
+type LockHeartbeatSignal = Arc<(Mutex<bool>, Condvar)>;
+
+/// Builds the unique owner payload written into `<out>/cache/.lock`: `<pid>:<unix_ms>:<seq>`.
+fn new_lock_owner_token() -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = NEXT_LOCK_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{}:{now_ms}:{seq}\n", std::process::id())
+}
+
+/// Returns `true` when `err` means the lock file already exists / is held by another process.
+fn is_lock_contention_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::AlreadyExists
+        || err.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(err.raw_os_error(), Some(5 | 32 | 80 | 183))
+}
+
+/// Returns `true` when the lock file at `lock_path` is stale.
+///
+/// A lock is stale **only** when its file `modified()` mtime is older than
+/// [`LOCK_STALE_AFTER`]. The payload timestamp is informational: a live writer refreshes the mtime
+/// and payload from its heartbeat thread every [`LOCK_HEARTBEAT_INTERVAL`], so a long conversion
+/// keeps a fresh mtime and is never evicted. A lock with a fresh mtime is treated as live even
+/// when its payload timestamp is older (e.g. an external writer that only touches the file), and a
+/// live owner PID with a fresh mtime is likewise never evicted.
+fn is_lock_stale(lock_path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(lock_path) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    let Ok(age) = SystemTime::now().duration_since(modified) else {
+        return false;
+    };
+    age > LOCK_STALE_AFTER
+}
+
+/// Rewrites `lock_path` with this lock's owner token when (and only when) the file still carries
+/// that token. Returns `false` when another owner has replaced the lock (which stops the
+/// heartbeat); a transient write failure keeps the heartbeat alive and is retried on the next tick.
+fn refresh_lock_file(lock_path: &Path, owner_token: &str) -> bool {
+    match fs::read(lock_path) {
+        Ok(contents) if contents == owner_token.as_bytes() => {
+            let _ = fs::write(lock_path, owner_token.as_bytes());
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Signals `stop` and refreshes the lock file until the thread is told to stop.
+fn spawn_lock_heartbeat(
+    lock_path: PathBuf,
+    owner_token: String,
+    interval: Duration,
+) -> (LockHeartbeatSignal, Option<JoinHandle<()>>) {
+    let signal = Arc::new((Mutex::new(false), Condvar::new()));
+    let thread_signal = Arc::clone(&signal);
+    let handle = std::thread::Builder::new()
+        .name("chipsrc-bundle-lock-heartbeat".to_string())
+        .spawn(move || {
+            let (mutex, cvar) = &*thread_signal;
+            let mut stop = match mutex.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            loop {
+                // Check before waiting too: `Drop` may signal while a refresh is in flight, and
+                // the thread must not sleep a full interval after the owner has already left.
+                if *stop {
+                    break;
+                }
+                let (guard, _) = match cvar.wait_timeout(stop, interval) {
+                    Ok(pair) => pair,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                stop = guard;
+                if *stop {
+                    break;
+                }
+                drop(stop);
+                if !refresh_lock_file(&lock_path, &owner_token) {
+                    break;
+                }
+                stop = match mutex.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+            }
+        })
+        .ok();
+    (signal, handle)
+}
+
+/// Advisory exclusive bundle lock on `<out>/cache/.lock`.
+///
+/// Writes a unique `<pid>:<unix_ms>:<seq>` owner token and keeps the file's mtime fresh with a
+/// lightweight heartbeat thread while held. `Drop` stops the heartbeat and removes the lock only
+/// when its contents still match this lock's owner token (never deleting a replacement lock).
 #[derive(Debug)]
 pub struct BundleLock {
     path: PathBuf,
+    owner_token: String,
+    stop_heartbeat: LockHeartbeatSignal,
+    heartbeat: Option<JoinHandle<()>>,
 }
 
 impl BundleLock {
     /// Attempts to acquire an exclusive advisory lock at `<out_dir>/cache/.lock`, waiting up to
     /// `wait` if another live process holds the lock.
     ///
-    /// - Writes `<pid>:<unix_ms>\n` using `File::options().write(true).create_new(true)`.
-    /// - Reclaims stale locks (`> 10 s` old by mtime or timestamp) immediately.
+    /// - Writes `<pid>:<unix_ms>:<seq>\n` using `File::options().write(true).create_new(true)`.
+    /// - Reclaims stale locks (mtime `> 10 s` old) immediately.
     /// - Tolerates arbitrary/garbage lock contents by falling back to file mtime.
+    /// - Polls at most every [`LOCK_POLL_INTERVAL`] and always honors the `wait` deadline, even when
+    ///   a stale lock cannot be deleted (e.g. a Windows `ERROR_SHARING_VIOLATION`).
     /// - Returns `Ok(None)` if the lock is still held after `wait`.
     pub fn acquire(out_dir: &Path, wait: Duration) -> Result<Option<Self>> {
         let cache_dir = out_dir.join("cache");
@@ -57,58 +174,33 @@ impl BundleLock {
                 .open(&lock_path)
             {
                 Ok(mut file) => {
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0);
-                    let payload = format!("{}:{now_ms}\n", std::process::id());
-                    let _ = std::io::Write::write_all(&mut file, payload.as_bytes());
-                    return Ok(Some(Self { path: lock_path }));
+                    let owner_token = new_lock_owner_token();
+                    let _ = std::io::Write::write_all(&mut file, owner_token.as_bytes());
+                    drop(file);
+                    let (stop_heartbeat, heartbeat) = spawn_lock_heartbeat(
+                        lock_path.clone(),
+                        owner_token.clone(),
+                        LOCK_HEARTBEAT_INTERVAL,
+                    );
+                    return Ok(Some(Self {
+                        path: lock_path,
+                        owner_token,
+                        stop_heartbeat,
+                        heartbeat,
+                    }));
                 }
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::AlreadyExists
-                        || err.kind() == std::io::ErrorKind::PermissionDenied
-                        || matches!(err.raw_os_error(), Some(5 | 32 | 80 | 183)) =>
-                {
-                    let stale = fs::metadata(&lock_path).is_ok_and(|meta| {
-                        let old_mtime = meta.modified().is_ok_and(|modified| {
-                            SystemTime::now()
-                                .duration_since(modified)
-                                .is_ok_and(|age| age > LOCK_STALE_AFTER)
-                        });
-                        if old_mtime {
-                            return true;
-                        }
-                        if meta.len() <= 128 {
-                            if let Ok(bytes) = fs::read(&lock_path) {
-                                if let Ok(text) = std::str::from_utf8(&bytes) {
-                                    if let Some((_, ts_str)) = text.trim().split_once(':') {
-                                        if let Ok(lock_ms) = ts_str.trim().parse::<u128>() {
-                                            if lock_ms >= 1_000_000_000_000 {
-                                                let now_ms = SystemTime::now()
-                                                    .duration_since(UNIX_EPOCH)
-                                                    .map(|d| d.as_millis())
-                                                    .unwrap_or(0);
-                                                return now_ms.saturating_sub(lock_ms)
-                                                    > LOCK_STALE_AFTER.as_millis();
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        false
-                    });
-                    if stale {
-                        let _ = fs::remove_file(&lock_path);
+                Err(err) if is_lock_contention_error(&err) => {
+                    if is_lock_stale(&lock_path) && fs::remove_file(&lock_path).is_ok() {
                         continue;
                     }
+                    // The lock is live, or a stale lock could not be removed (sharing violation).
+                    // Either way the wait budget is authoritative: never spin past the deadline.
                     let elapsed = start.elapsed();
                     if elapsed >= wait {
                         return Ok(None);
                     }
                     let remaining = wait.saturating_sub(elapsed);
-                    std::thread::sleep(remaining.min(Duration::from_millis(15)));
+                    std::thread::sleep(LOCK_POLL_INTERVAL.min(remaining));
                 }
                 Err(err) => return Err(ChipsrcError::io(&lock_path, err)),
             }
@@ -123,6 +215,23 @@ pub fn acquire_bundle_lock(out_dir: &Path, wait: Duration) -> Result<Option<Bund
 
 impl Drop for BundleLock {
     fn drop(&mut self) {
+        if let Some(handle) = self.heartbeat.take() {
+            {
+                let (mutex, cvar) = &*self.stop_heartbeat;
+                let mut stop = match mutex.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *stop = true;
+                cvar.notify_all();
+            }
+            let _ = handle.join();
+        }
+        let owns_lock =
+            fs::read(&self.path).is_ok_and(|contents| contents == self.owner_token.as_bytes());
+        if !owns_lock {
+            return;
+        }
         for attempt in 0..4 {
             if fs::remove_file(&self.path).is_ok() || !self.path.exists() {
                 return;
@@ -351,7 +460,7 @@ where
         Err(source) => return Err(ChipsrcError::io(&tmp_path, source)),
     };
     let mut hashing = hashing;
-    {
+    let rendered = {
         let mut sink = RowSink {
             target: RowTarget::File {
                 out: &mut hashing,
@@ -360,7 +469,14 @@ where
             buf: String::with_capacity(STREAM_ROW_BUFFER_BYTES + 4096),
             path,
         };
-        build(&mut sink).and_then(|()| sink.finish())?;
+        build(&mut sink).and_then(|()| sink.finish())
+    };
+    if let Err(err) = rendered {
+        // Close the writer (dropping its `BufWriter`) before unlinking the staging file so a
+        // Windows sharing violation cannot leave a truncated `*.tmp` behind.
+        drop(hashing);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
     }
     let HashingWriter {
         hasher,
@@ -373,8 +489,13 @@ where
             return Ok(());
         }
     }
-    // Flush explicitly instead of `into_inner()` so a flush failure reports the target path.
-    inner.flush().map_err(|e| ChipsrcError::io(path, e))?;
+    // Flush explicitly instead of `into_inner()` so a flush failure reports the target path and
+    // removes the staging file before returning.
+    if let Err(source) = inner.flush() {
+        drop(inner);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(ChipsrcError::io(path, source));
+    }
     drop(inner);
     rename_with_retry(&tmp_path, path)
 }
@@ -647,11 +768,15 @@ pub fn emit_bundle(
     create_dir(output_dir)?;
     create_dir(&sections_dir)?;
     create_dir(&index_dir)?;
+    // Always sweep the (small) `index/` directory first: a failed previous streamed table can
+    // leave `index/.*.tmp` even when `sections/` is absent. `cache/` is pruned by
+    // `CacheDirState::scan`.
+    prune_stale_tmp_files_in_dir(&index_dir);
 
     let mut existing_md: FxHashSet<String> = FxHashSet::default();
     if !fresh_bundle {
         // Clean stale .md files in output_dir/sections/ that are no longer part of `sections`,
-        // and prune any stale *.tmp files (>60s) across bundle directories.
+        // and prune any stale *.tmp files (>60s) in the bundle root.
         prune_stale_tmp_files_in_dir(output_dir);
         let expected_md: FxHashSet<&str> = sections
             .iter()
@@ -1516,6 +1641,21 @@ pub fn prepare_cache_shard(unit: &ParsedFileUnit) -> Option<CacheShardPacket> {
     })
 }
 
+/// Controls whether [`CacheShardWriter`] may reuse shards listed by the previous
+/// `cache/manifest.json`.
+///
+/// A full (`--force`) rebuild never reuses a previous shard, and a clean shard that failed to
+/// deserialize and had to be reparsed must be rewritten instead of being trusted by hash alone
+/// (SYNC-SCRUT-009).
+#[derive(Debug, Clone, Default)]
+pub struct CacheShardWritePolicy {
+    /// When `false`, every shard is re-serialized from its parsed unit.
+    pub reuse_previous: bool,
+    /// Repository-relative paths that must be re-serialized even when a previous manifest entry
+    /// matches their content hash and shard path.
+    pub rewrite: FxHashSet<String>,
+}
+
 /// Streaming per-file AST cache writer for one bundle.
 ///
 /// Construct once per convert (it lists `cache/` and parses the previous `cache/manifest.json`
@@ -1525,6 +1665,7 @@ pub fn prepare_cache_shard(unit: &ParsedFileUnit) -> Option<CacheShardPacket> {
 pub struct CacheShardWriter {
     cache_dir: PathBuf,
     state: CacheDirState,
+    policy: CacheShardWritePolicy,
     written: usize,
     reused: usize,
     bytes: usize,
@@ -1532,15 +1673,33 @@ pub struct CacheShardWriter {
 }
 
 impl CacheShardWriter {
-    /// Opens the bundle's `cache/` directory for streaming writes.
-    ///
-    /// Shards whose content hash and shard path already match the previous `cache/manifest.json`
-    /// are reused in place, so a rebuild of an unchanged tree rewrites no cache files at all.
+    /// Opens the bundle's `cache/` directory for streaming writes, reusing shards whose content
+    /// hash and shard path already match the previous `cache/manifest.json`.
     pub fn new(
         output_dir: &Path,
         schema_version: &str,
         blueprint_hash: &str,
         vendor_mode: VendorMode,
+    ) -> Result<Self> {
+        Self::new_with_policy(
+            output_dir,
+            schema_version,
+            blueprint_hash,
+            vendor_mode,
+            &CacheShardWritePolicy {
+                reuse_previous: true,
+                rewrite: FxHashSet::default(),
+            },
+        )
+    }
+
+    /// Opens the bundle's `cache/` directory with an explicit shard-reuse policy.
+    pub fn new_with_policy(
+        output_dir: &Path,
+        schema_version: &str,
+        blueprint_hash: &str,
+        vendor_mode: VendorMode,
+        policy: &CacheShardWritePolicy,
     ) -> Result<Self> {
         let cache_dir = output_dir.join("cache");
         create_dir(&cache_dir)?;
@@ -1556,6 +1715,7 @@ impl CacheShardWriter {
         Ok(Self {
             cache_dir,
             state,
+            policy: policy.clone(),
             written: 0,
             reused: 0,
             bytes: 0,
@@ -1569,6 +1729,9 @@ impl CacheShardWriter {
     /// This is checked before any JSON serialization or structural-digest hashing, so an
     /// incremental sync over 122 unchanged files does no per-unit CPU work at all.
     fn reusable_digest(&self, rel_path: &str, hash: &str, expected_shard: &str) -> Option<String> {
+        if !self.policy.reuse_previous || self.policy.rewrite.contains(rel_path) {
+            return None;
+        }
         let prev = self.state.prev_manifest.as_ref()?.files.get(rel_path)?;
         if prev.blake3_hash == hash
             && prev.shard == expected_shard
@@ -1720,8 +1883,40 @@ pub fn write_cache_shards_for_units(
     blueprint_hash: &str,
     vendor_mode: VendorMode,
 ) -> Result<PrewrittenCache> {
-    let mut writer =
-        CacheShardWriter::new(output_dir, schema_version, blueprint_hash, vendor_mode)?;
+    write_cache_shards_for_units_with_policy(
+        output_dir,
+        units,
+        schema_version,
+        blueprint_hash,
+        vendor_mode,
+        &CacheShardWritePolicy {
+            reuse_previous: true,
+            rewrite: FxHashSet::default(),
+        },
+    )
+}
+
+/// Same as [`write_cache_shards_for_units`] with an explicit shard-reuse policy.
+///
+/// A full/`--force` rebuild passes `reuse_previous = false`; an incremental sync whose clean
+/// shards all loaded intact passes `reuse_previous = true` with an empty `rewrite` set, and a sync
+/// that had to reparse a clean shard lists that path in `rewrite` so the unreadable file is
+/// replaced instead of being trusted by its manifest hash.
+pub fn write_cache_shards_for_units_with_policy(
+    output_dir: &Path,
+    units: &[ParsedFileUnit],
+    schema_version: &str,
+    blueprint_hash: &str,
+    vendor_mode: VendorMode,
+    policy: &CacheShardWritePolicy,
+) -> Result<PrewrittenCache> {
+    let mut writer = CacheShardWriter::new_with_policy(
+        output_dir,
+        schema_version,
+        blueprint_hash,
+        vendor_mode,
+        policy,
+    )?;
     let mut available: FxHashMap<String, PrewrittenShard> =
         FxHashMap::with_capacity_and_hasher(units.len(), Default::default());
     if units.len() > crate::model::CACHE_PACK_FILE_THRESHOLD {
@@ -3806,5 +4001,253 @@ mod tests {
             .expect("Stale garbage lock must be reclaimed by mtime");
         drop(lock3);
         assert!(!lock_path.exists());
+    }
+
+    /// SYNC-SCRUT-001: a held lock refreshes its mtime from a heartbeat thread, so a conversion
+    /// longer than `LOCK_STALE_AFTER` is never mistaken for a crashed writer.
+    #[test]
+    fn bundle_lock_heartbeat_keeps_long_held_lock_fresh() {
+        let tmp = TestTempDir::new("bundle_lock_heartbeat");
+        let out_dir = tmp.0.join("bundle");
+        let lock_path = out_dir.join("cache").join(".lock");
+        let lock = BundleLock::acquire(&out_dir, Duration::from_millis(100))
+            .expect("acquire")
+            .expect("lock should be acquired");
+
+        // Backdate the lock past the stale threshold; only the heartbeat can make it fresh again.
+        fs::File::options()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(SystemTime::now() - LOCK_STALE_AFTER - Duration::from_secs(20))
+            .unwrap();
+        assert!(is_lock_stale(&lock_path), "backdated lock must look stale");
+
+        std::thread::sleep(LOCK_HEARTBEAT_INTERVAL + Duration::from_millis(800));
+        assert!(
+            !is_lock_stale(&lock_path),
+            "heartbeat must refresh the lock mtime while it is held"
+        );
+        let payload = fs::read_to_string(&lock_path).expect("read lock payload");
+        assert!(
+            payload.trim().split(':').count() == 3,
+            "lock payload must be <pid>:<unix_ms>:<seq>, got {payload:?}"
+        );
+
+        drop(lock);
+        assert!(!lock_path.exists(), "Drop must remove the lock");
+    }
+
+    /// SYNC-SCRUT-001: a lock with an ancient payload timestamp but a fresh mtime (e.g. an
+    /// external writer that only touches the file) must be treated as live.
+    #[test]
+    fn bundle_lock_fresh_mtime_with_old_payload_is_not_stolen() {
+        let tmp = TestTempDir::new("bundle_lock_old_payload");
+        let out_dir = tmp.0.join("bundle");
+        let lock_path = out_dir.join("cache").join(".lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let stale_ms = 1_600_000_000_000u128;
+        let payload = format!("{}:{stale_ms}:0\n", std::process::id());
+        fs::write(&lock_path, &payload).expect("write live lock");
+
+        let acquired = BundleLock::acquire(&out_dir, Duration::from_millis(80))
+            .expect("acquire on fresh-mtime lock");
+        assert!(
+            acquired.is_none(),
+            "a lock with a fresh mtime must never be stolen, even with an old payload timestamp"
+        );
+        assert_eq!(
+            fs::read_to_string(&lock_path).unwrap(),
+            payload,
+            "the live lock contents must be left untouched"
+        );
+        let _ = fs::remove_file(&lock_path);
+    }
+
+    /// SYNC-SCRUT-001: `Drop` never deletes a replacement lock owned by someone else.
+    #[test]
+    fn bundle_lock_drop_only_removes_its_own_token() {
+        let tmp = TestTempDir::new("bundle_lock_token");
+        let out_dir = tmp.0.join("bundle");
+        let lock_path = out_dir.join("cache").join(".lock");
+        let lock = BundleLock::acquire(&out_dir, Duration::from_millis(100))
+            .expect("acquire")
+            .expect("lock should be acquired");
+        let replacement = "424242:1700000000000:7\n";
+        fs::write(&lock_path, replacement).expect("replace lock");
+
+        drop(lock);
+        assert!(lock_path.is_file(), "a replacement lock must survive Drop");
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), replacement);
+        let _ = fs::remove_file(&lock_path);
+    }
+
+    /// SYNC-SCRUT-002: an undeletable stale lock cannot make `acquire` spin past its deadline.
+    #[cfg(windows)]
+    #[test]
+    fn bundle_lock_undeletable_stale_lock_honors_wait_deadline() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+
+        let tmp = TestTempDir::new("bundle_lock_undeletable");
+        let out_dir = tmp.0.join("bundle");
+        let lock_path = out_dir.join("cache").join(".lock");
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        fs::write(&lock_path, "999999:1000:0\n").expect("write stale lock");
+        fs::File::options()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        // Hold the file without FILE_SHARE_DELETE: `remove_file` fails with a sharing violation
+        // while `metadata` (read attributes) still succeeds.
+        let _guard = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&lock_path)
+            .expect("open lock without delete sharing");
+
+        let started = Instant::now();
+        let acquired = BundleLock::acquire(&out_dir, Duration::from_millis(300))
+            .expect("acquire with undeletable stale lock");
+        let elapsed = started.elapsed();
+        assert!(
+            acquired.is_none(),
+            "an undeletable stale lock must not be acquired"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(3),
+            "acquire must honor its wait deadline instead of spinning (elapsed {elapsed:?})"
+        );
+        assert!(lock_path.is_file(), "the undeletable lock must remain");
+        drop(_guard);
+        let _ = fs::remove_file(&lock_path);
+    }
+
+    /// SYNC-SCRUT-003: a failing streamed render unlinks its staging `.tmp` file.
+    #[test]
+    fn write_streamed_file_removes_tmp_when_render_fails() {
+        let tmp = TestTempDir::new("stream_fail_cleanup");
+        let index_dir = tmp.0.join("index");
+        fs::create_dir_all(&index_dir).unwrap();
+        let path = index_dir.join("xref.tsv");
+        let chunk = "x".repeat(1 << 20);
+
+        let result = write_streamed_file(&path, |sink| -> Result<()> {
+            sink.rows().push_str(&chunk);
+            sink.flush_if_full()?;
+            sink.rows().push_str("row after flush\n");
+            Err(ChipsrcError::io(
+                &path,
+                std::io::Error::other("streamed render failed"),
+            ))
+        });
+        assert!(result.is_err(), "the render error must be returned");
+        assert!(!path.exists(), "no target file may be created on error");
+        let tmp_files: Vec<String> = fs::read_dir(&index_dir)
+            .expect("read index dir")
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            tmp_files.is_empty(),
+            "a failing streamed render must unlink its .tmp file, found {tmp_files:?}"
+        );
+    }
+
+    /// SYNC-SCRUT-009: a schema-2.1.0 shard written before the compact rename (long field names)
+    /// must deserialize through the serde aliases.
+    #[test]
+    fn legacy_long_field_name_shard_deserializes_and_restores_paths() {
+        let tmp = TestTempDir::new("legacy_shard");
+        let out_dir = tmp.0.join("bundle");
+        let cache_dir = out_dir.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let legacy = r#"{"scanned":{"rel_path":"alpha.py","abs_path":"alpha.py","language":"python","scope":"first_party","arch_layer":"other","size_bytes":64,"mtime_secs":1793717751,"mtime_nanos":248154200,"blake3_hash":"a75f9cdc468a7d5f","line_count":8},"symbols":[{"name":"alpha","qualified_name":"A::alpha","kind":"method","visibility":"public","start_line":1,"end_line":2,"signature":"def alpha(self)","doc_summary":"doc","enclosing_type":"A","scope":"first_party","arch_layer":"other","section_id":"root","file":"alpha.py","symbol_id":"alpha.py::A::alpha"}],"types":[{"type_id":"alpha.py::Cfg","name":"Cfg","kind":"struct","visibility":"public","start_line":3,"end_line":4,"fields_summary":"a: int","doc_summary":"","scope":"first_party","arch_layer":"other","section_id":"root","file":"alpha.py"}],"macros":[{"name":"LIMIT","kind":"constant","value_or_args":"10","hex_addr":null,"file":"alpha.py","line":5,"scope":"first_party","arch_layer":"other","section_id":"root","description":"limit"}],"imports":[{"file":"alpha.py","line":1,"raw_path":"typing","imported_names":["Optional"],"is_system":true}],"raw_calls":[{"caller_file":"alpha.py","caller_name":"alpha","caller_start_line":1,"callee_name":"helper","receiver_or_qualifier":null,"call_line":2}],"raw_xrefs":[{"file":"alpha.py","line":6,"enclosing_symbol":"alpha","target_name":"Cfg","category":"type_ref","context":"x: Cfg = None"}],"parse_errors":0}"#;
+        fs::write(cache_dir.join("legacy.json"), legacy).expect("write legacy shard");
+
+        let units = crate::scanner::load_cache_shard_units(&out_dir, "cache/legacy.json")
+            .expect("legacy shard must deserialize");
+        assert_eq!(units.len(), 1);
+        let unit = &units[0];
+        assert_eq!(unit.symbols[0].qualified_name, "A::alpha");
+        assert_eq!(unit.symbols[0].enclosing_type.as_deref(), Some("A"));
+        assert_eq!(unit.symbols[0].file, "alpha.py");
+        assert_eq!(unit.symbols[0].symbol_id, "alpha.py::A::alpha");
+        assert_eq!(unit.types[0].fields_summary, "a: int");
+        assert_eq!(unit.macros[0].value_or_args, "10");
+        assert_eq!(unit.imports[0].imported_names, vec!["Optional".to_string()]);
+        assert_eq!(unit.raw_calls[0].caller_start_line, 1);
+        assert_eq!(unit.raw_calls[0].callee_name, "helper");
+        assert_eq!(unit.raw_xrefs[0].target_name, "Cfg");
+        assert_eq!(unit.raw_xrefs[0].context, "x: Cfg = None");
+    }
+
+    /// SYNC-SCRUT-009: a clean shard listed in the previous manifest is not reused when the
+    /// caller reports that it failed to deserialize and had to be reparsed.
+    #[test]
+    fn cache_writer_rewrites_shards_excluded_by_policy() {
+        let tmp = TestTempDir::new("shard_policy");
+        let out_dir = tmp.0.join("bundle");
+        let unit = cache_unit("src/a.py", "hash-a", "alpha");
+        let first = write_cache_shards_for_units(
+            &out_dir,
+            std::slice::from_ref(&unit),
+            CACHE_SCHEMA_VERSION,
+            "",
+            VendorMode::Active,
+        )
+        .expect("initial shard write");
+        let shard_name = first
+            .shards()
+            .get("src/a.py")
+            .expect("shard identity")
+            .shard_name
+            .clone();
+        let shard_path = out_dir.join("cache").join(&shard_name);
+        fs::write(&shard_path, b"{not valid json").expect("corrupt shard");
+
+        // Default policy would trust the manifest hash and keep the unreadable file.
+        let mut rewrite = FxHashSet::default();
+        rewrite.insert("src/a.py".to_string());
+        write_cache_shards_for_units_with_policy(
+            &out_dir,
+            std::slice::from_ref(&unit),
+            CACHE_SCHEMA_VERSION,
+            "",
+            VendorMode::Active,
+            &CacheShardWritePolicy {
+                reuse_previous: true,
+                rewrite,
+            },
+        )
+        .expect("policy rewrite");
+        let loaded =
+            crate::scanner::load_cache_shard_units(&out_dir, &format!("cache/{shard_name}"))
+                .expect("shard must be readable after the policy rewrite");
+        assert_eq!(loaded[0].symbols[0].name, "alpha");
+
+        // `reuse_previous = false` (a `--force` rebuild) rewrites every shard as well.
+        fs::write(&shard_path, b"{not valid json").expect("corrupt shard again");
+        let policy = CacheShardWritePolicy {
+            reuse_previous: false,
+            ..Default::default()
+        };
+        write_cache_shards_for_units_with_policy(
+            &out_dir,
+            std::slice::from_ref(&unit),
+            CACHE_SCHEMA_VERSION,
+            "",
+            VendorMode::Active,
+            &policy,
+        )
+        .expect("force-policy rewrite");
+        let loaded =
+            crate::scanner::load_cache_shard_units(&out_dir, &format!("cache/{shard_name}"))
+                .expect("shard must be readable after a force-policy rewrite");
+        assert_eq!(loaded[0].symbols[0].name, "alpha");
     }
 }

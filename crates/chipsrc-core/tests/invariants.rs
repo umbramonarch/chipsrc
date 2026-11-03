@@ -2096,3 +2096,314 @@ fn test_coordinate_shift_with_vendor_surface_compaction_matches_force() {
     let _ = convert_repo(&force_cfg).unwrap();
     assert_eq!(incremental_hashes, artifact_sha_map(&out));
 }
+
+// ============================================================================
+// Sync-performance scrutiny regressions (SYNC-SCRUT-003..009)
+// ============================================================================
+
+/// SYNC-SCRUT-004: moving `helper()` from `impl A::run` to `impl B::run` keeps the structural
+/// digest (same short caller name) but changes the linked caller id. Tier 3 must fall back so
+/// `index/calls.tsv` matches a `--force` relink.
+#[test]
+fn test_coordinate_shift_moved_call_between_impls_matches_force() {
+    let tmp = TestTempDir::new("scrut_moved_call");
+    let repo = tmp.path().join("repo");
+    let out = tmp.path().join("bundle");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    let file = repo.join("src/method.rs");
+    let before = "struct A;\n\nstruct B;\n\nimpl A {\n    fn run(&self) {\n        helper();\n    }\n}\n\nimpl B {\n    fn run(&self) {\n    }\n}\n\nfn helper() -> u32 {\n    1\n}\n\nfn main() {\n    A.run();\n    B.run();\n}\n";
+    let after = "struct A;\n\nstruct B;\n\nimpl A {\n    fn run(&self) {\n    }\n}\n\nimpl B {\n    fn run(&self) {\n        helper();\n    }\n}\n\nfn helper() -> u32 {\n    1\n}\n\nfn main() {\n    A.run();\n    B.run();\n}\n";
+    fs::write(&file, before).unwrap();
+
+    let cfg = ConvertConfig::new(repo.clone(), out.clone());
+    let cold = convert_repo(&cfg).unwrap();
+    assert_eq!(cold.metadata.incremental_tier, "structural");
+    assert!(cold
+        .indexes
+        .symbols
+        .iter()
+        .any(|rs| rs.symbol.qualified_name == "A::run"));
+    assert!(cold
+        .indexes
+        .symbols
+        .iter()
+        .any(|rs| rs.symbol.qualified_name == "B::run"));
+
+    fs::write(&file, after).unwrap();
+    bump_file_mtime(&file);
+
+    let inc = convert_repo(&cfg).unwrap();
+    assert_eq!(
+        inc.metadata.incremental_tier, "structural",
+        "a call moved between impls must reject Tier 3"
+    );
+    let calls = fs::read_to_string(out.join("index/calls.tsv")).unwrap();
+    let helper_row = calls
+        .lines()
+        .find(|line| line.contains("\thelper\t"))
+        .unwrap_or_else(|| panic!("missing helper call row in:\n{calls}"));
+    assert!(
+        helper_row.starts_with("src/method.rs::B::run\t"),
+        "stale call owner after the move: {helper_row}"
+    );
+
+    let inc_hashes = artifact_sha_map(&out);
+    let mut force_cfg = cfg.clone();
+    force_cfg.force = true;
+    let _ = convert_repo(&force_cfg).unwrap();
+    assert_eq!(
+        inc_hashes,
+        artifact_sha_map(&out),
+        "moved-call output must be byte-identical to --force"
+    );
+}
+
+/// SYNC-SCRUT-005: an inline-comment change on a non-macro raw xref must refresh
+/// `index/xref.tsv` (Tier 3) and match `--force`.
+#[test]
+fn test_coordinate_shift_refreshes_inline_xref_comment_and_matches_force() {
+    let tmp = TestTempDir::new("scrut_xref_comment");
+    let repo = tmp.path().join("repo");
+    let out = tmp.path().join("bundle");
+    fs::create_dir_all(&repo).unwrap();
+    let app = repo.join("app.py");
+    let before = "class Device:\n    name: str = \"\"\n\n\ndef describe(device: Device) -> str:\n    result: str = device.name  # old inline comment\n    return result\n";
+    let after = "class Device:\n    name: str = \"\"\n\n\ndef describe(device: Device) -> str:\n    result: str = device.name  # revised inline comment\n    return result\n";
+    fs::write(&app, before).unwrap();
+
+    let cfg = ConvertConfig::new(repo.clone(), out.clone());
+    let cold = convert_repo(&cfg).unwrap();
+    assert!(cold
+        .indexes
+        .xrefs
+        .iter()
+        .any(|x| x.context.contains("old inline")));
+
+    fs::write(&app, after).unwrap();
+    bump_file_mtime(&app);
+
+    let inc = convert_repo(&cfg).unwrap();
+    assert_eq!(
+        inc.metadata.incremental_tier, "coordinate_shift",
+        "a context-only xref change must stay on Tier 3"
+    );
+    assert_eq!(inc.metadata.link_ms, 0);
+    assert_eq!(inc.metadata.graph_ms, 0);
+    let xrefs = fs::read_to_string(out.join("index/xref.tsv")).unwrap();
+    assert!(
+        xrefs.contains("# revised inline comment"),
+        "stale xref context:\n{xrefs}"
+    );
+    assert!(!xrefs.contains("# old inline comment"));
+
+    let inc_hashes = artifact_sha_map(&out);
+    let mut force_cfg = cfg.clone();
+    force_cfg.force = true;
+    let _ = convert_repo(&force_cfg).unwrap();
+    assert_eq!(
+        inc_hashes,
+        artifact_sha_map(&out),
+        "xref-context refresh must be byte-identical to --force"
+    );
+}
+
+/// SYNC-SCRUT-006: two macros with the same name in one file must keep distinct `macro_def`
+/// contexts through a coordinate shift.
+#[test]
+fn test_coordinate_shift_duplicate_macro_names_match_force() {
+    let tmp = TestTempDir::new("scrut_dup_macros");
+    let repo = tmp.path().join("repo");
+    let out = tmp.path().join("bundle");
+    fs::create_dir_all(&repo).unwrap();
+    let file = repo.join("dup.rs");
+    let body = "const LIMIT: u32 = 10;\n\nfn first() -> u32 {\n    LIMIT\n}\n\nconst LIMIT: u32 = 20;\n\nfn second() -> u32 {\n    LIMIT\n}\n";
+    fs::write(&file, body).unwrap();
+
+    let cfg = ConvertConfig::new(repo.clone(), out.clone());
+    let cold = convert_repo(&cfg).unwrap();
+    assert_eq!(cold.metadata.macro_count, 2);
+
+    fs::write(&file, format!("# shift pad\n{body}")).unwrap();
+    bump_file_mtime(&file);
+
+    let inc = convert_repo(&cfg).unwrap();
+    assert_eq!(inc.metadata.incremental_tier, "coordinate_shift");
+    let xrefs = fs::read_to_string(out.join("index/xref.tsv")).unwrap();
+    let limit_rows: Vec<&str> = xrefs
+        .lines()
+        .filter(|line| line.starts_with("LIMIT\tmacro_def\t"))
+        .collect();
+    assert_eq!(limit_rows.len(), 2, "two macro_def rows expected:\n{xrefs}");
+    assert_eq!(
+        limit_rows[0],
+        "LIMIT\tmacro_def\tconst\t10\tdup.rs\t2\t01-root\t10 (Rust const/static item)",
+        "the first duplicate macro kept the wrong context:\n{xrefs}"
+    );
+    assert_eq!(
+        limit_rows[1],
+        "LIMIT\tmacro_def\tconst\t20\tdup.rs\t8\t01-root\t20 (Rust const/static item)",
+        "the second duplicate macro kept the wrong context:\n{xrefs}"
+    );
+
+    let inc_hashes = artifact_sha_map(&out);
+    let mut force_cfg = cfg.clone();
+    force_cfg.force = true;
+    let _ = convert_repo(&force_cfg).unwrap();
+    assert_eq!(
+        inc_hashes,
+        artifact_sha_map(&out),
+        "duplicate-macro output must be byte-identical to --force"
+    );
+}
+
+/// SYNC-SCRUT-003: `emit_bundle` prunes stale `index/*.tmp` staging files.
+#[test]
+fn test_convert_prunes_stale_index_tmp_files() {
+    let tmp = TestTempDir::new("scrut_index_tmp");
+    let repo = tmp.path().join("repo");
+    let out = tmp.path().join("bundle");
+    fs::create_dir_all(&repo).unwrap();
+    let app = repo.join("app.py");
+    fs::write(&app, "def alpha() -> int:\n    return 1\n").unwrap();
+    let cfg = ConvertConfig::new(repo.clone(), out.clone());
+    let _ = convert_repo(&cfg).unwrap();
+
+    let stale_tmp = out.join("index/.xref.tsv.9999.0.tmp");
+    let fresh_tmp = out.join("index/.xref.tsv.9999.1.tmp");
+    fs::write(&stale_tmp, b"stale").unwrap();
+    fs::write(&fresh_tmp, b"fresh").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&stale_tmp)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+        .unwrap();
+
+    fs::write(
+        &app,
+        "def alpha() -> int:\n    return 1\n\n\ndef beta() -> int:\n    return 2\n",
+    )
+    .unwrap();
+    bump_file_mtime(&app);
+    let _ = convert_repo(&cfg).unwrap();
+
+    assert!(
+        !stale_tmp.exists(),
+        "stale index/*.tmp files must be pruned by emit_bundle"
+    );
+    assert!(fresh_tmp.exists(), "fresh index/*.tmp files must be kept");
+    let _ = fs::remove_file(&fresh_tmp);
+}
+
+/// SYNC-SCRUT-009: a pre-compaction schema-2.1.0 shard (long field names) loads through the serde
+/// aliases, and a `--force` rebuild rewrites it in the compact format.
+#[test]
+fn test_legacy_schema_shard_loads_and_force_rewrites_compact_cache() {
+    let tmp = TestTempDir::new("scrut_legacy_shard");
+    let repo = tmp.path().join("repo");
+    let out = tmp.path().join("bundle");
+    fs::create_dir_all(&repo).unwrap();
+    let alpha = repo.join("alpha.py");
+    let beta = repo.join("beta.py");
+    fs::write(&alpha, "def alpha() -> int:\n    return 1\n").unwrap();
+    fs::write(&beta, "def beta() -> int:\n    return 2\n").unwrap();
+
+    let cfg = ConvertConfig::new(repo.clone(), out.clone());
+    let _ = convert_repo(&cfg).unwrap();
+
+    let manifest = load_cache_manifest(&out).expect("manifest");
+    let alpha_entry = manifest.files.get("alpha.py").expect("alpha entry").clone();
+    let alpha_shard = out.join(&alpha_entry.shard);
+    let compact: serde_json::Value =
+        serde_json::from_slice(&fs::read(&alpha_shard).unwrap()).expect("compact shard json");
+    let scanned = compact["scanned"].clone();
+    let symbol = &compact["symbols"][0];
+    let legacy_symbol = format!(
+        r#"{{"name":{},"qualified_name":{},"kind":{},"visibility":{},"start_line":{},"end_line":{},"signature":{},"doc_summary":{},"enclosing_type":{},"scope":{},"arch_layer":{},"section_id":{},"file":"alpha.py","symbol_id":"alpha.py::alpha"}}"#,
+        symbol["n"],
+        symbol["q"],
+        symbol["k"],
+        symbol["v"],
+        symbol["s"],
+        symbol["e"],
+        symbol["g"],
+        symbol["d"],
+        symbol["t"],
+        symbol["c"],
+        symbol["a"],
+        symbol["i"],
+    );
+    let legacy = format!(
+        r#"{{"scanned":{scanned},"symbols":[{legacy_symbol}],"types":[],"macros":[],"imports":[],"raw_calls":[],"raw_xrefs":[],"parse_errors":0}}"#
+    );
+    fs::write(&alpha_shard, legacy).unwrap();
+    assert!(
+        load_cache_shard_unit(&out, &alpha_entry.shard, "alpha.py").is_some(),
+        "legacy field-name shard must deserialize through serde aliases"
+    );
+
+    // A structural edit to beta.py only: alpha stays clean and must be reused (1 reparsed, 1 reused).
+    fs::write(&beta, "def beta(x: int) -> int:\n    return x + 2\n").unwrap();
+    bump_file_mtime(&beta);
+    let inc = convert_repo(&cfg).unwrap();
+    assert_eq!(inc.metadata.incremental_reparsed_files, 1);
+    assert_eq!(inc.metadata.incremental_reused_files, 1);
+
+    // `--force` reparses everything and rewrites the legacy shard in the compact format.
+    let mut force_cfg = cfg.clone();
+    force_cfg.force = true;
+    let _ = convert_repo(&force_cfg).unwrap();
+    let manifest = load_cache_manifest(&out).expect("manifest after force");
+    let entry = manifest
+        .files
+        .get("alpha.py")
+        .expect("alpha entry after force");
+    let rewritten = fs::read_to_string(out.join(&entry.shard)).unwrap();
+    assert!(
+        rewritten.contains("\"q\":\"alpha\""),
+        "force rebuild must write compact field names:\n{rewritten}"
+    );
+    assert!(
+        !rewritten.contains("\"qualified_name\""),
+        "force rebuild must not keep the legacy shard format"
+    );
+    assert!(load_cache_shard_unit(&out, &entry.shard, "alpha.py").is_some());
+}
+
+/// SYNC-SCRUT-009: a clean shard that failed to deserialize is rewritten by the incremental sync
+/// instead of being reused from the previous manifest by content hash alone.
+#[test]
+fn test_unreadable_clean_shard_is_rewritten_incrementally() {
+    let tmp = TestTempDir::new("scrut_unreadable_shard");
+    let repo = tmp.path().join("repo");
+    let out = tmp.path().join("bundle");
+    fs::create_dir_all(&repo).unwrap();
+    let alpha = repo.join("alpha.py");
+    let beta = repo.join("beta.py");
+    fs::write(&alpha, "def alpha() -> int:\n    return 1\n").unwrap();
+    fs::write(&beta, "def beta() -> int:\n    return 2\n").unwrap();
+
+    let cfg = ConvertConfig::new(repo.clone(), out.clone());
+    let _ = convert_repo(&cfg).unwrap();
+    let manifest = load_cache_manifest(&out).expect("manifest");
+    let alpha_shard = out.join(&manifest.files["alpha.py"].shard);
+    fs::write(&alpha_shard, b"{not valid json").unwrap();
+
+    fs::write(&beta, "def beta(x: int) -> int:\n    return x + 2\n").unwrap();
+    bump_file_mtime(&beta);
+    let inc = convert_repo(&cfg).unwrap();
+    assert_eq!(
+        inc.metadata.incremental_reparsed_files, 2,
+        "the unreadable clean shard must be reparsed"
+    );
+    assert_eq!(inc.metadata.incremental_reused_files, 0);
+
+    let manifest = load_cache_manifest(&out).expect("manifest after incremental");
+    assert!(
+        load_cache_shard_unit(&out, &manifest.files["alpha.py"].shard, "alpha.py").is_some(),
+        "the repaired sync must rewrite the unreadable clean shard"
+    );
+
+    let again = convert_repo(&cfg).unwrap();
+    assert!(again.cache_hit, "the repaired bundle must cache-hit");
+}

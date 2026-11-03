@@ -96,6 +96,14 @@ All notable changes to this project are listed here. Versions follow
 
 ### Fixed
 
+- **Sync-Performance Scrutiny Fixes: Lock Heartbeat, Streamed-Write Cleanup, Tier 3 Reconstruction & Legacy Shard Aliases (`emitter.rs`, `lib.rs`, `model.rs`, `query.rs`)**:
+  - `BundleLock` now writes a unique `<pid>:<unix_ms>:<seq>` owner token, spawns a heartbeat thread (`Condvar::wait_timeout`, 2 s) that refreshes `cache/.lock` while held, treats a lock as stale only when its file mtime is `> 10 s` old (payload timestamps never steal a visibly live lock), honors the wait deadline when a stale lock cannot be removed (Windows sharing violation), and `Drop` removes the file only when its contents still match the owner token.
+  - `write_streamed_file` unlinks its `index/.*.tmp` staging file when `render`/`finish`/`flush` fails, and `emit_bundle` prunes stale `*.tmp` files in `index/` alongside `output/`, `sections/`, and `cache/`.
+  - Tier 3 coordinate-shift reconstruction now rejects dirty files whose raw call or xref changed its enclosing symbol's `qualified_name`, refreshes non-macro xref contexts 1:1 (falling back on ambiguity), and keys macro contexts by `(name, old line)`, so moved calls between `impl` blocks, edited inline comments, and duplicate `#define`/constant names stay byte-identical to `--force`.
+  - `workspace_status` parses `cache/manifest.json` once per bundle and feeds it to both the artifact-integrity gate and the cache-presence/fallback paths; `MacroRowPrefilter` normalizes `_GPIOA` in the same order as the scorer (trim leading `_` before the peripheral slice) so `chipsrc reg _GPIOA` matches `GPIO_MODER` identically in text and `--json`.
+  - Cache shards carry serde aliases for every pre-compaction long field name, `--force` rebuilds no longer reuse previous shards, and clean shards that failed to deserialize are rewritten instead of being trusted by manifest hash alone.
+  - Tests: bundle-lock heartbeat/liveness/undeletable-deadline/owner-token coverage, failing streamed-render cleanup, legacy-shard deserialization + force rewrite, unreadable clean-shard repair, `index/*.tmp` pruning, moved-call/inline-xref/duplicate-macro Tier 3 equality with `--force`, single-manifest `workspace_status`, and `_GPIOA` prefilter/scorer parity.
+
 - **Accurate `ClaudeIgnore` Status Message for Out-of-Tree Bundles (`emitter.rs`, `main.rs`)**:
   - Added `emitter::is_output_inside_repo` and updated `print_conversion_summary` in `chipsrc-cli` to print `[ok] ClaudeIgnore: not needed (bundle outside repo)` when the output directory is outside the target repository instead of misleadingly printing `already configured`.
 - **QA Harness Rerun Idempotency, Fixture-Bundle Separation, Build-Failure Recording & Sandbox Cleanup (`qa/qa_blackbox.py`, `qa/lib/runner.py`, `qa/suites/real.py`, `qa/suites/dup_content.py`, `qa/README.md`)**:

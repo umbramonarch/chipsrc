@@ -854,29 +854,40 @@ pub fn bundle_artifacts_complete_with(
     first_missing_bundle_artifact_with(bundle_dir, sources).is_none()
 }
 
+/// Loads the incremental AST cache from an already-parsed `cache/manifest.json` plus its shards.
+///
+/// Callers that already parsed the manifest (e.g. `query::workspace_status`) use this to keep the
+/// manifest parse to exactly one per bundle.
+pub fn load_cache_file_from_manifest(
+    bundle_dir: &Path,
+    manifest: &CacheManifest,
+) -> Option<IncrementalAstCache> {
+    let requests: Vec<(String, String)> = manifest
+        .files
+        .iter()
+        .map(|(rel_path, entry)| (rel_path.clone(), entry.shard.clone()))
+        .collect();
+    let mut loaded = load_cache_units(bundle_dir, &requests);
+    let mut files = BTreeMap::new();
+    for rel_path in manifest.files.keys() {
+        let unit = loaded.remove(rel_path)?;
+        files.insert(rel_path.clone(), unit);
+    }
+    Some(IncrementalAstCache {
+        schema_version: manifest.schema_version.clone(),
+        repo_root: manifest.repo_root.clone(),
+        vendor_mode: manifest.vendor_mode,
+        fingerprint: manifest.fingerprint.clone(),
+        blueprint_hash: manifest.blueprint_hash.clone(),
+        files,
+    })
+}
+
 /// Loads the incremental AST cache from `bundle_dir/cache/manifest.json` + `cache/*.json` shards
 /// (schema `2.1.0`).
 pub fn load_cache_file(bundle_dir: &Path) -> Option<IncrementalAstCache> {
     if let Some(manifest) = load_cache_manifest(bundle_dir) {
-        let requests: Vec<(String, String)> = manifest
-            .files
-            .iter()
-            .map(|(rel_path, entry)| (rel_path.clone(), entry.shard.clone()))
-            .collect();
-        let mut loaded = load_cache_units(bundle_dir, &requests);
-        let mut files = BTreeMap::new();
-        for rel_path in manifest.files.keys() {
-            let unit = loaded.remove(rel_path)?;
-            files.insert(rel_path.clone(), unit);
-        }
-        return Some(IncrementalAstCache {
-            schema_version: manifest.schema_version,
-            repo_root: manifest.repo_root,
-            vendor_mode: manifest.vendor_mode,
-            fingerprint: manifest.fingerprint,
-            blueprint_hash: manifest.blueprint_hash,
-            files,
-        });
+        return load_cache_file_from_manifest(bundle_dir, &manifest);
     }
 
     let legacy_path = bundle_dir.join("cache.json");

@@ -1,9 +1,11 @@
 use crate::error::{ChipsrcError, Result};
 use crate::mmio::{normalize_hex_literal, normalize_query_hex_literal};
-use crate::model::{BundleStatusEntry, LanguageKind, SearchHit, DEFAULT_MAX_FILE_BYTES};
+use crate::model::{
+    BundleStatusEntry, LanguageKind, SearchHit, CACHE_SCHEMA_VERSION, DEFAULT_MAX_FILE_BYTES,
+};
 use crate::scanner::{
     canonical_repo_root_and_name, check_files_changed, check_meta_files_changed,
-    first_missing_bundle_artifact_with, has_bundle_cache, has_valid_tsv_header, load_cache_file,
+    first_missing_bundle_artifact_with, has_valid_tsv_header, load_cache_file_from_manifest,
     load_cache_manifest_any_version, load_meta_file, scan_repository, BundleArtifactSources,
 };
 use memchr::memmem;
@@ -192,30 +194,31 @@ pub fn workspace_status(workspace: &Path) -> Result<Vec<BundleStatusEntry>> {
 
     let mut entries = Vec::with_capacity(bundles.len());
     for bundle_dir in bundles {
-        // Parse `meta.json` once and feed the parsed copy into the artifact-integrity gate.
+        // Parse `meta.json` and `cache/manifest.json` at most once per bundle: the parsed copies
+        // drive the artifact-integrity gate, the cache-presence gate, and `repo_root` recovery.
         let meta_file_opt = load_meta_file(&bundle_dir);
+        let manifest = load_cache_manifest_any_version(&bundle_dir);
         let missing_artifact = first_missing_bundle_artifact_with(
             &bundle_dir,
             BundleArtifactSources {
                 meta: meta_file_opt.as_ref(),
-                manifest: None,
+                manifest: manifest.as_ref(),
             },
         );
+        let has_valid_cache = manifest
+            .as_ref()
+            .is_some_and(|m| m.schema_version == CACHE_SCHEMA_VERSION && !m.files.is_empty());
         let Some(meta_file) = meta_file_opt else {
-            let fallback_manifest = load_cache_manifest_any_version(&bundle_dir);
             let bundle_name = bundle_dir
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("bundle")
                 .to_string();
-            let source_root = fallback_manifest
+            let source_root = manifest
                 .as_ref()
                 .map(|m| m.repo_root.clone())
                 .unwrap_or_default();
-            let total_files = fallback_manifest
-                .as_ref()
-                .map(|m| m.files.len().max(1))
-                .unwrap_or(1);
+            let total_files = manifest.as_ref().map(|m| m.files.len().max(1)).unwrap_or(1);
             let reason = missing_artifact
                 .map(|m| format!("missing {m}"))
                 .unwrap_or_else(|| "missing or invalid meta.json".to_string());
@@ -244,13 +247,17 @@ pub fn workspace_status(workspace: &Path) -> Result<Vec<BundleStatusEntry>> {
 
         let source_path = Path::new(&meta.source_root);
         let changed_files_count = if source_path.is_dir() {
-            if !has_bundle_cache(&bundle_dir) || meta.file_stamps.is_empty() {
+            if !has_valid_cache || meta.file_stamps.is_empty() {
                 meta.total_files.max(1)
             } else if let Some(count) =
                 check_meta_files_changed(source_path, &meta, DEFAULT_MAX_FILE_BYTES)
             {
                 count
-            } else if let Some(cache) = load_cache_file(&bundle_dir) {
+            } else if let Some(cache) = manifest
+                .as_ref()
+                .filter(|m| m.schema_version == CACHE_SCHEMA_VERSION)
+                .and_then(|m| load_cache_file_from_manifest(&bundle_dir, m))
+            {
                 check_files_changed(source_path, &cache, DEFAULT_MAX_FILE_BYTES).unwrap_or(0)
             } else if let Ok((_, live_fp)) =
                 scan_repository(source_path, meta.vendor_mode, DEFAULT_MAX_FILE_BYTES)
@@ -266,7 +273,7 @@ pub fn workspace_status(workspace: &Path) -> Result<Vec<BundleStatusEntry>> {
         let is_fresh = changed_files_count == 0 && missing_artifact.is_none();
         let reason = if let Some(ref missing) = missing_artifact {
             Some(format!("missing {missing}"))
-        } else if !has_bundle_cache(&bundle_dir) {
+        } else if !has_valid_cache {
             Some("missing or outdated cache/manifest.json".to_string())
         } else if meta.file_stamps.is_empty() {
             Some("missing file_stamps in meta.json".to_string())
@@ -2455,11 +2462,30 @@ impl MacroRowPrefilter {
             }
         };
         push(q.raw);
-        let stem = strip_periph_instance_slice(q.raw);
+        // Normalize in exactly the same order as `QueryHw` / `score_hw_identifier_match_prepared`:
+        // strip surrounding whitespace and leading underscores **before** the peripheral-instance
+        // slice. Using the raw query for the slice (`_GPIOA` -> `_GPIOA`) produced needles that
+        // can never occur in `GPIO_MODER`, so the prefilter rejected a row the scorer accepts at
+        // score 2 (SYNC-SCRUT-008).
+        let normalized = q.raw.trim().trim_start_matches('_');
+        push(normalized);
+        let stem = strip_periph_instance_slice(normalized);
         if stem.len() >= 3 {
             push(stem);
         }
-        if let Some(last) = last_alnum_run(q.raw) {
+        for (periph, reg) in q.splits.into_iter().flatten() {
+            push(periph);
+            push(reg);
+            let periph_normalized = periph.trim().trim_start_matches('_');
+            push(periph_normalized);
+            if let Some(last) = last_alnum_run(periph_normalized) {
+                push(last);
+            }
+            if let Some(last) = last_alnum_run(reg) {
+                push(last);
+            }
+        }
+        if let Some(last) = last_alnum_run(normalized) {
             push(last);
         }
         // Longest needles first: they select the fewest rows on this table.
@@ -3456,6 +3482,8 @@ mod tests {
             "MODER",
             "GPIO",
             "GPIOA",
+            "_GPIOA",
+            "_GPIOA_MODER",
             "TIM3",
             "TIMx",
             "USART1_IRQn",
@@ -3503,6 +3531,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// SYNC-SCRUT-008: `chipsrc reg _GPIOA` must admit `#define GPIO_MODER 1` (the scorer accepts
+    /// it at score 2), so the text and `--json` outputs agree.
+    #[test]
+    fn macro_prefilter_matches_underscore_prefixed_peripheral_query() {
+        let q_hw = QueryHw::new("_GPIOA");
+        assert_eq!(
+            score_hw_identifier_match_prepared("GPIO_MODER", &q_hw),
+            2,
+            "the full scorer must accept the peripheral stem"
+        );
+        assert_eq!(score_hw_identifier_match("GPIO_MODER", "_GPIOA"), 2);
+        let row = b"GPIO_MODER\tmacro\t1\t-\tprobe.c\t1\tother\tfirst_party\t01-root\tObject macro / compile-time constant";
+        assert!(
+            MacroRowPrefilter::new(&q_hw, MacroScanMode::Strong).may_match(row),
+            "the strong prefilter must admit a row the scorer accepts at score 2"
+        );
+        assert!(
+            MacroRowPrefilter::new(&q_hw, MacroScanMode::Full).may_match(row),
+            "the full prefilter must admit a row the scorer accepts at score 2"
+        );
     }
 
     #[test]

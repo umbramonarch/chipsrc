@@ -429,88 +429,88 @@ pub struct ExtractedSymbol {
     /// [`ParsedFileUnit::restore_per_file_fields`]).
     #[serde(default, skip_serializing)]
     pub symbol_id: String,
-    #[serde(rename = "n")]
+    #[serde(rename = "n", alias = "name")]
     pub name: String,
-    #[serde(rename = "q")]
+    #[serde(rename = "q", alias = "qualified_name")]
     pub qualified_name: String,
-    #[serde(rename = "k")]
+    #[serde(rename = "k", alias = "kind")]
     pub kind: SymbolKind,
-    #[serde(rename = "v")]
+    #[serde(rename = "v", alias = "visibility")]
     pub visibility: Visibility,
     /// Owning file, never serialized (the shard's own `scanned.rel_path`).
     #[serde(default, skip_serializing)]
     pub file: String,
-    #[serde(rename = "s")]
+    #[serde(rename = "s", alias = "start_line")]
     pub start_line: usize,
-    #[serde(rename = "e")]
+    #[serde(rename = "e", alias = "end_line")]
     pub end_line: usize,
-    #[serde(rename = "g")]
+    #[serde(rename = "g", alias = "signature")]
     pub signature: String,
-    #[serde(rename = "d")]
+    #[serde(rename = "d", alias = "doc_summary")]
     pub doc_summary: String,
-    #[serde(rename = "t")]
+    #[serde(rename = "t", alias = "enclosing_type")]
     pub enclosing_type: Option<String>,
-    #[serde(rename = "c")]
+    #[serde(rename = "c", alias = "scope")]
     pub scope: FileScope,
-    #[serde(rename = "a")]
+    #[serde(rename = "a", alias = "arch_layer")]
     pub arch_layer: ArchLayer,
-    #[serde(rename = "i")]
+    #[serde(rename = "i", alias = "section_id")]
     pub section_id: String,
 }
 
 /// Extracted struct, enum, union, trait, interface, class, or typedef definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedType {
-    #[serde(rename = "i")]
+    #[serde(rename = "i", alias = "type_id")]
     pub type_id: String,
-    #[serde(rename = "n")]
+    #[serde(rename = "n", alias = "name")]
     pub name: String,
-    #[serde(rename = "k")]
+    #[serde(rename = "k", alias = "kind")]
     pub kind: TypeKind,
-    #[serde(rename = "v")]
+    #[serde(rename = "v", alias = "visibility")]
     pub visibility: Visibility,
     /// Owning file, never serialized (the shard's own `scanned.rel_path`).
     #[serde(default, skip_serializing)]
     pub file: String,
-    #[serde(rename = "s")]
+    #[serde(rename = "s", alias = "start_line")]
     pub start_line: usize,
-    #[serde(rename = "e")]
+    #[serde(rename = "e", alias = "end_line")]
     pub end_line: usize,
-    #[serde(rename = "f")]
+    #[serde(rename = "f", alias = "fields_summary")]
     pub fields_summary: String,
-    #[serde(rename = "d")]
+    #[serde(rename = "d", alias = "doc_summary")]
     pub doc_summary: String,
-    #[serde(rename = "c")]
+    #[serde(rename = "c", alias = "scope")]
     pub scope: FileScope,
-    #[serde(rename = "a")]
+    #[serde(rename = "a", alias = "arch_layer")]
     pub arch_layer: ArchLayer,
-    #[serde(rename = "t")]
+    #[serde(rename = "t", alias = "section_id")]
     pub section_id: String,
 }
 
 /// Extracted `#define` macro, compile-time constant, hex MMIO address, bitmask, or hardware register access.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedMacro {
-    #[serde(rename = "n")]
+    #[serde(rename = "n", alias = "name")]
     pub name: String,
-    #[serde(rename = "k")]
+    #[serde(rename = "k", alias = "kind")]
     pub kind: MacroKind,
-    #[serde(rename = "v")]
+    #[serde(rename = "v", alias = "value_or_args")]
     pub value_or_args: String,
-    #[serde(rename = "h")]
+    #[serde(rename = "h", alias = "hex_addr")]
     pub hex_addr: Option<String>,
     /// Owning file, never serialized (the shard's own `scanned.rel_path`).
     #[serde(default, skip_serializing)]
     pub file: String,
-    #[serde(rename = "l")]
+    #[serde(rename = "l", alias = "line")]
     pub line: usize,
-    #[serde(rename = "c")]
+    #[serde(rename = "c", alias = "scope")]
     pub scope: FileScope,
-    #[serde(rename = "a")]
+    #[serde(rename = "a", alias = "arch_layer")]
     pub arch_layer: ArchLayer,
-    #[serde(rename = "t")]
+    #[serde(rename = "t", alias = "section_id")]
     pub section_id: String,
-    #[serde(rename = "d")]
+    #[serde(rename = "d", alias = "description")]
     pub description: String,
 }
 
@@ -520,13 +520,13 @@ pub struct ExtractedImport {
     /// Owning file, never serialized (the shard's own `scanned.rel_path`).
     #[serde(default, skip_serializing)]
     pub file: String,
-    #[serde(rename = "l")]
+    #[serde(rename = "l", alias = "line")]
     pub line: usize,
-    #[serde(rename = "p")]
+    #[serde(rename = "p", alias = "raw_path")]
     pub raw_path: String,
-    #[serde(rename = "i")]
+    #[serde(rename = "i", alias = "imported_names")]
     pub imported_names: Vec<String>,
-    #[serde(rename = "s")]
+    #[serde(rename = "s", alias = "is_system")]
     pub is_system: bool,
 }
 
@@ -536,15 +536,15 @@ pub struct RawCallSite {
     /// Owning file, never serialized (the shard's own `scanned.rel_path`).
     #[serde(default, skip_serializing)]
     pub caller_file: String,
-    #[serde(rename = "n")]
+    #[serde(rename = "n", alias = "caller_name")]
     pub caller_name: String,
-    #[serde(rename = "s")]
+    #[serde(rename = "s", alias = "caller_start_line")]
     pub caller_start_line: usize,
-    #[serde(rename = "c")]
+    #[serde(rename = "c", alias = "callee_name")]
     pub callee_name: String,
-    #[serde(rename = "r")]
+    #[serde(rename = "r", alias = "receiver_or_qualifier")]
     pub receiver_or_qualifier: Option<String>,
-    #[serde(rename = "l")]
+    #[serde(rename = "l", alias = "call_line")]
     pub call_line: usize,
 }
 
@@ -554,15 +554,15 @@ pub struct RawXrefSite {
     /// Owning file, never serialized (the shard's own `scanned.rel_path`).
     #[serde(default, skip_serializing)]
     pub file: String,
-    #[serde(rename = "l")]
+    #[serde(rename = "l", alias = "line")]
     pub line: usize,
-    #[serde(rename = "e")]
+    #[serde(rename = "e", alias = "enclosing_symbol")]
     pub enclosing_symbol: Option<String>,
-    #[serde(rename = "n")]
+    #[serde(rename = "n", alias = "target_name")]
     pub target_name: String,
-    #[serde(rename = "c")]
+    #[serde(rename = "c", alias = "category")]
     pub category: String,
-    #[serde(rename = "x")]
+    #[serde(rename = "x", alias = "context")]
     pub context: String,
 }
 

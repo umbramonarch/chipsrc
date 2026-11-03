@@ -1154,3 +1154,54 @@ fn bundle_lock_and_atomic_writes_end_to_end() {
         query_symbols(&bundles, "locked_probe_fn", None, false, 10).expect("query locked_probe_fn");
     assert!(sym_out.contains("locked_probe_fn"));
 }
+
+/// SYNC-SCRUT-007: `workspace_status` parses `cache/manifest.json` once and feeds the same parsed
+/// copy to both the artifact-integrity gate and the cache-presence/fallback paths.
+#[test]
+fn workspace_status_reuses_one_parsed_manifest() {
+    let tmp = TestTempDir::new("status_manifest_once");
+    let repo_dir = tmp.0.join("repo");
+    let out_root = tmp.0.join("out");
+    create_synthetic_repo(&repo_dir);
+
+    let bundle =
+        ensure_repo(&repo_dir, &out_root, false, VendorMode::Active).expect("initial ensure");
+    let bundle_dir = bundle.output_dir.clone();
+    let status = workspace_status(&bundle_dir).expect("fresh status");
+    assert_eq!(status.len(), 1);
+    assert!(status[0].is_fresh, "fresh bundle: {:?}", status[0].reason);
+    assert_eq!(status[0].source_root, bundle.metadata.source_root);
+
+    // The manifest is present and current, but a required TSV is missing: the artifact gate must
+    // report the missing table (not a cache problem) using the pre-parsed manifest.
+    let symbols_tsv = bundle_dir.join("index/symbols.tsv");
+    let saved = fs::read(&symbols_tsv).expect("read symbols.tsv");
+    fs::remove_file(&symbols_tsv).unwrap();
+    let missing_table = workspace_status(&bundle_dir).expect("status missing table");
+    assert!(!missing_table[0].is_fresh);
+    let reason = missing_table[0].reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("index/symbols.tsv"),
+        "expected missing symbols.tsv reason, got {reason:?}"
+    );
+
+    // With `meta.json` gone, the same parsed manifest must still supply the source root and the
+    // bundle must be reported stale (reason names meta.json).
+    fs::write(&symbols_tsv, saved).expect("restore symbols.tsv");
+    let meta_path = bundle_dir.join("meta.json");
+    // A complete bundle is fresh again after restoring the table.
+    assert!(workspace_status(&bundle_dir).expect("status restored")[0].is_fresh);
+    fs::remove_file(&meta_path).unwrap();
+    let missing_meta = workspace_status(&bundle_dir).expect("status missing meta");
+    assert_eq!(missing_meta.len(), 1);
+    assert!(!missing_meta[0].is_fresh);
+    assert!(
+        !missing_meta[0].source_root.is_empty(),
+        "source_root must be recovered from cache/manifest.json"
+    );
+    let reason = missing_meta[0].reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("meta.json"),
+        "expected missing meta.json reason, got {reason:?}"
+    );
+}

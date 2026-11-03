@@ -90,6 +90,27 @@ pub fn inspect_repo(repo_path: &Path, vendor_mode: VendorMode) -> Result<Inspect
     })
 }
 
+/// Returns the qualified name of the innermost extracted symbol whose `start_line..=end_line`
+/// covers `line`.
+///
+/// Used to verify that a moved call or xref still has the same enclosing owner: `RawCallSite`
+/// and `RawXrefSite` only carry the (often unqualified) caller/enclosing name, so two methods with
+/// the same short name in different `impl`/class blocks look identical in the structural digest.
+/// A changed qualified owner means the previously linked row would name the wrong symbol
+/// (SYNC-SCRUT-004).
+fn enclosing_symbol_qualified_name(unit: &ParsedFileUnit, line: usize) -> Option<&str> {
+    unit.symbols
+        .iter()
+        .filter(|symbol| symbol.start_line <= line && line <= symbol.end_line)
+        .min_by_key(|symbol| {
+            (
+                symbol.end_line.saturating_sub(symbol.start_line),
+                symbol.start_line,
+            )
+        })
+        .map(|symbol| symbol.qualified_name.as_str())
+}
+
 /// Returns `true` when two parsed units for the same file have identical line coordinates
 /// and docstrings for every extracted symbol, type, macro, call, and xref (meaning no line
 /// numbers or rendered Markdown skeletons shifted).
@@ -128,19 +149,22 @@ fn units_have_identical_coordinates(old_u: &ParsedFileUnit, new_u: &ParsedFileUn
     if !macros_eq {
         return false;
     }
-    let calls_eq = old_u
-        .raw_calls
-        .iter()
-        .zip(&new_u.raw_calls)
-        .all(|(a, b)| a.call_line == b.call_line && a.callee_name == b.callee_name);
+    let calls_eq = old_u.raw_calls.iter().zip(&new_u.raw_calls).all(|(a, b)| {
+        a.call_line == b.call_line
+            && a.callee_name == b.callee_name
+            && enclosing_symbol_qualified_name(old_u, a.call_line)
+                == enclosing_symbol_qualified_name(new_u, b.call_line)
+    });
     if !calls_eq {
         return false;
     }
-    old_u
-        .raw_xrefs
-        .iter()
-        .zip(&new_u.raw_xrefs)
-        .all(|(a, b)| a.line == b.line && a.target_name == b.target_name)
+    old_u.raw_xrefs.iter().zip(&new_u.raw_xrefs).all(|(a, b)| {
+        a.line == b.line
+            && a.target_name == b.target_name
+            && a.context == b.context
+            && enclosing_symbol_qualified_name(old_u, a.line)
+                == enclosing_symbol_qualified_name(new_u, b.line)
+    })
 }
 
 /// Line/strings translation for one dirty file: old line number -> new line number plus the
@@ -148,7 +172,14 @@ fn units_have_identical_coordinates(old_u: &ParsedFileUnit, new_u: &ParsedFileUn
 struct DirtyFileMaps {
     old_to_new_line: FxHashMap<usize, usize>,
     new_symbol_start_to_old: FxHashMap<(String, usize), usize>,
-    macro_contexts: FxHashMap<String, String>,
+    /// Refreshed `macro_def` contexts keyed by `(macro name, old line)`. The line component keeps
+    /// two macros with the same name in one file distinct (`#define LIMIT 10` /
+    /// `#define LIMIT 20`), which a name-only key collapsed (SYNC-SCRUT-006).
+    macro_contexts: FxHashMap<(String, usize), String>,
+    /// Refreshed non-macro raw-xref contexts keyed by `(old line, target name, raw category)`.
+    /// A changed inline comment on a non-macro xref rewrites its `index/xref.tsv` context 1:1
+    /// instead of forcing the full structural path (SYNC-SCRUT-005).
+    xref_contexts: FxHashMap<(usize, String, String), String>,
 }
 
 /// Builds line-number translations by zipping every extracted list of the old and new units.
@@ -210,18 +241,51 @@ fn build_dirty_file_maps(old_u: &ParsedFileUnit, new_u: &ParsedFileUnit) -> Opti
         insert(old.start_line, new.start_line)?;
         insert(old.end_line, new.end_line)?;
     }
-    let mut macro_contexts: FxHashMap<String, String> = FxHashMap::default();
+    let mut macro_contexts: FxHashMap<(String, usize), String> = FxHashMap::default();
     for (old, new) in old_u.macros.iter().zip(&new_u.macros) {
         if old.name != new.name {
             return None;
         }
         insert(old.line, new.line)?;
-        macro_contexts.insert(new.name.clone(), render_macro_xref_context(new));
+        macro_contexts.insert((new.name.clone(), old.line), render_macro_xref_context(new));
     }
+    let mut xref_contexts: FxHashMap<(usize, String, String), String> = FxHashMap::default();
     for (old, new) in old_u.raw_calls.iter().zip(&new_u.raw_calls) {
+        // A call moved to another owner keeps the same short caller name and digest while its
+        // linked caller id becomes stale; only the enclosing qualified name reveals the move.
+        if old.caller_name != new.caller_name
+            || old.callee_name != new.callee_name
+            || old.receiver_or_qualifier != new.receiver_or_qualifier
+            || enclosing_symbol_qualified_name(old_u, old.call_line)
+                != enclosing_symbol_qualified_name(new_u, new.call_line)
+        {
+            return None;
+        }
         insert(old.call_line, new.call_line)?;
     }
     for (old, new) in old_u.raw_xrefs.iter().zip(&new_u.raw_xrefs) {
+        if old.target_name != new.target_name
+            || old.category != new.category
+            || old.enclosing_symbol != new.enclosing_symbol
+            || enclosing_symbol_qualified_name(old_u, old.line)
+                != enclosing_symbol_qualified_name(new_u, new.line)
+        {
+            return None;
+        }
+        // Refresh the emitted context 1:1. Two raw xrefs on the same old line with the same
+        // target/category but different context text cannot be told apart in `index/xref.tsv`, so
+        // that shape falls back to the full structural path.
+        let key = (old.line, new.target_name.clone(), new.category.clone());
+        match xref_contexts.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                if entry.get() != &new.context {
+                    return None;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(new.context.clone());
+            }
+        }
         insert(old.line, new.line)?;
     }
 
@@ -229,6 +293,7 @@ fn build_dirty_file_maps(old_u: &ParsedFileUnit, new_u: &ParsedFileUnit) -> Opti
         old_to_new_line,
         new_symbol_start_to_old,
         macro_contexts,
+        xref_contexts,
     })
 }
 
@@ -558,12 +623,31 @@ fn try_coordinate_shift_tier(
     }
     for xref in &mut xrefs {
         if let Some(maps) = file_maps.get(xref.file.as_str()) {
-            let Some(&new_line) = maps.old_to_new_line.get(&xref.line) else {
+            let old_line = xref.line;
+            let Some(&new_line) = maps.old_to_new_line.get(&old_line) else {
                 return Ok(None);
             };
             xref.line = new_line;
             if xref.category == "macro_def" {
-                let Some(context) = maps.macro_contexts.get(&xref.symbol) else {
+                // `(name, old line)` keeps duplicate macro names in one file distinct.
+                let Some(context) = maps.macro_contexts.get(&(xref.symbol.clone(), old_line))
+                else {
+                    return Ok(None);
+                };
+                xref.context.clone_from(context);
+            } else if xref.category != "call" && xref.category != "type_def" {
+                // Every remaining category is produced from a raw xref and copies its context
+                // verbatim; `fn_ptr_candidate` is the one renamed on emission.
+                let raw_category = if xref.category == "fn_ptr_ref" {
+                    "fn_ptr_candidate"
+                } else {
+                    xref.category.as_str()
+                };
+                let Some(context) = maps.xref_contexts.get(&(
+                    old_line,
+                    xref.symbol.clone(),
+                    raw_category.to_string(),
+                )) else {
                     return Ok(None);
                 };
                 xref.context.clone_from(context);
@@ -988,6 +1072,11 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
         None
     };
 
+    // Shard-reuse policy for the writer thread. A full rebuild (no previous manifest, `--force`,
+    // or a missing `meta.json`) never reuses a previous shard; the incremental branch below
+    // enables reuse and lists every clean file whose shard had to be reparsed.
+    let mut shard_write_policy = emitter::CacheShardWritePolicy::default();
+
     let (parsed_units, incremental_reused_files, incremental_reparsed_files) =
         if let Some(mut manifest) = prev_manifest_opt {
             let prev_stamp_map: BTreeMap<&str, &FileStamp> = existing_meta_opt
@@ -1161,6 +1250,11 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
             let mut cached_units = scanner::load_cache_units(&config.output_dir, &requests);
             let mut cached_slots: Vec<Option<ParsedFileUnit>> =
                 Vec::with_capacity(clean_files.len());
+            // Clean files whose shard is missing, unparsable, or does not match the live content
+            // hash are reparsed below; their shard must be rewritten rather than reused from
+            // `prev_manifest` because the manifest hash alone cannot prove the file is readable
+            // (SYNC-SCRUT-009).
+            shard_write_policy.reuse_previous = true;
             let mut to_reparse: Vec<ScannedFile> = Vec::new();
             for file in clean_files {
                 match cached_units.remove(&file.rel_path) {
@@ -1177,6 +1271,10 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                     }
                 }
             }
+            shard_write_policy.rewrite = to_reparse
+                .iter()
+                .map(|file| file.rel_path.clone())
+                .collect();
             let bp_ref = blueprint_opt.as_ref().map(|(bp, _)| bp);
             let reparsed: Vec<ParsedFileUnit> = to_reparse
                 .into_par_iter()
@@ -1229,6 +1327,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                     }
                 }
                 if old_dirty_complete
+                    && shard_write_policy.rewrite.is_empty()
                     && coordinate_shift_eligible(
                         &old_dirty_units,
                         &dirty_units,
@@ -1294,12 +1393,13 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                 let units_before_write: &[ParsedFileUnit] = &parsed_units;
                 let blueprint_hash_ref: &str = &blueprint_hash;
                 let writer = scope.spawn(|| {
-                    emitter::write_cache_shards_for_units(
+                    emitter::write_cache_shards_for_units_with_policy(
                         &config.output_dir,
                         units_before_write,
                         CACHE_SCHEMA_VERSION,
                         blueprint_hash_ref,
                         config.vendor_mode,
+                        &shard_write_policy,
                     )
                 });
 
@@ -1843,7 +1943,9 @@ mod tests {
             Some(&2)
         );
         assert_eq!(
-            maps.macro_contexts.get("MAX_DEVICES").map(String::as_str),
+            maps.macro_contexts
+                .get(&("MAX_DEVICES".to_string(), 10))
+                .map(String::as_str),
             Some("64 (New macro doc)")
         );
 
@@ -1853,5 +1955,124 @@ mod tests {
         let mut conflicting_new = new.clone();
         conflicting_new.macros[0].line = 12; // call maps 3 -> 8, macro maps 3 -> 12
         assert!(build_dirty_file_maps(&conflicting_old, &conflicting_new).is_none());
+    }
+
+    /// SYNC-SCRUT-004: moving a call between two methods with the same short name keeps the
+    /// structural digest but changes the linked caller id, so Tier 3 must fall back.
+    #[test]
+    fn dirty_file_line_maps_reject_call_moved_between_enclosing_symbols() {
+        let mut old = make_unit("src/lib.rs", LanguageKind::Rust, 20);
+        let base = old.symbols[0].clone();
+        old.symbols[0].name = "run".to_string();
+        old.symbols[0].qualified_name = "A::run".to_string();
+        old.symbols[0].symbol_id = "src/lib.rs::A::run".to_string();
+        old.symbols[0].enclosing_type = Some("A".to_string());
+        old.symbols[0].start_line = 2;
+        old.symbols[0].end_line = 4;
+        let mut second = base;
+        second.name = "run".to_string();
+        second.qualified_name = "B::run".to_string();
+        second.symbol_id = "src/lib.rs::B::run".to_string();
+        second.enclosing_type = Some("B".to_string());
+        second.start_line = 6;
+        second.end_line = 8;
+        old.symbols.push(second);
+        old.raw_calls.push(RawCallSite {
+            caller_file: "src/lib.rs".to_string(),
+            caller_name: "run".to_string(),
+            caller_start_line: 2,
+            callee_name: "helper".to_string(),
+            receiver_or_qualifier: None,
+            call_line: 3,
+        });
+        let mut moved = old.clone();
+        moved.raw_calls[0].caller_start_line = 6;
+        moved.raw_calls[0].call_line = 7;
+
+        assert!(
+            build_dirty_file_maps(&old, &moved).is_none(),
+            "a call whose enclosing qualified name changed must reject Tier 3"
+        );
+        assert!(
+            !units_have_identical_coordinates(&old, &moved),
+            "the digest-noop short-circuit must also reject a moved call"
+        );
+    }
+
+    /// SYNC-SCRUT-005: an inline-comment change on a non-macro raw xref must refresh the emitted
+    /// `index/xref.tsv` context instead of keeping the stale text.
+    #[test]
+    fn dirty_file_line_maps_refresh_changed_raw_xref_context() {
+        let mut old = make_unit("app.py", LanguageKind::Python, 20);
+        old.raw_xrefs.push(RawXrefSite {
+            file: "app.py".to_string(),
+            line: 8,
+            enclosing_symbol: Some("target_fn".to_string()),
+            target_name: "Device::name".to_string(),
+            category: "field_read".to_string(),
+            context: "value = device.name  # old comment".to_string(),
+        });
+        let mut changed = old.clone();
+        changed.raw_xrefs[0].line = 9;
+        changed.raw_xrefs[0].context = "value = device.name  # new comment".to_string();
+
+        let maps = build_dirty_file_maps(&old, &changed).expect("context refresh maps");
+        assert_eq!(maps.old_to_new_line.get(&8), Some(&9));
+        assert_eq!(
+            maps.xref_contexts
+                .get(&(8, "Device::name".to_string(), "field_read".to_string()))
+                .map(String::as_str),
+            Some("value = device.name  # new comment")
+        );
+
+        // Two raw xrefs on the same line/target/category with different contexts are ambiguous.
+        let mut ambiguous_old = old.clone();
+        let mut second = old.raw_xrefs[0].clone();
+        second.context = "another old comment".to_string();
+        ambiguous_old.raw_xrefs.push(second);
+        let mut ambiguous_new = changed.clone();
+        let mut second_new = changed.raw_xrefs[0].clone();
+        second_new.line = 10;
+        second_new.context = "another new comment".to_string();
+        ambiguous_new.raw_xrefs.push(second_new);
+        assert!(build_dirty_file_maps(&ambiguous_old, &ambiguous_new).is_none());
+    }
+
+    /// SYNC-SCRUT-006: duplicate macro names in one file must key their contexts by
+    /// `(name, line)`; a name-only key overwrote the first macro's context with the second's.
+    #[test]
+    fn dirty_file_line_maps_key_duplicate_macro_names_by_line() {
+        let mut old = make_unit("dup.rs", LanguageKind::Rust, 30);
+        let macro_at = |line: usize, value: &str, doc: &str| ExtractedMacro {
+            name: "LIMIT".to_string(),
+            kind: MacroKind::Constant,
+            value_or_args: value.to_string(),
+            hex_addr: None,
+            file: "dup.rs".to_string(),
+            line,
+            scope: FileScope::FirstParty,
+            arch_layer: ArchLayer::Other,
+            section_id: "root".to_string(),
+            description: doc.to_string(),
+        };
+        old.macros.push(macro_at(10, "10", "first limit"));
+        old.macros.push(macro_at(20, "20", "second limit"));
+        let mut shifted = old.clone();
+        shifted.macros[0].line = 11;
+        shifted.macros[1].line = 21;
+
+        let maps = build_dirty_file_maps(&old, &shifted).expect("duplicate macro maps");
+        assert_eq!(
+            maps.macro_contexts
+                .get(&("LIMIT".to_string(), 10))
+                .map(String::as_str),
+            Some("10 (first limit)")
+        );
+        assert_eq!(
+            maps.macro_contexts
+                .get(&("LIMIT".to_string(), 20))
+                .map(String::as_str),
+            Some("20 (second limit)")
+        );
     }
 }
