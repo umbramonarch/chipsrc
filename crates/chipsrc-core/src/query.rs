@@ -386,11 +386,23 @@ pub fn query_symbols(
 
     let mut hits: Vec<SymHit> = Vec::new();
 
+    // Scoring only ever compares the query against the row's name/identifier/signature columns, so
+    // a row whose raw bytes do not contain the query at all cannot score. Hoisting the suffix and
+    // file-target probe out of the loop (and testing the raw line before splitting tabs or
+    // lowercasing four strings) removes ~N heap allocations per row for N-row tables.
+    let colon_suffix = format!("::{q_lower}");
+    let targets_file = query_targets_file(q_trim);
+
     for bundle_dir in bundles {
         let content = load_index_table(bundle_dir, "symbols.tsv")?;
         let bundle_name = bundle_name_from_dir(bundle_dir);
 
         for line in content.lines().skip(1) {
+            if !q_lower.is_empty()
+                && !ascii_contains_ignore_case(line.as_bytes(), q_lower.as_bytes())
+            {
+                continue;
+            }
             let cols: Vec<&str> = line.split('\t').collect();
             if cols.len() < 14 {
                 continue;
@@ -411,7 +423,6 @@ pub fn query_symbols(
             let scoped_lower = id_view.scoped.to_ascii_lowercase();
             let short_lower = id_view.short.to_ascii_lowercase();
             let sig_lower = cols[7].to_ascii_lowercase();
-            let targets_file = query_targets_file(q_trim);
 
             let score = if q_lower.is_empty() {
                 1
@@ -427,7 +438,7 @@ pub fn query_symbols(
                 || (targets_file && symbol_id.eq_ignore_ascii_case(q_trim))
             {
                 4
-            } else if scoped_lower.ends_with(&format!("::{q_lower}"))
+            } else if scoped_lower.ends_with(&colon_suffix)
                 || name_lower.starts_with(&q_lower)
                 || scoped_lower.starts_with(&q_lower)
                 || (targets_file && id_view.file.to_ascii_lowercase().contains(&q_lower))
@@ -858,11 +869,19 @@ pub fn query_types(
 
     let mut hits = Vec::new();
 
+    // See `query_symbols`: same score-only-on-the-row contract permits the byte prefilter.
+    let targets_file = query_targets_file(q_trim);
+
     for bundle_dir in bundles {
         let content = load_index_table(bundle_dir, "types.tsv")?;
         let bundle_name = bundle_name_from_dir(bundle_dir);
 
         for line in content.lines().skip(1) {
+            if !q_lower.is_empty()
+                && !ascii_contains_ignore_case(line.as_bytes(), q_lower.as_bytes())
+            {
+                continue;
+            }
             let cols: Vec<&str> = line.split('\t').collect();
             if cols.len() < 11 {
                 continue;
@@ -876,7 +895,6 @@ pub fn query_types(
             let name_lower = name.to_ascii_lowercase();
             let scoped_lower = id_view.scoped.to_ascii_lowercase();
             let fields_lower = fields.to_ascii_lowercase();
-            let targets_file = query_targets_file(q_trim);
 
             let score = if q_lower.is_empty() {
                 1
@@ -1038,6 +1056,13 @@ fn collect_macro_rows(bundles: &[PathBuf], query: &str) -> Result<Vec<MacroRow>>
     scan_macro_rows(bundles, &q_hw, &q_lower, MacroScanMode::Full)
 }
 
+/// Byte size above which one `macros.tsv` body is split into newline-aligned chunks and scanned
+/// in parallel. Below it the table is small enough that thread dispatch costs more than the walk.
+const MACRO_PARALLEL_SCAN_BYTES: usize = 4 * 1024 * 1024;
+
+/// Number of chunks a large `macros.tsv` body is split into.
+const MACRO_SCAN_CHUNKS: usize = 8;
+
 fn scan_macro_rows(
     bundles: &[PathBuf],
     q_hw: &QueryHw<'_>,
@@ -1050,64 +1075,147 @@ fn scan_macro_rows(
     for bundle_dir in bundles {
         let content = load_index_table_bytes(bundle_dir, "macros.tsv")?;
         let bundle_name = bundle_name_from_dir(bundle_dir);
-        let mut line_start = 0usize;
-        let mut first_line = true;
-
-        let mut process = |raw: &[u8]| {
-            if first_line {
-                first_line = false;
-                return;
+        // The header line never holds a macro; everything after it is table rows.
+        let body_start = memchr::memchr(b'\n', &content).map_or(content.len(), |idx| idx + 1);
+        let body = &content[body_start..];
+        if body.len() < MACRO_PARALLEL_SCAN_BYTES {
+            scan_macro_rows_chunk(
+                body,
+                bundle_dir,
+                &bundle_name,
+                &prefilter,
+                q_hw,
+                q_lower,
+                &mut hits,
+            );
+        } else {
+            // A 100 MB `macros.tsv` takes ~100 ms to walk on one core; the prefilter is a pure
+            // byte scan, so split it at newline boundaries and concatenate the per-chunk hits in
+            // chunk order — the row order (and therefore the deterministic sort input) is
+            // identical to the serial walk.
+            let parts: Vec<Vec<MacroRow>> = macro_scan_bounds(body)
+                .par_iter()
+                .map(|&(start, end)| {
+                    let mut chunk_hits = Vec::new();
+                    scan_macro_rows_chunk(
+                        &body[start..end],
+                        bundle_dir,
+                        &bundle_name,
+                        &prefilter,
+                        q_hw,
+                        q_lower,
+                        &mut chunk_hits,
+                    );
+                    chunk_hits
+                })
+                .collect();
+            for part in parts {
+                hits.extend(part);
             }
-            if raw.is_empty() || !prefilter.may_match(raw) {
-                return;
-            }
-            let Ok(line) = std::str::from_utf8(raw) else {
-                return;
-            };
-            let mut cols = line.split('\t');
-            let (Some(name), Some(_kind), Some(val), Some(hex_col)) =
-                (cols.next(), cols.next(), cols.next(), cols.next())
-            else {
-                return;
-            };
-            let (Some(file), Some(line_no), Some(_arch_layer), Some(_scope), Some(_section_id)) = (
-                cols.next(),
-                cols.next(),
-                cols.next(),
-                cols.next(),
-                cols.next(),
-            ) else {
-                return;
-            };
-            let Some(desc) = cols.next() else {
-                return;
-            };
-            let score = score_macro_row(name, val, hex_col, desc, q_hw, q_lower);
-            if score == 0 {
-                return;
-            }
-            hits.push(MacroRow {
-                bundle_dir: bundle_dir.clone(),
-                bundle_name: bundle_name.clone(),
-                score,
-                file: file.to_string(),
-                line: line_no.parse().unwrap_or(1),
-                raw: line.to_string(),
-            });
-        };
-
-        for newline in memchr::memchr_iter(b'\n', &content) {
-            let raw = &content[line_start..newline];
-            let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
-            process(raw);
-            line_start = newline + 1;
-        }
-        if line_start < content.len() {
-            process(&content[line_start..]);
         }
     }
 
     Ok(hits)
+}
+
+/// Returns newline-aligned `[start, end)` bounds splitting `body` into [`MACRO_SCAN_CHUNKS`]
+/// roughly equal pieces. Every bound except the last starts immediately after a `\n`, so no row is
+/// ever split across chunks.
+fn macro_scan_bounds(body: &[u8]) -> Vec<(usize, usize)> {
+    let mut bounds: Vec<usize> = Vec::with_capacity(MACRO_SCAN_CHUNKS + 1);
+    bounds.push(0);
+    let target = body.len() / MACRO_SCAN_CHUNKS;
+    for k in 1..MACRO_SCAN_CHUNKS {
+        let pos = k * target;
+        let Some(newline) = memchr::memchr(b'\n', &body[pos..]) else {
+            break;
+        };
+        let next = pos + newline + 1;
+        if next > *bounds.last().unwrap_or(&0) && next < body.len() {
+            bounds.push(next);
+        }
+    }
+    bounds.push(body.len());
+    bounds.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+/// Scans one contiguous slice of newline-terminated `macros.tsv` rows, appending every admitting
+/// row (decoded and scored) to `hits` in line order.
+fn scan_macro_rows_chunk(
+    chunk: &[u8],
+    bundle_dir: &Path,
+    bundle_name: &str,
+    prefilter: &MacroRowPrefilter,
+    q_hw: &QueryHw<'_>,
+    q_lower: &str,
+    hits: &mut Vec<MacroRow>,
+) {
+    let mut line_start = 0usize;
+    for newline in memchr::memchr_iter(b'\n', chunk) {
+        let raw = &chunk[line_start..newline];
+        push_macro_row(raw, bundle_dir, bundle_name, prefilter, q_hw, q_lower, hits);
+        line_start = newline + 1;
+    }
+    if line_start < chunk.len() {
+        push_macro_row(
+            &chunk[line_start..],
+            bundle_dir,
+            bundle_name,
+            prefilter,
+            q_hw,
+            q_lower,
+            hits,
+        );
+    }
+}
+
+/// Decodes and scores one raw `macros.tsv` row, appending it to `hits` when it scores above zero.
+fn push_macro_row(
+    raw: &[u8],
+    bundle_dir: &Path,
+    bundle_name: &str,
+    prefilter: &MacroRowPrefilter,
+    q_hw: &QueryHw<'_>,
+    q_lower: &str,
+    hits: &mut Vec<MacroRow>,
+) {
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    if raw.is_empty() || !prefilter.may_match(raw) {
+        return;
+    }
+    let Ok(line) = std::str::from_utf8(raw) else {
+        return;
+    };
+    let mut cols = line.split('\t');
+    let (Some(name), Some(_kind), Some(val), Some(hex_col)) =
+        (cols.next(), cols.next(), cols.next(), cols.next())
+    else {
+        return;
+    };
+    let (Some(file), Some(line_no), Some(_arch_layer), Some(_scope), Some(_section_id)) = (
+        cols.next(),
+        cols.next(),
+        cols.next(),
+        cols.next(),
+        cols.next(),
+    ) else {
+        return;
+    };
+    let Some(desc) = cols.next() else {
+        return;
+    };
+    let score = score_macro_row(name, val, hex_col, desc, q_hw, q_lower);
+    if score == 0 {
+        return;
+    }
+    hits.push(MacroRow {
+        bundle_dir: bundle_dir.to_path_buf(),
+        bundle_name: bundle_name.to_string(),
+        score,
+        file: file.to_string(),
+        line: line_no.parse().unwrap_or(1),
+        raw: line.to_string(),
+    });
 }
 
 /// Queries `#define` macros, constants, bitmasks, and MMIO register accesses (`index/macros.tsv`),
@@ -2480,14 +2588,13 @@ impl MacroRowPrefilter {
         if stem.len() >= 3 {
             push(stem);
         }
-        for (periph, reg) in q.splits.into_iter().flatten() {
-            push(periph);
+        for (_periph, reg) in q.splits.into_iter().flatten() {
+            // Only the register half of a split can admit a row: every split match in
+            // `score_hw_identifier_match_prepared` requires `cr.eq_ignore_ascii_case(qr)`, and the
+            // row's register half is a substring of its name column. The peripheral half is *not*
+            // a sound needle — `GPIO` occurs in 60k+ unrelated `GPIO_*` macro names, so admitting
+            // on it made `reg GPIO_MODER` decode and score every GPIO macro on STM32CubeF4.
             push(reg);
-            let periph_normalized = periph.trim().trim_start_matches('_');
-            push(periph_normalized);
-            if let Some(last) = last_alnum_run(periph_normalized) {
-                push(last);
-            }
             if let Some(last) = last_alnum_run(reg) {
                 push(last);
             }
@@ -2925,11 +3032,18 @@ pub fn query_subcommand_json(
     match subcommand {
         "sym" => {
             let kind_lower = kind_filter.map(|k| k.trim().to_ascii_lowercase());
+            let colon_suffix = format!("::{q_lower}");
+            let targets_file = query_targets_file(q_trim);
             let mut items = Vec::new();
             for bundle_dir in bundles {
                 let content = load_index_table(bundle_dir, "symbols.tsv")?;
                 let bundle_name = bundle_name_from_dir(bundle_dir);
                 for line in content.lines().skip(1) {
+                    if !q_lower.is_empty()
+                        && !ascii_contains_ignore_case(line.as_bytes(), q_lower.as_bytes())
+                    {
+                        continue;
+                    }
                     let cols: Vec<&str> = line.split('\t').collect();
                     if cols.len() < 14 {
                         continue;
@@ -2948,7 +3062,6 @@ pub fn query_subcommand_json(
                     let name_lower = name.to_ascii_lowercase();
                     let scoped_lower = id_view.scoped.to_ascii_lowercase();
                     let sig_lower = cols[7].to_ascii_lowercase();
-                    let targets_file = query_targets_file(q_trim);
                     let score = if q_lower.is_empty() {
                         1u8
                     } else if name == q_trim
@@ -2964,7 +3077,7 @@ pub fn query_subcommand_json(
                     {
                         4
                     } else if name_lower.starts_with(&q_lower)
-                        || scoped_lower.ends_with(&format!("::{q_lower}"))
+                        || scoped_lower.ends_with(&colon_suffix)
                         || (targets_file && id_view.file.to_ascii_lowercase().contains(&q_lower))
                     {
                         3
@@ -3082,11 +3195,17 @@ pub fn query_subcommand_json(
             Ok(serde_json::to_string_pretty(&out).unwrap_or_else(|_| "[]".to_string()))
         }
         "type" => {
+            let targets_file = query_targets_file(q_trim);
             let mut items = Vec::new();
             for bundle_dir in bundles {
                 let content = load_index_table(bundle_dir, "types.tsv")?;
                 let bundle_name = bundle_name_from_dir(bundle_dir);
                 for line in content.lines().skip(1) {
+                    if !q_lower.is_empty()
+                        && !ascii_contains_ignore_case(line.as_bytes(), q_lower.as_bytes())
+                    {
+                        continue;
+                    }
                     let cols: Vec<&str> = line.split('\t').collect();
                     if cols.len() < 11 {
                         continue;
@@ -3098,7 +3217,6 @@ pub fn query_subcommand_json(
                     let name_lower = name.to_ascii_lowercase();
                     let scoped_lower = id_view.scoped.to_ascii_lowercase();
                     let fields_lower = fields.to_ascii_lowercase();
-                    let targets_file = query_targets_file(q_trim);
                     let score = if q_lower.is_empty() {
                         1u8
                     } else if name == q_trim || id_view.scoped == q_trim || type_id == q_trim {
@@ -3683,6 +3801,21 @@ mod tests {
         assert!(prefilter.may_match(value_row));
         let strong = MacroRowPrefilter::new(&q_hw, MacroScanMode::Strong);
         assert!(!strong.may_match(value_row));
+        // A peripheral-name needle must not admit unrelated macros: `GPIO` occurs in tens of
+        // thousands of STM32 `GPIO_*` rows that can never match the register half `MODER`.
+        assert!(!strong.may_match(
+            b"GPIO_PIN_0\tmacro\t1\t-\tsrc/gpio.c\t10\tdrvs\tfirst_party\t01-src\tPin mask"
+        ));
+        assert!(!strong.may_match(
+            b"GPIO_MODE_OUTPUT_PP\tmacro\t1\t-\tsrc/gpio.c\t10\tdrvs\tfirst_party\t01-src\tOutput mode"
+        ));
+        // ... while every row the scorer accepts through the register half stays admitted.
+        assert!(strong.may_match(
+            b"GPIOA_MODER\tmacro\t1\t-\tsrc/gpio.c\t10\tdrvs\tfirst_party\t01-src\tMode register"
+        ));
+        assert!(strong.may_match(
+            b"GPIO_MODER\tmacro\t1\t-\tsrc/gpio.c\t10\tdrvs\tfirst_party\t01-src\tMode register"
+        ));
         let hex = MacroRowPrefilter::new(&QueryHw::new("41C00004h"), MacroScanMode::Strong);
         assert!(!hex.may_match(
             b"USART1_CR1\tmacro\t0x0\t-\tsrc/usart.c\t10\tdrvs\tfirst_party\t01-src\tEnable bit"
@@ -3690,6 +3823,87 @@ mod tests {
         assert!(hex.may_match(
             b"REG_CTRL\tmmio_addr\t0x41C00004UL\t0x41C00004\tsrc/drv.c\t1\tdrvs\tfirst_party\t01-src\tMMIO"
         ));
+    }
+
+    /// A `macros.tsv` body at or above the parallel-scan threshold is split at newline boundaries
+    /// and scanned concurrently; the concatenated hits must be exactly the serial walk's rows in
+    /// the same order (the deterministic sort and row output depend on it).
+    #[test]
+    fn parallel_macro_scan_preserves_serial_row_order() {
+        let header = "name\tkind\tvalue_or_args\thex_addr\tfile\tline\tarch_layer\tscope\tsection_id\tdescription\n";
+        let filler = "FILLER_VALUE_0\tmacro\t0\t-\tsrc/f.c\t1\tother\tfirst_party\t01-s\tunused filler row padding padding padding padding\n";
+        let mut content = String::with_capacity(MACRO_PARALLEL_SCAN_BYTES + 2 * 1024 * 1024);
+        content.push_str(header);
+        let mut row = 0usize;
+        let mut probes = 0usize;
+        while content.len() < MACRO_PARALLEL_SCAN_BYTES + 1024 * 1024 {
+            row += 1;
+            // Place a match right after the header and then every ~10k rows, so matches straddle
+            // the chunk boundaries the parallel splitter picks.
+            if row == 1 || row.is_multiple_of(10_000) {
+                probes += 1;
+                content.push_str(&format!(
+                    "GPIO_MODER_V{row}\tmacro\t1\t-\tsrc/gpio.c\t{row}\tdrvs\tfirst_party\t01-s\tGPIO mode register\n"
+                ));
+            } else {
+                content.push_str(filler);
+            }
+        }
+        assert!(content.len() >= MACRO_PARALLEL_SCAN_BYTES);
+
+        let bytes = content.as_bytes();
+        let body_start = memchr::memchr(b'\n', bytes).expect("header newline") + 1;
+        let body = &bytes[body_start..];
+        let q_hw = QueryHw::new("GPIO_MODER");
+        let q_lower = "gpio_moder".to_string();
+        let prefilter = MacroRowPrefilter::new(&q_hw, MacroScanMode::Strong);
+        let bundle_dir = PathBuf::from("bundle");
+
+        let mut serial = Vec::new();
+        scan_macro_rows_chunk(
+            body,
+            &bundle_dir,
+            "demo",
+            &prefilter,
+            &q_hw,
+            &q_lower,
+            &mut serial,
+        );
+
+        let parts: Vec<Vec<MacroRow>> = macro_scan_bounds(body)
+            .par_iter()
+            .map(|&(start, end)| {
+                let mut chunk_hits = Vec::new();
+                scan_macro_rows_chunk(
+                    &body[start..end],
+                    &bundle_dir,
+                    "demo",
+                    &prefilter,
+                    &q_hw,
+                    &q_lower,
+                    &mut chunk_hits,
+                );
+                chunk_hits
+            })
+            .collect();
+        let parallel: Vec<MacroRow> = parts.into_iter().flatten().collect();
+
+        assert!(probes >= 4, "test data must contain several probe rows");
+        assert!(!serial.is_empty(), "serial scan must find the probe rows");
+        assert_eq!(
+            serial.len(),
+            parallel.len(),
+            "parallel scan must not add or drop rows"
+        );
+        for (serial_row, parallel_row) in serial.iter().zip(&parallel) {
+            assert_eq!(serial_row.raw, parallel_row.raw);
+            assert_eq!(serial_row.score, parallel_row.score);
+            assert_eq!(serial_row.line, parallel_row.line);
+        }
+        // Every newline-aligned chunk boundary lies on a row start (no split rows).
+        for &(start, _) in &macro_scan_bounds(body) {
+            assert!(start == 0 || body.get(start - 1) == Some(&b'\n'));
+        }
     }
 
     #[test]

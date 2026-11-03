@@ -936,29 +936,36 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
 
     // 1. Stat-only fast-path check against `meta.file_stamps` (zero source-file reads when clean)
     let mut pre_scanned: Option<(Vec<ScannedFile>, String)> = None;
+    // `cache/manifest.json` parsed by the artifact-integrity gate below, reused by the incremental
+    // branch instead of being read and parsed a second time.
+    let mut gate_manifest_opt: Option<CacheManifest> = None;
     if let Some(mut existing_meta) = existing_meta_opt.clone() {
         // The artifact-integrity gate and the stat walk are independent: run the gate on its own
-        // thread so its `cache/manifest.json` parse and `cache/` listing overlap the walk.
-        let (sc_opt, complete) = std::thread::scope(|scope| {
+        // thread so its `cache/manifest.json` parse and `cache/` listing overlap the walk. The gate
+        // hands its parsed manifest back so the incremental branch reuses it (one parse per run).
+        let (sc_opt, complete, manifest_opt) = std::thread::scope(|scope| {
             let artifacts = scope.spawn(|| {
-                scanner::bundle_artifacts_complete_with(
+                let manifest = scanner::load_cache_manifest(&config.output_dir);
+                let complete = scanner::bundle_artifacts_complete_with(
                     &config.output_dir,
                     scanner::BundleArtifactSources {
                         meta: Some(&existing_meta),
-                        manifest: None,
+                        manifest: manifest.as_ref(),
                         meta_attempted: true,
-                        manifest_attempted: false,
+                        manifest_attempted: true,
                     },
-                )
+                );
+                (complete, manifest)
             });
             let sc = scanner::stamp_check(
                 &config.repo_path,
                 &existing_meta.metadata,
                 config.max_file_bytes,
             );
-            let complete = artifacts.join().unwrap_or(false);
-            (sc, complete)
+            let (complete, manifest) = artifacts.join().unwrap_or((false, None));
+            (sc, complete, manifest)
         });
+        gate_manifest_opt = manifest_opt;
         if let Some(sc) = sc_opt {
             if sc.unchanged {
                 if complete {
@@ -1068,7 +1075,9 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
     // 3. Incremental AST parse & Structural Digest No-Op Short-Circuit (Bug 7)
     let t_parse = Instant::now();
     let prev_manifest_opt = if existing_meta_opt.is_some() {
-        scanner::load_cache_manifest(&config.output_dir)
+        gate_manifest_opt
+            .take()
+            .or_else(|| scanner::load_cache_manifest(&config.output_dir))
             .filter(|m| m.blueprint_hash == blueprint_hash && m.vendor_mode == config.vendor_mode)
     } else {
         None
@@ -1117,23 +1126,62 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                 }
             }
 
-            let (dirty_units, _, reparsed_count) = parser::parse_files_incremental_with_blueprint(
-                &dirty_files,
-                None,
-                blueprint_opt.as_ref().map(|(bp, _)| bp),
-            )?;
-
-            // Load the previous unit of every dirty file once: a packed shard may hold several
-            // dirty files, and the digest check, the digest-noop tier, and Tier 3 all need them.
-            let dirty_requests: Vec<(String, String)> = dirty_units
+            // Parse the dirty files while the clean shards load: the two jobs are independent, so
+            // a 1-file structural edit overlaps its (small) parse with the ~100 clean shard reads
+            // instead of paying for them one after the other.
+            let clean_requests: Vec<(String, String)> = clean_files
                 .iter()
-                .filter_map(|u| {
+                .filter_map(|file| {
+                    manifest
+                        .files
+                        .get(&file.rel_path)
+                        .map(|entry| (file.rel_path.clone(), entry.shard.clone()))
+                })
+                .collect();
+            let bp_ref = blueprint_opt.as_ref().map(|(bp, _)| bp);
+            let (dirty_parse, mut cached_units) = if !dirty_files.is_empty()
+                && !clean_requests.is_empty()
+            {
+                rayon::join(
+                    || parser::parse_files_incremental_with_blueprint(&dirty_files, None, bp_ref),
+                    || scanner::load_cache_units(&config.output_dir, &clean_requests),
+                )
+            } else {
+                (
+                    parser::parse_files_incremental_with_blueprint(&dirty_files, None, bp_ref),
+                    scanner::load_cache_units(&config.output_dir, &clean_requests),
+                )
+            };
+            let (dirty_units, _, reparsed_count) = dirty_parse?;
+
+            // The previous unit of a dirty file is needed only when its structural digest survived
+            // (digest-noop and coordinate-shift tiers compare old coordinates). A structural edit
+            // changes the digest, so the old shard read is skipped entirely on the common path.
+            let digests_preserved = !dirty_units.is_empty()
+                && dirty_units.iter().all(|u| {
                     manifest
                         .files
                         .get(&u.scanned.rel_path)
-                        .map(|entry| (u.scanned.rel_path.clone(), entry.shard.clone()))
-                })
-                .collect();
+                        .is_some_and(|entry| {
+                            !entry.structural_digest.is_empty()
+                                && entry.structural_digest == u.structural_digest()
+                        })
+                });
+            // Load the previous unit of every dirty file once: a packed shard may hold several
+            // dirty files, and the digest check, the digest-noop tier, and Tier 3 all need them.
+            let dirty_requests: Vec<(String, String)> = if digests_preserved {
+                dirty_units
+                    .iter()
+                    .filter_map(|u| {
+                        manifest
+                            .files
+                            .get(&u.scanned.rel_path)
+                            .map(|entry| (u.scanned.rel_path.clone(), entry.shard.clone()))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let mut old_dirty_units_by_path =
                 scanner::load_cache_units(&config.output_dir, &dirty_requests);
 
@@ -1245,17 +1293,8 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
             // A packed shard could not be read (missing/corrupt): fall through to the structural
             // path, which reparses and re-emits the whole bundle.
 
-            // Load clean shards (each packed shard once) and re-parse any missing shard seamlessly.
-            let requests: Vec<(String, String)> = clean_files
-                .iter()
-                .filter_map(|file| {
-                    manifest
-                        .files
-                        .get(&file.rel_path)
-                        .map(|entry| (file.rel_path.clone(), entry.shard.clone()))
-                })
-                .collect();
-            let mut cached_units = scanner::load_cache_units(&config.output_dir, &requests);
+            // The clean shards were already loaded at the top of this branch, in parallel with the
+            // dirty-file parse. Re-parse any missing/unreadable shard seamlessly.
             let mut cached_slots: Vec<Option<ParsedFileUnit>> =
                 Vec::with_capacity(clean_files.len());
             // Clean files whose shard is missing, unparsable, or does not match the live content
@@ -1283,7 +1322,6 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                 .iter()
                 .map(|file| file.rel_path.clone())
                 .collect();
-            let bp_ref = blueprint_opt.as_ref().map(|(bp, _)| bp);
             let reparsed: Vec<ParsedFileUnit> = to_reparse
                 .into_par_iter()
                 .map(|file| {
@@ -1611,56 +1649,68 @@ pub fn auto_refresh_bundles(bundles: &[PathBuf]) -> Result<usize> {
 
     for bundle_dir in bundles {
         let meta_opt = scanner::load_meta_file(bundle_dir);
-        // Parse `cache/manifest.json` at most once per bundle per command: the same parsed
-        // manifest drives the cache gate, the artifact-integrity gate, and `repo_root` recovery.
-        let manifest_opt = scanner::load_cache_manifest(bundle_dir);
-        let manifest_any = if manifest_opt.is_none() {
-            scanner::load_cache_manifest_any_version(bundle_dir)
+        let stamps_present = meta_opt
+            .as_ref()
+            .is_some_and(|mf| !mf.metadata.file_stamps.is_empty());
+
+        // Resolve the bundle's source root. `meta.json` is authoritative; when it is missing or
+        // truncated, `cache/manifest.json` (any schema version) recovers the same fields.
+        let (source_root_str, vendor_mode, repo_name) = if let Some(ref mf) = meta_opt {
+            (
+                mf.metadata.source_root.clone(),
+                mf.metadata.vendor_mode,
+                mf.metadata.repo_name.clone(),
+            )
         } else {
-            None
-        };
-        let (source_root_str, vendor_mode, repo_name, file_stamps_empty) =
-            if let Some(ref mf) = meta_opt {
-                (
-                    mf.metadata.source_root.clone(),
-                    mf.metadata.vendor_mode,
-                    mf.metadata.repo_name.clone(),
-                    mf.metadata.file_stamps.is_empty(),
-                )
-            } else if let Some(manifest) = manifest_opt.as_ref().or(manifest_any.as_ref()) {
-                let name = bundle_dir
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("repo")
-                    .to_string();
-                (manifest.repo_root.clone(), manifest.vendor_mode, name, true)
-            } else {
+            let Some(manifest) = scanner::load_cache_manifest(bundle_dir)
+                .or_else(|| scanner::load_cache_manifest_any_version(bundle_dir))
+            else {
                 continue;
             };
+            let name = bundle_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("repo")
+                .to_string();
+            (manifest.repo_root.clone(), manifest.vendor_mode, name)
+        };
         let source_path = Path::new(&source_root_str);
         if !source_path.is_dir() {
             continue;
         }
 
-        // Fast-path: check `meta.file_stamps` directly from `meta.json` (~2 KB) without loading
-        // the multi-megabyte `cache.json` when no source files have changed (Issue #41).
-        let needs_refresh = if manifest_opt.is_none()
-            || file_stamps_empty
-            || !scanner::bundle_artifacts_complete_with(
-                bundle_dir,
-                scanner::BundleArtifactSources {
-                    meta: meta_opt.as_ref(),
-                    manifest: manifest_opt.as_ref(),
-                    meta_attempted: meta_opt.is_some(),
-                    manifest_attempted: manifest_opt.is_some(),
-                },
-            ) {
+        // Fast-path: check `meta.file_stamps` directly from `meta.json` without loading the
+        // multi-megabyte `cache.json` when no source files have changed (Issue #41). The
+        // artifact-integrity gate and the stat walk are independent, so an auto-sync query runs
+        // them concurrently: on STM32CubeF4 the `cache/manifest.json` parse (~2.5 MB) and the
+        // 12k-file walk each take tens of milliseconds, and the query should pay the larger of
+        // the two instead of their sum.
+        let needs_refresh = if !stamps_present {
+            // A missing `meta.json`/file stamps always rebuilds; only the source root recovery
+            // above needs the manifest, so no artifact gate is required here.
             true
         } else if let Some(ref mf) = meta_opt {
             let meta = &mf.metadata;
-            if let Some(count) =
-                scanner::check_meta_files_changed(source_path, meta, DEFAULT_MAX_FILE_BYTES)
-            {
+            let (changed, complete) = std::thread::scope(|scope| {
+                let artifacts = scope.spawn(|| {
+                    let manifest = scanner::load_cache_manifest(bundle_dir);
+                    scanner::bundle_artifacts_complete_with(
+                        bundle_dir,
+                        scanner::BundleArtifactSources {
+                            meta: meta_opt.as_ref(),
+                            manifest: manifest.as_ref(),
+                            meta_attempted: true,
+                            manifest_attempted: true,
+                        },
+                    )
+                });
+                let changed =
+                    scanner::check_meta_files_changed(source_path, meta, DEFAULT_MAX_FILE_BYTES);
+                (changed, artifacts.join().unwrap_or(false))
+            });
+            if !complete {
+                true
+            } else if let Some(count) = changed {
                 count > 0
             } else if let Some(mut cache) = scanner::load_cache_file(bundle_dir) {
                 if cache.fingerprint.is_empty() {

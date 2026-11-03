@@ -895,16 +895,21 @@ pub fn emit_bundle(
     //    rotational disk (they only add seeks), and the CPU-side formatting is cheap next to the
     //    I/O. Incremental syncs rebuild the same files concurrently instead (see below).
     let parallel_tables = index_tables_parallelizable(&index_dir);
+    // The cache manifest and `.claudeignore` are independent of the tables/docs, so an incremental
+    // sync emits them inside the same thread scope. `--single-file` keeps them on the ordered tail
+    // because its combined Markdown is assembled after the shards.
     if parallel_tables {
         // Incremental sync: every table already exists and fits in memory, so it is re-rendered
         // in memory and compared against the file on disk. Their (pure CPU) formatting is
         // independent of each other, of the Markdown docs, and of the linked-graph state, so
         // concurrent rebuilds keep it off the critical path. Cold builds and large corpora keep
         // the single ordered stream, where disk seeks dominate.
+        let mut tail: Option<Result<bool>> = None;
         std::thread::scope(|scope| -> Result<()> {
             let xref = scope.spawn(|| write_xref_tsv_in_memory(&index_dir, indexes));
             let calls = scope.spawn(|| write_calls_tsv_in_memory(&index_dir, indexes));
-            let small = scope.spawn(|| write_small_tsv_files(&index_dir, indexes));
+            let symbols = scope.spawn(|| write_symbols_tsv_in_memory(&index_dir, indexes));
+            let small = scope.spawn(|| write_other_small_tsv_files(&index_dir, indexes));
             let docs = scope.spawn(|| {
                 write_index_and_sections(
                     config,
@@ -921,13 +926,35 @@ pub fn emit_bundle(
                     build_graph_state(indexes, &metadata.fingerprint, metadata.vendor_mode);
                 emit_graph_state(output_dir, &graph_state)
             });
+            let parallel_tail = !config.single_file;
+            let cache = parallel_tail.then(|| {
+                scope.spawn(|| emit_cache_source(config, metadata, blueprint_hash, &cache_source))
+            });
+            let ignore = parallel_tail
+                .then(|| scope.spawn(|| ensure_claudeignore_entry(&config.repo_path, output_dir)));
             join_emit_worker(xref.join(), &index_dir)??;
             join_emit_worker(calls.join(), &index_dir)??;
+            join_emit_worker(symbols.join(), &index_dir)??;
             join_emit_worker(small.join(), &index_dir)??;
             join_emit_worker(docs.join(), &index_dir)??;
             join_emit_worker(graph.join(), &index_dir)??;
+            if let (Some(cache), Some(ignore)) = (cache, ignore) {
+                join_emit_worker(cache.join(), output_dir)??;
+                let updated = ignore.join().map_err(|_| {
+                    ChipsrcError::io(
+                        output_dir,
+                        std::io::Error::other("bundle emitter worker thread panicked"),
+                    )
+                })??;
+                tail = Some(Ok(updated));
+            }
             Ok(())
         })?;
+        if let Some(updated) = tail {
+            // `--single-file` is off in this branch: the cache manifest and `.claudeignore` were
+            // the only remaining artifacts, so the bundle is complete.
+            return updated;
+        }
     } else {
         // Cold build: the table stream is bandwidth-bound while `sections/*.md` creation is
         // latency-bound (1,500+ small files), so the doc shards run on a second thread alongside
@@ -978,22 +1005,13 @@ pub fn emit_bundle(
     }
 
     // The per-file AST cache is already on disk (the caller joined its writer and dropped the
-    // parsed units), so only the manifest derivation remains.
-    match cache_source {
-        CacheShardSource::Prewritten(cache) => {
-            emit_cache_manifest_for_prewritten(config, metadata, blueprint_hash, cache)?
-        }
-        CacheShardSource::Units(units) => emit_cache_shards_for_units(
-            config,
-            metadata,
-            units,
-            blueprint_hash,
-            &FxHashMap::default(),
-        )?,
-    }
+    // parsed units), so only the manifest derivation remains. (Reached for cold builds and for
+    // `--single-file`; the incremental parallel path above already emitted both artifacts.)
+    emit_cache_source(config, metadata, blueprint_hash, &cache_source)?;
 
     // Ensure .claudeignore entry (only when output_dir is inside repo_path)
-    ensure_claudeignore_entry(&config.repo_path, output_dir)
+    let claudeignore_updated = ensure_claudeignore_entry(&config.repo_path, output_dir)?;
+    Ok(claudeignore_updated)
 }
 
 /// Builds the compact linked-graph state persisted at `cache/graph_state.json`.
@@ -1499,12 +1517,40 @@ fn write_small_tsv_files(index_dir: &Path, indexes: &BundleIndexes) -> Result<()
         append_section_row,
         false,
     )?;
+    write_symbols_tsv(index_dir, indexes)?;
+    write_other_small_tsv_files(index_dir, indexes)
+}
+
+/// Rebuilds `index/symbols.tsv` in memory with parallel row formatting (incremental syncs).
+///
+/// `symbols.tsv` is the largest of the four "small" tables (hundreds of kilobytes even on a
+/// medium repository), so the incremental path gives it its own scoped thread instead of queueing
+/// it behind `sections`/`types`/`macros`.
+fn write_symbols_tsv_in_memory(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
+    let bytes = build_table_bytes(SYMBOLS_TSV_HEADER, &indexes.symbols, append_symbol_row);
+    write_bytes_atomic(&index_dir.join("symbols.tsv"), &bytes)
+}
+
+/// Streams `index/symbols.tsv` (cold builds).
+fn write_symbols_tsv(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
     write_index_table(
         &index_dir.join("symbols.tsv"),
         SYMBOLS_TSV_HEADER,
         &indexes.symbols,
         append_symbol_row,
         true,
+    )
+}
+
+/// Writes `index/sections.tsv`, `index/types.tsv`, and `index/macros.tsv` (the incremental path's
+/// non-symbol tables, which are small enough to share one worker).
+fn write_other_small_tsv_files(index_dir: &Path, indexes: &BundleIndexes) -> Result<()> {
+    write_index_table(
+        &index_dir.join("sections.tsv"),
+        SECTIONS_TSV_HEADER,
+        &indexes.sections,
+        append_section_row,
+        false,
     )?;
     write_index_table(
         &index_dir.join("types.tsv"),
@@ -1541,7 +1587,10 @@ fn write_index_and_sections(
     // Section shards are independent small files, but on a rotational disk concurrent writers lose
     // more to head thrashing than they gain from parallelism (measured: ~8.6 s with two parallel
     // streams vs ~3 s serial for 1.5k shards). One ordered stream keeps the head moving forward.
-    for shard in sections {
+    // An incremental sync of a small/medium bundle is the exception: its shards already exist, so
+    // every write is a small content compare that is latency-bound, and a handful of concurrent
+    // compares finish in one disk round trip.
+    let write_shard = |shard: &SectionShard| -> Result<()> {
         let rel_md = shard
             .summary
             .md_file
@@ -1551,7 +1600,14 @@ fn write_index_and_sections(
             &sections_dir.join(rel_md),
             shard.markdown_body.as_bytes(),
             !existing_md.contains(rel_md),
-        )?;
+        )
+    };
+    if !existing_md.is_empty() && sections.len() <= 128 {
+        sections.par_iter().try_for_each(write_shard)?;
+    } else {
+        for shard in sections {
+            write_shard(shard)?;
+        }
     }
     Ok(())
 }
@@ -2140,10 +2196,21 @@ impl CacheShardWriter {
                 None => pending.push(unit),
             }
         }
-        let mut packets: Vec<CacheShardPacket> = pending
-            .par_iter()
-            .filter_map(|unit| prepare_cache_shard(unit))
-            .collect();
+        // A handful of shards (the incremental-edit steady state: one rewritten file plus a few
+        // unreadable ones) is cheaper to serialize inline than to fan out to a rayon pool, which
+        // would dispatch work to OS threads for less than the dispatch costs.
+        const SERIAL_SERIALIZE_LIMIT: usize = 8;
+        let mut packets: Vec<CacheShardPacket> = if pending.len() <= SERIAL_SERIALIZE_LIMIT {
+            pending
+                .iter()
+                .filter_map(|unit| prepare_cache_shard(unit))
+                .collect()
+        } else {
+            pending
+                .par_iter()
+                .filter_map(|unit| prepare_cache_shard(unit))
+                .collect()
+        };
         if packets.len() != pending.len() {
             // Every unit must have a shard on disk: the manifest is emitted from these identities
             // after the parsed units are dropped, so a missing shard would silently drop the file.
@@ -2272,12 +2339,20 @@ pub fn write_cache_shards_for_units_with_policy(
     vendor_mode: VendorMode,
     policy: &CacheShardWritePolicy,
 ) -> Result<PrewrittenCache> {
+    let mut effective_policy = policy.clone();
+    // The dedicated pool exists so a large structural rebuild's cache serialization never queues
+    // behind the main thread's global rayon jobs. A small repository uses the per-file shard
+    // layout with a tiny batch, where spawning the pool's OS threads costs more than the work.
+    if effective_policy.background_writer && units.len() <= crate::model::CACHE_PACK_FILE_THRESHOLD
+    {
+        effective_policy.background_writer = false;
+    }
     let mut writer = CacheShardWriter::new_with_policy(
         output_dir,
         schema_version,
         blueprint_hash,
         vendor_mode,
-        policy,
+        &effective_policy,
     )?;
     let mut available: FxHashMap<String, PrewrittenShard> =
         FxHashMap::with_capacity_and_hasher(units.len(), Default::default());
@@ -2462,6 +2537,30 @@ pub fn emit_cache_shards_for_units(
         prewritten,
         &state,
     )
+}
+
+/// Emits the per-file AST cache artifacts for whichever [`CacheShardSource`] the caller holds.
+///
+/// `emit_bundle` calls this either on the ordered tail or inside the parallel sync scope, so it is
+/// a plain function rather than a match at the call site.
+fn emit_cache_source(
+    config: &ConvertConfig,
+    metadata: &RepoMetadata,
+    blueprint_hash: &str,
+    cache_source: &CacheShardSource<'_>,
+) -> Result<()> {
+    match cache_source {
+        CacheShardSource::Prewritten(cache) => {
+            emit_cache_manifest_for_prewritten(config, metadata, blueprint_hash, cache)
+        }
+        CacheShardSource::Units(units) => emit_cache_shards_for_units(
+            config,
+            metadata,
+            units,
+            blueprint_hash,
+            &FxHashMap::default(),
+        ),
+    }
 }
 
 /// Emits `cache/manifest.json` for shards that [`write_cache_shards_for_units`] already put on
@@ -4669,6 +4768,10 @@ mod tests {
 
     /// SYNC-SCRUT-001 (round 2): a held lock keeps its file handle open without delete sharing, so
     /// another reclaimer cannot unlink the live file even when its mtime looks stale.
+    ///
+    /// Windows-only: this exercises NTFS's mandatory sharing semantics. On Unix a held-but-unlocked
+    /// file can always be unlinked, so the test would assert the opposite of the platform's rules.
+    #[cfg(windows)]
     #[test]
     fn bundle_lock_held_handle_blocks_stale_unlink() {
         let tmp = TestTempDir::new("bundle_lock_held_handle");

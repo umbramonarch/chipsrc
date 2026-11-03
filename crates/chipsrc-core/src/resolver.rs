@@ -27,26 +27,35 @@ pub fn collect_symbol_tables(
     let type_count: usize = units.iter().map(|u| u.types.len()).sum();
     let macro_count: usize = units.iter().map(|u| u.macros.len()).sum();
 
-    // Deep-cloning ~1.7M owned rows is allocation-bound, so clone in parallel batches and append
-    // in unit order. The batch bounds the temporarily duplicated memory while keeping the result
-    // identical to a serial clone (order follows `units`).
+    // Deep-cloning ~1.7M owned rows is allocation-bound on a large corpus, so above a small
+    // threshold clone in parallel batches and append in unit order. Below it the batch bookkeeping
+    // (and its temporary copies) costs more than the clone itself, so append directly.
     const COLLECT_BATCH: usize = 512;
+    const PARALLEL_COLLECT_MIN_UNITS: usize = 256;
     let mut symbols: Vec<ExtractedSymbol> = Vec::with_capacity(symbol_count);
     let mut types: Vec<ExtractedType> = Vec::with_capacity(type_count);
     let mut macros: Vec<ExtractedMacro> = Vec::with_capacity(macro_count);
-    for batch in units.chunks(COLLECT_BATCH) {
-        let parts: Vec<(
-            Vec<ExtractedSymbol>,
-            Vec<ExtractedType>,
-            Vec<ExtractedMacro>,
-        )> = batch
-            .par_iter()
-            .map(|u| (u.symbols.clone(), u.types.clone(), u.macros.clone()))
-            .collect();
-        for (mut batch_symbols, mut batch_types, mut batch_macros) in parts {
-            symbols.append(&mut batch_symbols);
-            types.append(&mut batch_types);
-            macros.append(&mut batch_macros);
+    if units.len() <= PARALLEL_COLLECT_MIN_UNITS {
+        for unit in units {
+            symbols.extend_from_slice(&unit.symbols);
+            types.extend_from_slice(&unit.types);
+            macros.extend_from_slice(&unit.macros);
+        }
+    } else {
+        for batch in units.chunks(COLLECT_BATCH) {
+            let parts: Vec<(
+                Vec<ExtractedSymbol>,
+                Vec<ExtractedType>,
+                Vec<ExtractedMacro>,
+            )> = batch
+                .par_iter()
+                .map(|u| (u.symbols.clone(), u.types.clone(), u.macros.clone()))
+                .collect();
+            for (mut batch_symbols, mut batch_types, mut batch_macros) in parts {
+                symbols.append(&mut batch_symbols);
+                types.append(&mut batch_types);
+                macros.append(&mut batch_macros);
+            }
         }
     }
     symbols.sort_by(|a, b| {
@@ -124,25 +133,41 @@ pub fn resolve_and_link(
         file_languages.insert(unit.scanned.rel_path.as_str(), unit.scanned.language);
     }
 
-    // Precompute normalized path metadata and language per symbol once across all units
-    let sym_files: Vec<PrecomputedSymFile> = symbols
-        .iter()
-        .map(|sym| {
-            let def_norm = sym.file.replace('\\', "/");
-            let def_stem = Path::new(&def_norm)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let def_without_ext = strip_source_extension(&def_norm);
-            let language = resolve_file_language(sym.file.as_str(), &file_languages);
-            PrecomputedSymFile {
-                def_without_ext,
-                def_stem,
-                language,
+    // Normalizing a defining path (`\`->`/`, stem, extension, language) is per *file*, while the
+    // symbol table has one row per declaration. Compute the metadata once per distinct file and
+    // map every symbol to its file's entry, so a header with hundreds of declarations pays one
+    // normalization instead of hundreds.
+    let mut file_meta: FxHashMap<&str, usize> = FxHashMap::default();
+    let mut file_entries: Vec<PrecomputedSymFile> = Vec::new();
+    let mut per_symbol: Vec<usize> = Vec::with_capacity(symbols.len());
+    for sym in &symbols {
+        let file_idx = match file_meta.get(sym.file.as_str()) {
+            Some(&idx) => idx,
+            None => {
+                let def_norm = sym.file.replace('\\', "/");
+                let def_stem = Path::new(&def_norm)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let def_without_ext = strip_source_extension(&def_norm);
+                let language = resolve_file_language(sym.file.as_str(), &file_languages);
+                let idx = file_entries.len();
+                file_entries.push(PrecomputedSymFile {
+                    def_without_ext,
+                    def_stem,
+                    language,
+                });
+                file_meta.insert(sym.file.as_str(), idx);
+                idx
             }
-        })
-        .collect();
+        };
+        per_symbol.push(file_idx);
+    }
+    let sym_files = SymFileIndex {
+        files: file_entries,
+        per_symbol,
+    };
 
     let per_unit_results: Vec<(Vec<ResolvedCallEdge>, Vec<XrefEntry>, bool)> = units
         .par_iter()
@@ -200,7 +225,7 @@ pub fn resolve_and_link(
                 candidate_indices.clear();
                 if let Some(indices) = candidates {
                     candidate_indices.extend(indices.iter().copied().filter(|&idx| {
-                        languages_compatible(Some(unit_language), sym_files[idx].language)
+                        languages_compatible(Some(unit_language), sym_files.of(idx).language)
                     }));
                 }
 
@@ -278,7 +303,7 @@ pub fn resolve_and_link(
                 candidate_indices.extend(candidates.iter().copied().filter(|&idx| {
                     let sym = &symbols[idx];
                     !(sym.file == rx.file && rx.line == sym.start_line)
-                        && languages_compatible(Some(unit_language), sym_files[idx].language)
+                        && languages_compatible(Some(unit_language), sym_files.of(idx).language)
                 }));
                 if candidate_indices.is_empty() {
                     continue;
@@ -537,11 +562,25 @@ pub fn resolve_and_link(
     (symbols, types, macros, calls, xrefs, vendor_surface)
 }
 
-/// Precomputed path metadata and language for a defined symbol.
+/// Precomputed path metadata and language for a defined symbol's file.
 struct PrecomputedSymFile {
     def_without_ext: String,
     def_stem: String,
     language: Option<LanguageKind>,
+}
+
+/// Per-symbol view over [`PrecomputedSymFile`]: one entry per distinct defining file plus the
+/// symbol-index -> file-index map.
+struct SymFileIndex {
+    files: Vec<PrecomputedSymFile>,
+    per_symbol: Vec<usize>,
+}
+
+impl SymFileIndex {
+    #[inline]
+    fn of(&self, symbol_idx: usize) -> &PrecomputedSymFile {
+        &self.files[self.per_symbol[symbol_idx]]
+    }
 }
 
 /// Precomputed normalized path metadata for a single import statement within a caller file.
@@ -616,7 +655,7 @@ fn resolve_callee_candidates(
     imports: &[PrecomputedImport<'_>],
     candidate_indices: &[usize],
     symbols: &[ExtractedSymbol],
-    sym_files: &[PrecomputedSymFile],
+    sym_files: &SymFileIndex,
 ) -> (String, ResolutionTier) {
     let caller_file = caller.file;
     let caller_section_id = caller.section_id;
@@ -751,7 +790,7 @@ fn resolve_callee_candidates(
             // Unqualified call cannot invoke a method of an unrelated type across files.
             continue;
         }
-        if let Some(score) = match_import_for_candidate(callee_name, &sym_files[idx], imports) {
+        if let Some(score) = match_import_for_candidate(callee_name, sym_files.of(idx), imports) {
             import_matches.push((score, idx));
         }
     }
@@ -1943,7 +1982,7 @@ fn is_external_module_qualifier(
     qualifier: &str,
     imports: &[PrecomputedImport<'_>],
     candidate_indices: &[usize],
-    sym_files: &[PrecomputedSymFile],
+    sym_files: &SymFileIndex,
 ) -> bool {
     let leaf = qualifier_leaf(qualifier);
     if leaf.is_empty() {
@@ -1956,7 +1995,7 @@ fn is_external_module_qualifier(
         }
         let references_repo_file = candidate_indices
             .iter()
-            .any(|&idx| import_references_file(imp, &sym_files[idx]));
+            .any(|&idx| import_references_file(imp, sym_files.of(idx)));
         if !references_repo_file {
             return true;
         }

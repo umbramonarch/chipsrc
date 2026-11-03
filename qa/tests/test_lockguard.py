@@ -8,6 +8,7 @@ the fresh replacement and refuse every other contender instead of leaving two li
 """
 from pathlib import Path
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -183,6 +184,7 @@ class LargeConvertLockTest(unittest.TestCase):
         owner_a.release()
         self.assertFalse(self.lock_path.exists(), "A's release must clear the guard")
 
+    @unittest.skipUnless(os.name == "nt", "Windows NTFS handle-locking semantics")
     def test_live_owner_handle_blocks_stale_displacement(self) -> None:
         """A reclaimer that believes A is stale must still fail while A's handle is open."""
         owner_a = self._guard(owner="A")
