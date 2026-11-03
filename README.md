@@ -124,7 +124,22 @@ chipsrc section "drvs" --show
 # 10. Parallel SIMD + Regex search across all indexed bundles
 chipsrc search "BLAKE3" --compact
 chipsrc search "GPIO" --kind macros -i
+
+# 11. Deterministic BM25 concept search (`--kind concept`; also the automatic multi-token fallback)
+chipsrc search "vendor mode" --kind concept --json --no-sync
+chipsrc search "strongly connected cycles tarjan" --json   # zero literal hits -> concept ranking
 ```
+
+Concept search scores the rows of `index/symbols.tsv`, `index/types.tsv`, and `index/macros.tsv`
+per query (no persisted index, no new dependencies). Identifiers are split on `snake_case`,
+`camelCase`, and acronym boundaries (`VendorMode` -> `vendor` + `mode`), lowercased, filtered for
+1-character tokens and common stopwords, and lightly stemmed (`s`/`es`/`ed`/`ing`). Fields are
+weighted name x3, docstring x2, and signature/fields/value plus file stem x1; BM25 uses `k1=1.2`,
+`b=0.75`, and the score is multiplied by `(matched_terms / |Q|)^2` so rows matching more query
+words rank first, tie-breaking on pagerank and then row id. A multi-token `search` with zero
+literal/regex hits falls back to the same ranking automatically; pass `--source` (or
+`--kind source`) to search raw text only and disable the fallback. Queries whose tokens match no
+row still return `[]`.
 
 ---
 

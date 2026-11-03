@@ -1994,8 +1994,9 @@ fn test_invalid_utf8_and_unicode_sources_never_panic() {
         .iter()
         .any(|rs| rs.symbol.name == "qa_unicode_snow" && rs.symbol.start_line == 3));
 
-    // Unicode search (regex, literal, and the reserved `concept` kind) must never panic and must
-    // be deterministic across repeated calls.
+    // Unicode search (regex, literal, and BM25 `concept`) must never panic and must be
+    // deterministic across repeated calls. The concept tokens are absent from the index
+    // metadata (name/doc/signature fields), so the ranked pass stays empty.
     let first = chipsrc_core::query::parallel_bundle_search(
         std::slice::from_ref(&out),
         "\u{2603} \u{4e2d}\u{6587} w\u{f6}rld",

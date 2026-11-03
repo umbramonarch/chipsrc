@@ -1355,3 +1355,50 @@ fn noise_probe_rules_end_to_end() {
         "pruned call must not leave an xref row behind"
     );
 }
+
+/// End-to-end BM25 concept search on a converted bundle: snake_case sub-token ranking, the
+/// automatic multi-token fallback, `--source` gating, and nonsense-query emptiness.
+#[test]
+fn concept_search_ranks_sub_tokens_and_gates_fallback_on_converted_repo() {
+    let base = TestTempDir::new("concept_e2e");
+    let repo_dir = base.0.join("synth_concept");
+    let bundle_dir = base.0.join("bundle");
+    create_synthetic_repo(&repo_dir);
+    let cfg = ConvertConfig::new(repo_dir, bundle_dir.clone());
+    convert_repo(&cfg).expect("convert synthetic repo");
+    let bundles = vec![bundle_dir];
+
+    // `motor_set_duty` sub-tokens (motor, set, duty) must rank through the concept index even
+    // though the spaced phrase never appears in the TSV rows or the sources.
+    let concept = parallel_bundle_search(&bundles, "motor set duty", "concept", false, 10)
+        .expect("concept search");
+    assert!(
+        concept
+            .iter()
+            .take(5)
+            .any(|h| h.snippet.starts_with("motor_set_duty — ")),
+        "expected motor_set_duty in the top 5: {concept:?}"
+    );
+    assert!(concept
+        .iter()
+        .all(|h| matches!(h.kind.as_str(), "symbol" | "type" | "macro")));
+
+    let fallback = parallel_bundle_search(&bundles, "motor set duty", "all", false, 10)
+        .expect("concept fallback");
+    assert_eq!(
+        fallback, concept,
+        "zero-hit literal queries fall back to BM25"
+    );
+
+    assert!(
+        parallel_bundle_search(&bundles, "motor set duty", "source", false, 10)
+            .expect("source gating")
+            .is_empty()
+    );
+    assert!(
+        parallel_bundle_search(&bundles, "quuxblorp wibbleflop", "all", false, 10)
+            .expect("nonsense query")
+            .is_empty(),
+        "nonsense multi-token queries must stay empty"
+    );
+}

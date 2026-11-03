@@ -6,6 +6,14 @@ All notable changes to this project are listed here. Versions follow
 
 ## [Unreleased]
 
+### Added
+
+- **Deterministic BM25 Concept Search (`query.rs`, `main.rs` CLI help, README)**:
+  - `search --kind concept "<words>"` ranks the rows of `index/symbols.tsv`, `index/types.tsv`, and `index/macros.tsv` with BM25 (`k1=1.2`, `b=0.75`) over camelCase / snake_case / acronym sub-tokens (`VendorMode` -> `vendor` + `mode`, `parseHTTPRequest` -> `parse` + `http` + `request`). `query::tokenize_concept` lowercases, drops 1-character tokens and a small stopword list, and applies light suffix stemming (`s`, `es`, `ed`, `ing`). Fields are weighted name x3, docstring x2, signature/fields/value and file stem x1; the score is multiplied by `(matched_terms / |Q|)^2` and ties break on pagerank then row id. Snippets are `name — signature/doc`, hits map to the source TSV row coordinates, and `--limit` / `-n` clamp the ranked list.
+  - Multi-token `search` queries that produce zero literal/regex hits (index tables and the raw-source fallback) retry automatically as a concept query; `--source` / `--kind source` disable the fallback. Nonsense multi-token queries and single-token zero-hit queries still return `[]`.
+  - No persisted index, no new dependencies, and recomputed per query: on the `chipsrc` bundle a three-word concept query (`--kind concept`, `--json`, `--no-sync`) has a ~25 ms wall median (~13 ms above `chipsrc --version` spawn overhead, budget < 30 ms), with byte-identical output across repeated runs and independent bundle rebuilds. Existing literal/regex results are deep-equal to the previous binary across the 12 comparison queries on the chipsrc, smart_locker, and volt_website bundles.
+  - Tests: tokenizer (camel/acronym/snake/stem/stopword/unicode), ranking and pagerank/id tie-breaks, determinism, limit clamping, nonsense emptiness, fallback gating (`--kind all` vs `source`) on a fixture bundle, literal-hits-are-not-augmented, plus an end-to-end converted-repo concept test.
+
 ### Performance
 
 - **Sub-Second Sync Budgets, Auto-Sync Query Latency & Serial Small-Repo Emit (`query.rs`, `lib.rs`, `emitter.rs`, `resolver.rs`)**:

@@ -2075,6 +2075,14 @@ pub fn parallel_bundle_search(
     ignore_case: bool,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
+    let k = kind.trim().to_ascii_lowercase();
+
+    // P2.3: `--kind concept` is a ranked BM25 pass over the symbol/type/macro tables, so it
+    // bypasses regex compilation entirely (an unbalanced pattern is still a valid concept query).
+    if k == "concept" || k == "concepts" {
+        return concept_search(bundles, pattern, limit);
+    }
+
     // Issue #28: Fall back to literal escaped regex when `pattern` has unclosed regex metacharacters
     // such as `"fn("` or `"ARR["`.
     let re = match RegexBuilder::new(pattern)
@@ -2109,7 +2117,6 @@ pub fn parallel_bundle_search(
         }
     };
 
-    let k = kind.trim().to_ascii_lowercase();
     let search_source_explicit = k.starts_with("src") || k.starts_with("source") || k == "code";
     let search_syms = !search_source_explicit && (k == "all" || k.starts_with("sym"));
     let search_types = !search_source_explicit && (k == "all" || k.starts_with("typ"));
@@ -2388,7 +2395,436 @@ pub fn parallel_bundle_search(
         }
     }
 
+    // P2.3: A multi-token query that produced zero literal/regex hits (in the index tables and the
+    // raw source fallback) is retried as a ranked BM25 concept query. `--source` / `--kind source`
+    // callers asked for raw text, so they never get concept results.
+    if all_hits.is_empty() && !search_source_explicit && concept_query_terms(pattern).len() >= 2 {
+        all_hits = concept_search(bundles, pattern, limit)?;
+    }
+
     Ok(all_hits)
+}
+
+/// Stopwords dropped from concept-query and document tokens.
+const CONCEPT_STOPWORDS: [&str; 37] = [
+    "a", "an", "and", "any", "are", "as", "at", "be", "been", "but", "by", "do", "does", "for",
+    "from", "if", "in", "into", "is", "it", "no", "not", "of", "on", "or", "per", "so", "such",
+    "than", "that", "the", "then", "this", "to", "via", "was", "with",
+];
+
+/// BM25 term-frequency saturation and length-normalization constants.
+const CONCEPT_BM25_K1: f64 = 1.2;
+const CONCEPT_BM25_B: f64 = 0.75;
+
+/// Upper bound (in characters) for a concept hit snippet.
+const CONCEPT_SNIPPET_MAX_CHARS: usize = 160;
+
+/// Splits `text` into lowercase BM25 concept terms.
+///
+/// Tokens are separated on non-alphanumerics (`snake_case`, punctuation) and on camelCase /
+/// PascalCase boundaries, including acronym runs (`parseHTTPRequest` -> `parse`, `http`,
+/// `request`; `VendorMode` -> `vendor`, `mode`). 1-character tokens and a small English stopword
+/// list are dropped, and a light suffix stemmer (`ing`, `ed`, plural `es`/`s`) collapses
+/// inflections so `digesting`, `digested`, and `digests` all index as `digest`.
+pub fn tokenize_concept(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for word in text.split(|c: char| !c.is_alphanumeric()) {
+        if word.is_empty() {
+            continue;
+        }
+        let mut chars = word.char_indices().peekable();
+        let mut start = 0usize;
+        let mut previous: Option<char> = None;
+        while let Some((byte_idx, current)) = chars.next() {
+            if let Some(prev) = previous {
+                let next = chars.peek().map(|(_, next)| *next);
+                let split = (prev.is_lowercase() && current.is_uppercase())
+                    || (prev.is_uppercase()
+                        && current.is_uppercase()
+                        && next.is_some_and(char::is_lowercase));
+                if split {
+                    push_concept_token(&word[start..byte_idx], &mut tokens);
+                    start = byte_idx;
+                }
+            }
+            previous = Some(current);
+        }
+        push_concept_token(&word[start..], &mut tokens);
+    }
+    tokens
+}
+
+fn push_concept_token(raw: &str, out: &mut Vec<String>) {
+    if raw.chars().nth(1).is_none() {
+        return;
+    }
+    if CONCEPT_STOPWORDS
+        .iter()
+        .any(|stopword| raw.eq_ignore_ascii_case(stopword))
+    {
+        return;
+    }
+    out.push(stem_concept_term(raw.to_lowercase()));
+}
+
+fn stem_concept_term(mut token: String) -> String {
+    // Suffix stripping is iterated so forms like `strings` (plural `s` -> `ing`) converge on the
+    // same stem as `string`; each round shortens the token, so four rounds are always enough.
+    for _ in 0..4 {
+        match concept_suffix_keep_len(&token) {
+            Some(keep) => token.truncate(keep),
+            None => break,
+        }
+    }
+    token
+}
+
+/// Returns the byte length the token keeps when a light suffix is stripped, if any.
+fn concept_suffix_keep_len(token: &str) -> Option<usize> {
+    if token.chars().count() < 4 {
+        return None;
+    }
+    for suffix in ["ing", "ed"] {
+        if let Some(stem) = token.strip_suffix(suffix) {
+            if stem.chars().count() >= 3 {
+                return Some(stem.len());
+            }
+        }
+    }
+    if let Some(stem) = token.strip_suffix("es") {
+        if stem.chars().count() >= 3 && ends_with_sibilant(stem) {
+            return Some(stem.len());
+        }
+    }
+    if !token.ends_with("ss") {
+        if let Some(stem) = token.strip_suffix('s') {
+            if stem.chars().count() >= 3 {
+                return Some(stem.len());
+            }
+        }
+    }
+    None
+}
+
+fn ends_with_sibilant(stem: &str) -> bool {
+    stem.ends_with('s')
+        || stem.ends_with('x')
+        || stem.ends_with('z')
+        || stem.ends_with("ch")
+        || stem.ends_with("sh")
+}
+
+/// Unique concept terms of `query`, in first-appearance order (query length `|Q|`).
+fn concept_query_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    for token in tokenize_concept(query) {
+        if seen.insert(token.clone()) {
+            terms.push(token);
+        }
+    }
+    terms
+}
+
+/// One scored document: a row of `symbols.tsv`, `types.tsv`, or `macros.tsv`.
+struct ConceptDocument {
+    bundle_name: String,
+    kind: &'static str,
+    id: String,
+    file: String,
+    line: usize,
+    name: String,
+    detail: String,
+    pagerank: f64,
+    /// Weighted term frequencies: name x3, docstring x2, signature/fields/value x1, file stem x1.
+    terms: FxHashMap<String, f64>,
+    /// Weighted document length (sum of field weights over all indexed tokens).
+    len: f64,
+}
+
+fn push_concept_field(terms: &mut FxHashMap<String, f64>, len: &mut f64, text: &str, weight: f64) {
+    if text.is_empty() {
+        return;
+    }
+    for token in tokenize_concept(text) {
+        *terms.entry(token).or_insert(0.0) += weight;
+        *len += weight;
+    }
+}
+
+/// Raw TSV row fields needed to build a [`ConceptDocument`].
+struct ConceptRow<'a> {
+    bundle_name: &'a str,
+    kind: &'static str,
+    id: &'a str,
+    name: &'a str,
+    file: &'a str,
+    line: usize,
+    pagerank: f64,
+    /// Signature (symbols), fields summary (types), or value (macros).
+    primary_field: &'a str,
+    /// Docstring (symbols/types) or description (macros).
+    doc_field: &'a str,
+}
+
+fn build_concept_document(row: ConceptRow<'_>) -> Option<ConceptDocument> {
+    if row.name.is_empty() {
+        return None;
+    }
+    let mut terms: FxHashMap<String, f64> = FxHashMap::default();
+    let mut len = 0.0;
+    push_concept_field(&mut terms, &mut len, row.name, 3.0);
+    push_concept_field(&mut terms, &mut len, row.doc_field, 2.0);
+    push_concept_field(&mut terms, &mut len, row.primary_field, 1.0);
+    let file_stem = Path::new(row.file)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(row.file);
+    push_concept_field(&mut terms, &mut len, file_stem, 1.0);
+    if terms.is_empty() {
+        return None;
+    }
+    let detail = if !row.primary_field.trim().is_empty() {
+        row.primary_field.trim()
+    } else if !row.doc_field.trim().is_empty() {
+        row.doc_field.trim()
+    } else {
+        row.file
+    };
+    Some(ConceptDocument {
+        bundle_name: row.bundle_name.to_string(),
+        kind: row.kind,
+        id: row.id.to_string(),
+        file: row.file.to_string(),
+        line: row.line,
+        name: row.name.to_string(),
+        detail: detail.to_string(),
+        pagerank: row.pagerank,
+        terms,
+        len,
+    })
+}
+
+fn concept_snippet(name: &str, detail: &str) -> String {
+    let snippet = format!("{name} — {detail}");
+    if snippet.chars().count() <= CONCEPT_SNIPPET_MAX_CHARS {
+        return snippet;
+    }
+    let mut truncated: String = snippet
+        .chars()
+        .take(CONCEPT_SNIPPET_MAX_CHARS - 3)
+        .collect();
+    truncated.push_str("...");
+    truncated
+}
+
+/// Widest `index/*.tsv` row consumed by concept search (`symbols.tsv` has 17 columns).
+const CONCEPT_MAX_TSV_COLUMNS: usize = 17;
+
+/// Splits one TSV row into a fixed-size column array without a heap allocation per row.
+fn concept_row_columns(raw_line: &str) -> [&str; CONCEPT_MAX_TSV_COLUMNS] {
+    let mut cols = [""; CONCEPT_MAX_TSV_COLUMNS];
+    for (idx, value) in raw_line.split('\t').enumerate() {
+        if idx >= cols.len() {
+            break;
+        }
+        cols[idx] = value;
+    }
+    cols
+}
+
+/// Loads every concept document (symbol, type, and macro rows) from the given bundles.
+fn collect_concept_documents(bundles: &[PathBuf]) -> Result<Vec<ConceptDocument>> {
+    let mut docs = Vec::new();
+    for bundle_dir in bundles {
+        let bundle_name = bundle_name_from_dir(bundle_dir);
+
+        let symbols = load_index_table(bundle_dir, "symbols.tsv")?;
+        for raw_line in symbols.lines().skip(1) {
+            if raw_line.trim().is_empty() {
+                continue;
+            }
+            let cols = concept_row_columns(raw_line);
+            let name = cols[1];
+            if name.is_empty() {
+                continue;
+            }
+            let id = if cols[0].is_empty() { name } else { cols[0] };
+            let line = cols[5].parse::<usize>().unwrap_or(0);
+            let pagerank = cols[8].parse::<f64>().unwrap_or(0.0);
+            if let Some(doc) = build_concept_document(ConceptRow {
+                bundle_name: &bundle_name,
+                kind: "symbol",
+                id,
+                name,
+                file: cols[4],
+                line,
+                pagerank,
+                primary_field: cols[7],
+                doc_field: cols[14],
+            }) {
+                docs.push(doc);
+            }
+        }
+
+        let types = load_index_table(bundle_dir, "types.tsv")?;
+        for raw_line in types.lines().skip(1) {
+            if raw_line.trim().is_empty() {
+                continue;
+            }
+            let cols = concept_row_columns(raw_line);
+            let name = cols[1];
+            if name.is_empty() {
+                continue;
+            }
+            let id = if cols[0].is_empty() { name } else { cols[0] };
+            let line = cols[5].parse::<usize>().unwrap_or(0);
+            if let Some(doc) = build_concept_document(ConceptRow {
+                bundle_name: &bundle_name,
+                kind: "type",
+                id,
+                name,
+                file: cols[4],
+                line,
+                pagerank: 0.0,
+                primary_field: cols[7],
+                doc_field: cols[11],
+            }) {
+                docs.push(doc);
+            }
+        }
+
+        let macros = load_index_table(bundle_dir, "macros.tsv")?;
+        for raw_line in macros.lines().skip(1) {
+            if raw_line.trim().is_empty() {
+                continue;
+            }
+            let cols = concept_row_columns(raw_line);
+            let name = cols[0];
+            if name.is_empty() {
+                continue;
+            }
+            let line = cols[5].parse::<usize>().unwrap_or(0);
+            if let Some(doc) = build_concept_document(ConceptRow {
+                bundle_name: &bundle_name,
+                kind: "macro",
+                id: name,
+                name,
+                file: cols[4],
+                line,
+                pagerank: 0.0,
+                primary_field: cols[2],
+                doc_field: cols[9],
+            }) {
+                docs.push(doc);
+            }
+        }
+    }
+    Ok(docs)
+}
+
+/// Deterministic BM25 concept search over the symbol/type/macro tables of every bundle.
+///
+/// Documents are the TSV rows themselves (no persisted index), fields are weighted name x3,
+/// docstring x2, signature/fields/value and file stem x1, and the BM25 score (`k1=1.2`,
+/// `b=0.75`) is multiplied by `(matched_terms / |Q|)^2` so rows matching more of the query
+/// rank first. Ties break on pagerank (descending) and then the row id (ascending).
+/// Queries whose tokens match no row return `[]`.
+pub fn concept_search(bundles: &[PathBuf], query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let query_terms = concept_query_terms(query);
+    if query_terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let documents = collect_concept_documents(bundles)?;
+    if documents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let doc_count = documents.len() as f64;
+    let total_len: f64 = documents.iter().map(|doc| doc.len).sum();
+    if total_len <= 0.0 {
+        return Ok(Vec::new());
+    }
+    let avg_len = total_len / doc_count;
+
+    let mut doc_freq: FxHashMap<&str, usize> = FxHashMap::default();
+    for term in &query_terms {
+        let freq = documents
+            .iter()
+            .filter(|doc| doc.terms.contains_key(term.as_str()))
+            .count();
+        doc_freq.insert(term.as_str(), freq);
+    }
+
+    let mut scored: Vec<(f64, &ConceptDocument)> = Vec::new();
+    for doc in &documents {
+        let mut score = 0.0_f64;
+        let mut matched = 0usize;
+        for term in &query_terms {
+            let Some(&freq) = doc_freq.get(term.as_str()) else {
+                continue;
+            };
+            if freq == 0 {
+                continue;
+            }
+            let idf = (1.0 + (doc_count - freq as f64 + 0.5) / (freq as f64 + 0.5)).ln();
+            if idf <= 0.0 {
+                continue;
+            }
+            let tf = doc.terms.get(term.as_str()).copied().unwrap_or(0.0);
+            if tf <= 0.0 {
+                continue;
+            }
+            matched += 1;
+            let norm =
+                CONCEPT_BM25_K1 * (1.0 - CONCEPT_BM25_B + CONCEPT_BM25_B * (doc.len / avg_len));
+            score += idf * (tf * (CONCEPT_BM25_K1 + 1.0)) / (tf + norm);
+        }
+        if matched == 0 {
+            continue;
+        }
+        let coverage = matched as f64 / query_terms.len() as f64;
+        score *= coverage * coverage;
+        if score > 0.0 {
+            scored.push((score, doc));
+        }
+    }
+
+    scored.sort_by(|(score_a, doc_a), (score_b, doc_b)| {
+        score_b
+            .total_cmp(score_a)
+            .then_with(|| doc_b.pagerank.total_cmp(&doc_a.pagerank))
+            .then_with(|| doc_a.id.cmp(&doc_b.id))
+            .then_with(|| doc_a.bundle_name.cmp(&doc_b.bundle_name))
+            .then_with(|| doc_a.file.cmp(&doc_b.file))
+            .then_with(|| doc_a.line.cmp(&doc_b.line))
+    });
+
+    let mut seen_coords: FxHashSet<(String, &'static str, String, usize)> = FxHashSet::default();
+    let mut hits = Vec::new();
+    for (_, doc) in scored {
+        if hits.len() >= limit {
+            break;
+        }
+        if !seen_coords.insert((
+            doc.bundle_name.clone(),
+            doc.kind,
+            doc.file.clone(),
+            doc.line,
+        )) {
+            continue;
+        }
+        hits.push(SearchHit {
+            bundle_name: doc.bundle_name.clone(),
+            kind: doc.kind.to_string(),
+            file: doc.file.clone(),
+            line: doc.line,
+            snippet: concept_snippet(&doc.name, &doc.detail),
+        });
+    }
+    Ok(hits)
 }
 
 fn bundles_have_exact_symbol(bundles: &[PathBuf], q_trim: &str, q_lower: &str) -> Result<bool> {
@@ -4046,5 +4482,301 @@ GPIOA->MODER\treg_access\tGPIOA->MODER = id;\t-\tsrc/drv.c\t3\tdrvs\tfirst_party
         let paren_hits =
             parallel_bundle_search(&bundles, "lock_actuator(", "source", false, 10).unwrap();
         assert!(!paren_hits.is_empty());
+    }
+
+    /// Writes a small two-table-plus-macro bundle whose rows exercise camelCase (VendorMode),
+    /// snake_case (structural_digest), docstring and signature tokenization, plus a source tree
+    /// that does NOT contain the concept phrase so the multi-token fallback is reachable.
+    fn write_concept_fixture_bundle(tmp: &TestTempDir) -> PathBuf {
+        let bundle_dir = tmp.0.join("bundle");
+        let index_dir = bundle_dir.join("index");
+        let source_dir = tmp.0.join("src");
+        fs::create_dir_all(&index_dir).unwrap();
+        fs::create_dir_all(&source_dir).unwrap();
+
+        fs::write(
+            source_dir.join("model.rs"),
+            "// concept probe source\npub fn structural_digest(value: &str) -> String {\n    value.to_string()\n}\n",
+        )
+        .unwrap();
+
+        let meta = BundleMetaFile {
+            metadata: RepoMetadata {
+                repo_name: "concept-demo".to_string(),
+                source_root: source_dir.display().to_string(),
+                fingerprint: "c0ffee1234567890".to_string(),
+                vendor_mode: VendorMode::Active,
+                total_files: 1,
+                first_party_files: 1,
+                symbol_count: 8,
+                section_count: 1,
+                ..Default::default()
+            },
+            sanity: SanityReport::default(),
+        };
+        fs::write(
+            bundle_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        fs::write(bundle_dir.join("INDEX.md"), "# concept demo\n").unwrap();
+
+        fs::write(
+            index_dir.join("symbols.tsv"),
+            "symbol_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tsignature\tpagerank\tin_deg\tout_deg\tarch_layer\tscope\tsection_id\tdoc_summary\thub_score\tauthority_score\n\
+src/model.rs::ParsedUnit::structural_digest\tstructural_digest\tmethod\tpub\tsrc/model.rs\t10\t20\tpub fn structural_digest(&self) -> String\t0.004000\t1\t0\tdomain\tfirst_party\t01-src\tComputes a deterministic structural digest of the parsed source.\t0.100000\t0.100000\n\
+src/model.rs::digest_cache\tdigest_cache\tfn\tpriv\tsrc/model.rs\t25\t30\tfn digest_cache(&self) -> usize\t0.002000\t0\t0\tdomain\tfirst_party\t01-src\tCaches the structural digest keyed by content hash.\t0.100000\t0.100000\n\
+src/graph.rs::analyze_graph\tanalyze_graph\tfn\tpub\tsrc/graph.rs\t40\t90\tpub fn analyze_graph(repo: &ParsedRepo)\t0.009000\t2\t5\tcore\tfirst_party\t02-src\tRuns Tarjan strongly connected component cycle detection over the call graph.\t0.100000\t0.100000\n\
+src/model.rs::short_circuit_guard\tshort_circuit_guard\tfn\tpriv\tsrc/model.rs\t33\t35\tfn short_circuit_guard(&self) -> bool\t0.001000\t0\t0\tdomain\tfirst_party\t01-src\tEarly structural digest guard that short-circuits unchanged files.\t0.100000\t0.100000\n\
+src/misc.rs::unrelated_helper\tunrelated_helper\tfn\tpriv\tsrc/misc.rs\t5\t9\tfn unrelated_helper(line: &str)\t0.000500\t0\t0\tlibs\tfirst_party\t03-src\tFormats a log line for diagnostics.\t0.100000\t0.100000\n\
+src/a.rs::alpha_one\talpha_one\tfn\tpriv\tsrc/a.rs\t1\t2\tfn alpha_one()\t0.001000\t0\t0\tlibs\tfirst_party\t04-src\t\t0.100000\t0.100000\n\
+src/a.rs::alpha_two\talpha_two\tfn\tpriv\tsrc/a.rs\t3\t4\tfn alpha_two()\t0.002000\t0\t0\tlibs\tfirst_party\t04-src\t\t0.100000\t0.100000\n\
+src/a.rs::alpha_zero\talpha_zero\tfn\tpriv\tsrc/a.rs\t5\t6\tfn alpha_zero()\t0.002000\t0\t0\tlibs\tfirst_party\t04-src\t\t0.100000\t0.100000\n",
+        )
+        .unwrap();
+        fs::write(
+            index_dir.join("types.tsv"),
+            "type_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tfields_summary\tarch_layer\tscope\tsection_id\tdoc_summary\n\
+src/model.rs::VendorMode\tVendorMode\tenum\tpub\tsrc/model.rs\t3\t8\tActive | All | None\tdomain\tfirst_party\t01-src\tVendor SDK surface selection mode.\n\
+src/misc.rs::RetryPolicy\tRetryPolicy\tstruct\tpub\tsrc/misc.rs\t12\t20\tattempts: u32, delay_ms: u64\tlibs\tfirst_party\t03-src\tRetry policy for transient IO errors.\n",
+        )
+        .unwrap();
+        fs::write(
+            index_dir.join("macros.tsv"),
+            "name\tkind\tvalue_or_args\thex_addr\tfile\tline\tarch_layer\tscope\tsection_id\tdescription\n\
+RETRY_LIMIT\tconst\t3\t-\tsrc/misc.rs\t4\tlibs\tfirst_party\t03-src\tMaximum retry attempts.\n",
+        )
+        .unwrap();
+        fs::write(
+            index_dir.join("calls.tsv"),
+            "caller_id\tcaller_name\tcallee_name\tcallee_id\tfile\tline\ttier\tsection_id\n",
+        )
+        .unwrap();
+        fs::write(
+            index_dir.join("sections.tsv"),
+            "section_id\ttitle\tmodule_path\tarch_layer\tscope\tfile_count\tsymbol_count\ttype_count\tmacro_count\ttoken_estimate\tmd_file\n",
+        )
+        .unwrap();
+        fs::write(
+            index_dir.join("xref.tsv"),
+            "symbol\tcategory\trelation\ttarget\tfile\tline\tsection_id\tcontext\n",
+        )
+        .unwrap();
+
+        bundle_dir
+    }
+
+    #[test]
+    fn tokenize_concept_splits_camel_snake_acronyms_and_stems() {
+        assert_eq!(
+            tokenize_concept("structural_digest"),
+            vec!["structural", "digest"]
+        );
+        assert_eq!(tokenize_concept("VendorMode"), vec!["vendor", "mode"]);
+        assert_eq!(
+            tokenize_concept("parseHTTPRequest"),
+            vec!["parse", "http", "request"]
+        );
+        assert_eq!(tokenize_concept("GPIOA_MODER"), vec!["gpioa", "moder"]);
+        assert_eq!(
+            tokenize_concept("HAL_UART_Transmit"),
+            vec!["hal", "uart", "transmit"]
+        );
+        // 1-char tokens and stopwords are dropped.
+        assert_eq!(tokenize_concept("a I of the x"), Vec::<String>::new());
+        // Light suffix stemming collapses singular/plural and verb forms.
+        for (input, expected) in [
+            ("digests", "digest"),
+            ("digested", "digest"),
+            ("digesting", "digest"),
+            ("types", "type"),
+            ("matches", "match"),
+            ("classes", "class"),
+            ("boxes", "box"),
+            ("connected", "connect"),
+        ] {
+            assert_eq!(
+                tokenize_concept(input),
+                vec![expected.to_string()],
+                "input={input:?}"
+            );
+        }
+        assert_eq!(
+            tokenize_concept("structural-digest, short/circuit!"),
+            vec!["structural", "digest", "short", "circuit"]
+        );
+        // Unicode input must never panic and keeps its (lowercased) alphanumeric runs.
+        assert_eq!(tokenize_concept("Wörld 中文"), vec!["wörld", "中文"]);
+    }
+
+    #[test]
+    fn concept_search_ranks_identifiers_and_documents() {
+        let tmp = TestTempDir::new("concept_rank");
+        let bundle_dir = write_concept_fixture_bundle(&tmp);
+        let bundles = vec![bundle_dir];
+
+        let full = concept_search(&bundles, "short structural digest circuit", 10).unwrap();
+        assert!(!full.is_empty(), "concept search must return hits");
+        assert!(full
+            .iter()
+            .take(5)
+            .any(|h| h.snippet.starts_with("structural_digest — ")));
+        assert!(full
+            .iter()
+            .all(|h| matches!(h.kind.as_str(), "symbol" | "type" | "macro")));
+        assert!(full.iter().all(|h| h.snippet.contains(" — ")));
+
+        // Snake-case sub-tokens of the identifier put it first for the two-word query.
+        let digest = concept_search(&bundles, "structural digest", 10).unwrap();
+        assert_eq!(
+            digest[0].snippet.split(" — ").next().unwrap(),
+            "structural_digest"
+        );
+
+        // CamelCase sub-tokenization (`VendorMode` -> vendor + mode).
+        let vendor = concept_search(&bundles, "vendor mode", 10).unwrap();
+        assert!(
+            vendor
+                .iter()
+                .take(3)
+                .any(|h| h.kind == "type" && h.snippet.starts_with("VendorMode — ")),
+            "VendorMode must rank in the top 3: {vendor:?}"
+        );
+
+        // Determinism: identical calls produce identical ordered hits.
+        assert_eq!(
+            concept_search(&bundles, "short structural digest circuit", 10).unwrap(),
+            full
+        );
+
+        // `--limit` / `-n` clamp the ranked list.
+        assert_eq!(
+            concept_search(&bundles, "short structural digest circuit", 2)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            concept_search(&bundles, "short structural digest circuit", 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            concept_search(&bundles, "short structural digest circuit", 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn concept_search_tie_breaks_by_pagerank_then_id() {
+        let tmp = TestTempDir::new("concept_tie");
+        let bundle_dir = write_concept_fixture_bundle(&tmp);
+        let bundles = vec![bundle_dir];
+        let hits = concept_search(&bundles, "alpha", 10).unwrap();
+        let names: Vec<&str> = hits
+            .iter()
+            .map(|h| h.snippet.split(" — ").next().unwrap())
+            .collect();
+        assert_eq!(names, vec!["alpha_two", "alpha_zero", "alpha_one"]);
+    }
+
+    #[test]
+    fn concept_search_returns_empty_for_nonsense_and_single_token() {
+        let tmp = TestTempDir::new("concept_empty");
+        let bundle_dir = write_concept_fixture_bundle(&tmp);
+        let bundles = vec![bundle_dir];
+        for query in [
+            "quuxblorp snazzlewump wibbleflop",
+            "zorbnaxnotoken",
+            "",
+            "the of a",
+            "   ",
+        ] {
+            assert!(
+                concept_search(&bundles, query, 10).unwrap().is_empty(),
+                "query={query:?} must return []"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_search_falls_back_to_concept_for_zero_hit_multi_token_queries() {
+        let tmp = TestTempDir::new("concept_fallback");
+        let bundle_dir = write_concept_fixture_bundle(&tmp);
+        let bundles = vec![bundle_dir];
+
+        let fallback = parallel_bundle_search(
+            &bundles,
+            "short structural digest circuit",
+            "all",
+            false,
+            10,
+        )
+        .unwrap();
+        assert!(!fallback.is_empty(), "fallback must not be empty");
+        assert!(fallback
+            .iter()
+            .take(5)
+            .any(|h| h.snippet.starts_with("structural_digest — ")));
+        let explicit = parallel_bundle_search(
+            &bundles,
+            "short structural digest circuit",
+            "concept",
+            false,
+            10,
+        )
+        .unwrap();
+        assert_eq!(fallback, explicit);
+
+        // `--source` / `--kind source` disable the concept fallback entirely.
+        assert!(parallel_bundle_search(
+            &bundles,
+            "short structural digest circuit",
+            "source",
+            false,
+            10
+        )
+        .unwrap()
+        .is_empty());
+        assert!(
+            parallel_bundle_search(&bundles, "zorbnaxnotoken", "all", false, 10)
+                .unwrap()
+                .is_empty(),
+            "single-token zero-hit queries must not fall back"
+        );
+        assert!(
+            parallel_bundle_search(
+                &bundles,
+                "quuxblorp snazzlewump wibbleflop",
+                "all",
+                false,
+                10
+            )
+            .unwrap()
+            .is_empty(),
+            "nonsense multi-token queries must return []"
+        );
+    }
+
+    #[test]
+    fn parallel_search_literal_hits_are_not_augmented_by_concept_hits() {
+        let tmp = TestTempDir::new("concept_nofallback");
+        let bundle_dir = write_concept_fixture_bundle(&tmp);
+        let bundles = vec![bundle_dir];
+        let hits = parallel_bundle_search(
+            &bundles,
+            "short_circuit_guard|analyze_graph",
+            "all",
+            false,
+            10,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 2, "literal hits: {hits:?}");
+        assert!(hits
+            .iter()
+            .all(|h| h.snippet.contains("short_circuit_guard")
+                || h.snippet.contains("analyze_graph")));
     }
 }

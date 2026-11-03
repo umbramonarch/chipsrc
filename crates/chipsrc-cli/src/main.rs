@@ -381,6 +381,9 @@ enum Commands {
     },
 
     /// Parallel SIMD + Regex search across all indexed Agent Codebase Bundles
+    ///
+    /// Multi-token queries with zero literal/regex hits automatically fall back to
+    /// deterministic BM25 concept ranking; pass `--source` (or `--kind source`) to disable.
     Search {
         /// Either `<pattern>` or `<bundle_or_repo>` followed by `<pattern>`
         target_or_query: String,
@@ -392,7 +395,7 @@ enum Commands {
         #[arg(short, long)]
         bundle: Option<PathBuf>,
 
-        /// Filter search target (`all`, `source`, `symbols`, `types`, `calls`, `macros`, `xref`, `sections`)
+        /// Filter search target (`all`, `concept`, `source`, `symbols`, `types`, `calls`, `macros`, `xref`, `sections`)
         #[arg(short, long, default_value = "all")]
         kind: String,
 
