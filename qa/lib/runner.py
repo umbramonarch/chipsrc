@@ -13,6 +13,12 @@ from lib import procs
 
 EXPECTED_CACHE_SCHEMA = "2.1.0"
 REQUIRED_TSVS = ["symbols", "types", "calls", "macros", "xref", "sections"]
+
+#: Marker recorded inside every baseline/fixture bundle in `--fixtures-mode build`.
+#: A bundle cached by an older `chipsrc` binary can contain artifacts produced by code paths
+#: that no longer exist, so a binary change forces a clean rebuild instead of an incremental
+#: sync over stale tables (the historical `index/calls.tsv` stale-bundle failure).
+BINARY_MARKER = ".binary_sha256"
 FALLBACK_IGNORE_DIRS = {
     ".git",
     "node_modules",
@@ -73,6 +79,8 @@ class HarnessContext:
         self.results: list[dict] = []
         self.surfaced_probes: list[dict] = []
         self._oracle_cache: dict[str, dict] = {}
+        self._bin_digest: str | None = None
+        self._bin_digest_computed = False
 
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.sandboxes_dir.mkdir(parents=True, exist_ok=True)
@@ -777,6 +785,34 @@ class HarnessContext:
             pass
         return {}
 
+    def binary_sha256(self) -> str | None:
+        """SHA-256 of the binary under test (cached per suite; None when unreadable)."""
+        if not self._bin_digest_computed:
+            self._bin_digest_computed = True
+            try:
+                self._bin_digest = procs.file_sha256(self.bin_path)
+            except OSError:
+                self._bin_digest = None
+        return self._bin_digest
+
+    @staticmethod
+    def read_binary_marker(bundle_dir: Path) -> str | None:
+        marker = bundle_dir / BINARY_MARKER
+        if not marker.is_file():
+            return None
+        try:
+            return marker.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
+
+    @staticmethod
+    def write_binary_marker(bundle_dir: Path, digest: str) -> None:
+        marker = bundle_dir / BINARY_MARKER
+        try:
+            marker.write_text(digest + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
     def _bundle_is_ready_and_fresh(self, repo_path: Path, bundle_dir: Path) -> bool:
         required = [
             "INDEX.md",
@@ -840,7 +876,18 @@ class HarnessContext:
         target_repo: Path,
         bundle_dir: Path,
     ) -> bool:
+        digest = self.binary_sha256() if self.fixtures_mode == "build" else None
+        if digest is not None:
+            recorded = self.read_binary_marker(bundle_dir)
+            if recorded != digest and bundle_dir.exists():
+                # Rebuilding `chipsrc.exe` invalidates every cached bundle: the marker records
+                # which binary produced the tables, and a mismatch forces a clean rebuild so
+                # bundle artifacts from the old call graph / parser never leak into this run.
+                shutil.rmtree(bundle_dir, ignore_errors=True)
+
         if self._bundle_is_ready_and_fresh(target_repo, bundle_dir):
+            if digest is not None and self.read_binary_marker(bundle_dir) != digest:
+                self.write_binary_marker(bundle_dir, digest)
             return True
 
         if self.fixtures_mode == "require":
@@ -876,6 +923,8 @@ class HarnessContext:
                 wall_ms=wall_ms,
             )
             return False
+        if digest is not None:
+            self.write_binary_marker(bundle_dir, digest)
         return True
 
     def ensure_repo_bundle(self, repo: str, repo_path: Path | None = None) -> bool:
@@ -926,9 +975,14 @@ class HarnessContext:
         return source
 
     @staticmethod
-    def read_symbols_tsv(bundle: Path) -> list[dict]:
-        tsv_path = bundle / "index" / "symbols.tsv"
+    def read_tsv(bundle: Path, name: str) -> list[dict]:
+        """Rows of `index/<name>.tsv` as dicts (empty when the table is absent)."""
+        tsv_path = Path(bundle) / "index" / f"{name}.tsv"
         if not tsv_path.is_file():
             return []
         with tsv_path.open(encoding="utf-8", newline="") as handle:
             return list(csv.DictReader(handle, delimiter="\t"))
+
+    @staticmethod
+    def read_symbols_tsv(bundle: Path) -> list[dict]:
+        return HarnessContext.read_tsv(bundle, "symbols")
