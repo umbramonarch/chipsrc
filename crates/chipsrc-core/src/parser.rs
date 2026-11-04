@@ -119,7 +119,17 @@ pub fn parse_source_str_with_blueprint(
         Some(preprocess_sfc_to_tsx(source, &scanned.rel_path))
     } else {
         match scanned.language {
-            LanguageKind::C | LanguageKind::Cpp => normalize_c_qualifier_macros(source, blueprint),
+            LanguageKind::C | LanguageKind::Cpp => {
+                let qualifier_normalized = normalize_c_qualifier_macros(source, blueprint);
+                if scanned.language == LanguageKind::Cpp {
+                    match qualifier_normalized {
+                        Some(buf) => normalize_cpp_macro_annotations(&buf),
+                        None => normalize_cpp_macro_annotations(source.as_bytes()),
+                    }
+                } else {
+                    qualifier_normalized
+                }
+            }
             _ => None,
         }
     };
@@ -181,7 +191,7 @@ pub fn parse_source_str_with_blueprint(
     };
 
     let root = tree.root_node();
-    walk_ast(&mut ctx, root, None, None);
+    walk_ast(&mut ctx, root, None, None, None, None);
 
     if is_sfc {
         extract_sfc_component_and_template(&mut ctx, source);
@@ -688,6 +698,816 @@ fn normalize_c_qualifier_macros(
     out
 }
 
+/// Returns true for identifiers shaped like all-caps macro tokens (`ETL_ASSERT`, `API_EXPORT`,
+/// `HAL_GPIO_EXTI_CALLBACK`). Mixed-case identifiers and lowercase keywords never match; a token
+/// needs an underscore or at least two uppercase letters so template parameters like `T1`/`U2`
+/// are not mistaken for macros.
+fn is_cpp_macro_like_token(word: &[u8]) -> bool {
+    if word.len() < 2
+        || !word
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+    {
+        return false;
+    }
+    let uppercase = word.iter().filter(|b| b.is_ascii_uppercase()).count();
+    word.contains(&b'_') || uppercase >= 2
+}
+
+/// Returns the byte index of the `)` matching the `(` at `open`, skipping comments and literals.
+fn find_matching_paren_bytes(src: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < src.len() {
+        match src[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'"' | b'\'' => {
+                let quote = src[i];
+                i += 1;
+                while i < src.len() {
+                    if src[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if src[i] == quote || src[i] == b'\n' {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'/' if src.get(i + 1) == Some(&b'/') => {
+                while i < src.len() && src[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if src.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < src.len() {
+                    if src[i] == b'*' && src[i + 1] == b'/' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Blanks C++ macro invocations and trailing macro annotations that the C++ grammar cannot parse
+/// (`ETL_NOEXCEPT_IF((...))`, `ETL_ASSERT_OR_RETURN(...)`, `ETL_OVERRIDE`, ...) while preserving
+/// byte offsets and newlines so AST coordinates and extracted slices stay exact.
+///
+/// The pass is structural rather than name-based, so it stays vendor-neutral:
+/// - a macro-like token in statement position is treated as an empty statement when its
+///   invocation ends at `;` (assertion helpers) and becomes an attribute when a declaration
+///   keyword or another macro follows it,
+/// - a macro-like token directly after a closed declarator or a trailing qualifier
+///   (`)`, `const`, ...) is a trailing annotation and is blanked,
+/// - a macro invocation in expression position is replaced by a synthetic identifier `qN` so
+///   `int x = MACRO(a);` and `if (MACRO(a))` stay syntactically valid,
+/// - macro-expanded definitions (`TEST_FIXTURE(...) { ... }`) become a synthetic function or an
+///   anonymous class depending on whether the body declares access specifiers,
+/// - conditional directives are flattened (`#if`/`#else`/`#endif` blanked) so declarations split
+///   across branches parse as one; alternative partial declarations keep only the last branch,
+/// - comments, string/character literals, and non-conditional directives are never touched.
+fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
+    if !src.iter().any(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    let n = src.len();
+    let mut out: Option<Vec<u8>> = None;
+    let mut i = 0usize;
+    let mut line_start = true;
+    let mut prev_sig: u8 = 0;
+    let mut prev_word: (usize, usize) = (0, 0);
+    let mut synthetic_counter: usize = 0;
+    let mut conditional_branches: Vec<Vec<(usize, usize)>> = Vec::new();
+
+    while i < n {
+        let b = src[i];
+        match b {
+            b'\n' => {
+                line_start = true;
+                i += 1;
+                continue;
+            }
+            b' ' | b'\t' | b'\r' => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if line_start && b == b'#' {
+            let directive_start = i;
+            // Identify the directive keyword so conditional splits (`#ifdef ... #endif`) can be
+            // flattened: the grammar keeps the branches separate and rejects declarations that
+            // straddle a conditional boundary (e.g. a `virtual` keyword in one branch).
+            let mut kw_start = i + 1;
+            while kw_start < n && matches!(src[kw_start], b' ' | b'\t') {
+                kw_start += 1;
+            }
+            let mut kw_end = kw_start;
+            while kw_end < n && is_c_ident_continue(src[kw_end]) {
+                kw_end += 1;
+            }
+            let keyword = &src[kw_start..kw_end];
+            let conditional = matches!(
+                keyword,
+                b"if" | b"ifdef" | b"ifndef" | b"elif" | b"else" | b"endif"
+            );
+            // Skip the whole directive, including backslash-continued lines.
+            while i < n {
+                if src[i] == b'\\' && i + 1 < n && matches!(src[i + 1], b'\n' | b'\r') {
+                    i += 1;
+                    if i < n && src[i] == b'\r' {
+                        i += 1;
+                    }
+                    if i < n && src[i] == b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if src[i] == b'\n' {
+                    break;
+                }
+                i += 1;
+            }
+            if conditional {
+                let buf = out.get_or_insert_with(|| src.to_vec());
+                blank_range_preserving_newlines(buf, directive_start, i);
+                let content_start = if src.get(i) == Some(&b'\n') { i + 1 } else { i };
+                match keyword {
+                    b"if" | b"ifdef" | b"ifndef" => {
+                        conditional_branches.push(vec![(content_start, content_start)]);
+                    }
+                    b"elif" | b"else" => {
+                        if let Some(branches) = conditional_branches.last_mut() {
+                            if let Some(last) = branches.last_mut() {
+                                last.1 = directive_start;
+                            }
+                            branches.push((content_start, content_start));
+                        }
+                    }
+                    b"endif" => {
+                        if let Some(mut branches) = conditional_branches.pop() {
+                            if let Some(last) = branches.last_mut() {
+                                last.1 = directive_start;
+                            }
+                            // Branches that each hold only a partial declaration and share the
+                            // body after `#endif` (`virtual void f() ETL_OVERRIDE` / `void f()`
+                            // then `{ ... }`) would concatenate into an invalid declaration when
+                            // flattened. Keep the last alternative and drop the earlier ones.
+                            let shared_body = matches!(
+                                src.get(cpp_skip_ws_and_directives(src, content_start)),
+                                Some(b'{') | Some(b':')
+                            );
+                            if shared_body
+                                && branches.len() >= 2
+                                && branches
+                                    .iter()
+                                    .all(|&(s, e)| cpp_range_is_partial_declaration(src, s, e))
+                            {
+                                let keep_from = branches[branches.len() - 1].0;
+                                blank_range_preserving_newlines(buf, branches[0].0, keep_from);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            line_start = true;
+            continue;
+        }
+        line_start = false;
+
+        if b == b'/' && i + 1 < n && src[i + 1] == b'/' {
+            while i < n && src[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && i + 1 < n && src[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < n {
+                if src[i] == b'*' && src[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            let quote = b;
+            i += 1;
+            while i < n {
+                if src[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if src[i] == quote || src[i] == b'\n' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            prev_sig = quote;
+            while i < n && src[i] == b'"' {
+                i += 1;
+            }
+            continue;
+        }
+
+        if is_c_ident_start(b) {
+            let start = i;
+            while i < n && is_c_ident_continue(src[i]) {
+                i += 1;
+            }
+            let word = &src[start..i];
+            let is_macro = is_cpp_macro_like_token(word);
+            if !is_macro && word != b"operator" && word != b"typename" {
+                prev_sig = word[word.len() - 1];
+                prev_word = (start, i);
+                continue;
+            }
+
+            let p = cpp_skip_ws_and_directives(src, i);
+            let prev_word_text = std::str::from_utf8(&src[prev_word.0..prev_word.1]).unwrap_or("");
+            let prev_qualifier = matches!(
+                prev_word_text,
+                "const" | "volatile" | "noexcept" | "override" | "final" | "mutable"
+            );
+            let prev_control = matches!(prev_word_text, "if" | "while" | "switch" | "for" | "else");
+            let statement_start = matches!(prev_sig, 0 | b'{' | b'}' | b';');
+
+            let member_operator =
+                (prev_sig == b'>' && start >= 2 && src[start - 2] == b'-') || prev_sig == b'.';
+            if word == b"operator" && member_operator {
+                // Explicit operator call through a member access (`this->operator+=(x)`).
+                let mut sym_start = i;
+                while sym_start < n && matches!(src[sym_start], b' ' | b'\t') {
+                    sym_start += 1;
+                }
+                let sym_end =
+                    if src.get(sym_start) == Some(&b'(') && src.get(sym_start + 1) == Some(&b')') {
+                        sym_start + 2
+                    } else {
+                        let mut q = sym_start;
+                        while q < n && !matches!(src[q], b' ' | b'\t' | b'\r' | b'\n' | b'(') {
+                            q += 1;
+                        }
+                        q
+                    };
+                let after_sym = cpp_skip_plain_ws(src, sym_end);
+                if sym_end > sym_start && src.get(after_sym) == Some(&b'(') {
+                    let buf = out.get_or_insert_with(|| src.to_vec());
+                    blank_range_preserving_newlines(buf, start, sym_end);
+                    let label = format!("q{}", synthetic_counter % 1000);
+                    synthetic_counter += 1;
+                    let bytes = label.as_bytes();
+                    let take = bytes.len().min(i - start);
+                    buf[start..start + take].copy_from_slice(&bytes[..take]);
+                    i = sym_end;
+                    prev_sig = b'0';
+                    continue;
+                }
+            }
+            if word == b"typename"
+                && (matches!(prev_word_text, "using" | "return") || matches!(prev_sig, b'(' | b'='))
+            {
+                // `using typename Base::name;` and `return typename T::type(x);` are rejected by
+                // the grammar even though they are valid C++.
+                let buf = out.get_or_insert_with(|| src.to_vec());
+                blank_range_preserving_newlines(buf, start, i);
+                prev_sig = b' ';
+                continue;
+            }
+            if !is_macro {
+                prev_sig = word[word.len() - 1];
+                prev_word = (start, i);
+                continue;
+            }
+            if prev_control && src.get(p) == Some(&b'(') {
+                // `if ETL_IF_CONSTEXPR (cond)`: drop the macro keyword, keep the condition.
+                let buf = out.get_or_insert_with(|| src.to_vec());
+                blank_range_preserving_newlines(buf, start, i);
+                prev_sig = b' ';
+                continue;
+            }
+
+            if src.get(p) == Some(&b'(') {
+                if let Some(close) = find_matching_paren_bytes(src, p) {
+                    let after_idx = cpp_skip_plain_ws(src, close + 1);
+                    let after = src.get(after_idx).copied().unwrap_or(0);
+                    let trailing_annotation = matches!(prev_sig, b')') || prev_qualifier;
+                    let buf = out.get_or_insert_with(|| src.to_vec());
+                    if trailing_annotation {
+                        blank_range_preserving_newlines(buf, start, after_idx);
+                        i = after_idx;
+                        continue;
+                    }
+                    if after == b'{' && (statement_start || prev_sig == b'>') {
+                        // Macro-expanded definition (`TEST_FIXTURE(...) { ... }`,
+                        // `SUITE(...) { ... }`, `ETL_PACKED_CLASS(name) { ... }`).
+                        if cpp_block_has_access_specifier(src, after_idx) {
+                            blank_range_preserving_newlines(buf, start, after_idx);
+                            let take = 5.min(after_idx - start);
+                            buf[start..start + take].copy_from_slice(&b"class"[..take]);
+                            prev_sig = *buf.get(after_idx - 1).unwrap_or(&b' ');
+                        } else {
+                            blank_range_preserving_newlines(buf, start, i);
+                            let label = format!("q{}", synthetic_counter % 1000);
+                            synthetic_counter += 1;
+                            let bytes = label.as_bytes();
+                            let take = bytes.len().min(i - start);
+                            buf[start..start + take].copy_from_slice(&bytes[..take]);
+                            prev_sig = b'0';
+                        }
+                        i = after_idx;
+                        continue;
+                    }
+                    if statement_start {
+                        let next_word_start = cpp_skip_ws_and_directives(src, after_idx);
+                        let mut next_word_end = next_word_start;
+                        while next_word_end < n && is_c_ident_continue(src[next_word_end]) {
+                            next_word_end += 1;
+                        }
+                        let next_word = &src[next_word_start..next_word_end];
+                        let next_is_macro = is_cpp_macro_like_token(next_word);
+                        let blank_statement = matches!(after, b';' | b'}')
+                            || (is_c_ident_start(after)
+                                && (is_cpp_declaration_keyword(next_word) || next_is_macro));
+                        blank_range_preserving_newlines(buf, start, after_idx);
+                        if !blank_statement {
+                            let label = format!("q{}", synthetic_counter % 1000);
+                            synthetic_counter += 1;
+                            let bytes = label.as_bytes();
+                            let take = bytes.len().min(i - start);
+                            buf[start..start + take].copy_from_slice(&bytes[..take]);
+                            prev_sig = b'0';
+                        } else {
+                            prev_sig = b' ';
+                        }
+                        i = after_idx;
+                        continue;
+                    }
+                    // Expression / initializer / condition position: an identifier keeps the
+                    // surrounding declaration or expression syntactically valid.
+                    blank_range_preserving_newlines(buf, start, after_idx);
+                    let label = format!("q{}", synthetic_counter % 1000);
+                    synthetic_counter += 1;
+                    let bytes = label.as_bytes();
+                    let take = bytes.len().min(i - start);
+                    buf[start..start + take].copy_from_slice(&bytes[..take]);
+                    prev_sig = *bytes.last().unwrap_or(&b'0');
+                    i = after_idx;
+                    continue;
+                }
+            } else {
+                let next = src.get(p).copied().unwrap_or(0);
+                let next_is_macro = if is_c_ident_start(next) {
+                    let mut e = p;
+                    while e < n && is_c_ident_continue(src[e]) {
+                        e += 1;
+                    }
+                    is_cpp_macro_like_token(&src[p..e])
+                } else {
+                    false
+                };
+                if (matches!(prev_sig, b')') || prev_qualifier)
+                    && (matches!(next, b';' | b'{' | b':' | b',' | b')' | b'=') || next_is_macro)
+                {
+                    // Bare trailing annotation macro (`void f() const ETL_NOEXCEPT {`), possibly
+                    // followed by a second annotation (`... ETL_LVALUE_REF_QUALIFIER ETL_NOEXCEPT`).
+                    let buf = out.get_or_insert_with(|| src.to_vec());
+                    blank_range_preserving_newlines(buf, start, i);
+                    continue;
+                }
+                if statement_start && matches!(next, b';' | b'}' | b')') {
+                    // Standalone declaration macro on its own line (`ETL_END_ENUM_TYPE`).
+                    let buf = out.get_or_insert_with(|| src.to_vec());
+                    blank_range_preserving_newlines(buf, start, i);
+                    continue;
+                }
+                if cpp_macro_is_leading_specifier(src, i, prev_sig, prev_word) {
+                    // Extra declaration specifier (`ETL_CONSTEXPR14 bool f()`,
+                    // `static ETL_CONSTANT int x`): the grammar accepts only one bare type
+                    // specifier, so drop the macro.
+                    let buf = out.get_or_insert_with(|| src.to_vec());
+                    blank_range_preserving_newlines(buf, start, i);
+                    continue;
+                }
+            }
+            prev_sig = word[word.len() - 1];
+            prev_word = (start, i);
+            continue;
+        }
+
+        // `::new` / `::delete` placement forms: the grammar rejects the leading scope
+        // qualifier, so drop it and keep the operator.
+        if b == b':'
+            && src.get(i + 1) == Some(&b':')
+            && (src[i + 2..].starts_with(b"new") || src[i + 2..].starts_with(b"delete"))
+        {
+            let buf = out.get_or_insert_with(|| src.to_vec());
+            blank_range_preserving_newlines(buf, i, i + 2);
+            i += 2;
+            prev_sig = b' ';
+            continue;
+        }
+        // Pointer-to-member operators (`a->*b`, `a.*b`, `T::*member`) are re-spelled as plain
+        // member access; extraction coordinates are unaffected because offsets are preserved.
+        if b == b'-' && src.get(i + 1) == Some(&b'>') && src.get(i + 2) == Some(&b'*') {
+            let buf = out.get_or_insert_with(|| src.to_vec());
+            buf[i + 2] = b' ';
+            i += 3;
+            prev_sig = b'>';
+            continue;
+        }
+        if b == b'.' && src.get(i + 1) == Some(&b'*') {
+            let buf = out.get_or_insert_with(|| src.to_vec());
+            buf[i + 1] = b' ';
+            i += 2;
+            prev_sig = b'.';
+            continue;
+        }
+        if b == b':' && src.get(i + 1) == Some(&b':') && src.get(i + 2) == Some(&b'*') {
+            let buf = out.get_or_insert_with(|| src.to_vec());
+            blank_range_preserving_newlines(buf, i, i + 2);
+            i += 2;
+            prev_sig = b' ';
+            continue;
+        }
+
+        prev_sig = b;
+        i += 1;
+    }
+
+    out
+}
+
+/// Skips only whitespace (no directive awareness) — used where the skipped byte range may be
+/// blanked, so preprocessor lines must stay intact.
+fn cpp_skip_plain_ws(src: &[u8], mut p: usize) -> usize {
+    while p < src.len() && matches!(src[p], b' ' | b'\t' | b'\r' | b'\n') {
+        p += 1;
+    }
+    p
+}
+
+/// Returns true when the bytes in `start..end` hold only a partial declaration — the last
+/// significant character is not `;`, `{`, or `}` (comments, directives, and literals skipped).
+fn cpp_range_is_partial_declaration(src: &[u8], start: usize, end: usize) -> bool {
+    let mut i = start;
+    let end = end.min(src.len());
+    let mut last = 0u8;
+    while i < end {
+        let b = src[i];
+        if b == b'/' && src.get(i + 1) == Some(&b'/') {
+            while i < end && src[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && src.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < end {
+                if src[i] == b'*' && src[i + 1] == b'/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            let quote = b;
+            i += 1;
+            while i < end {
+                if src[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if src[i] == quote || src[i] == b'\n' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            last = quote;
+            continue;
+        }
+        if b == b'#' {
+            while i < end && src[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if !matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+            last = b;
+        }
+        i += 1;
+    }
+    last != 0 && !matches!(last, b';' | b'{' | b'}')
+}
+
+/// Returns true when the block starting at the `{` at `open` declares an access specifier at its
+/// top level, which identifies a class/struct macro (`ETL_PACKED_CLASS(name) { public: ... }`)
+/// rather than a function-like test macro.
+fn cpp_block_has_access_specifier(src: &[u8], open: usize) -> bool {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < src.len() {
+        match src[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        if depth == 1 && is_c_ident_start(src[i]) {
+            let start = i;
+            while i < src.len() && is_c_ident_continue(src[i]) {
+                i += 1;
+            }
+            let word = &src[start..i];
+            if matches!(word, b"public" | b"private" | b"protected") {
+                let after = cpp_skip_plain_ws(src, i);
+                if src.get(after) == Some(&b':') {
+                    return true;
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Declaration or statement keywords that follow an attribute-style macro
+/// (`ETL_DEPRECATED("...") static int x`).
+fn is_cpp_declaration_keyword(word: &[u8]) -> bool {
+    matches!(
+        word,
+        b"static"
+            | b"const"
+            | b"constexpr"
+            | b"consteval"
+            | b"constinit"
+            | b"inline"
+            | b"virtual"
+            | b"explicit"
+            | b"friend"
+            | b"typedef"
+            | b"using"
+            | b"template"
+            | b"class"
+            | b"struct"
+            | b"union"
+            | b"enum"
+            | b"namespace"
+            | b"extern"
+            | b"typename"
+            | b"mutable"
+            | b"volatile"
+            | b"register"
+            | b"thread_local"
+    )
+}
+
+/// Advances past whitespace and whole preprocessor directive lines so look-ahead sees the next
+/// real code token (`ETL_CONSTEXPR20` / `#else` / `bool f()` sequences are common in headers).
+fn cpp_skip_ws_and_directives(src: &[u8], mut p: usize) -> usize {
+    loop {
+        while p < src.len() && matches!(src[p], b' ' | b'\t' | b'\r' | b'\n') {
+            p += 1;
+        }
+        if src.get(p) != Some(&b'#') {
+            return p;
+        }
+        let mut line_start = p;
+        while line_start > 0 && src[line_start - 1] != b'\n' {
+            line_start -= 1;
+        }
+        if !src[line_start..p]
+            .iter()
+            .all(|b| matches!(b, b' ' | b'\t' | b'\r'))
+        {
+            return p;
+        }
+        while p < src.len() {
+            if src[p] == b'\\' && p + 1 < src.len() && matches!(src[p + 1], b'\n' | b'\r') {
+                p += 1;
+                if p < src.len() && src[p] == b'\r' {
+                    p += 1;
+                }
+                if p < src.len() && src[p] == b'\n' {
+                    p += 1;
+                }
+                continue;
+            }
+            if src[p] == b'\n' {
+                break;
+            }
+            p += 1;
+        }
+    }
+}
+
+/// Returns true when the macro token at `start..end` is an extra declaration specifier in front of
+/// a real type (`ETL_CONSTEXPR14 bool f()`, `static ETL_CONSTANT int x`). Such tokens make the
+/// C++ grammar see two bare type specifiers and report an error, so the parse buffer drops them.
+fn cpp_macro_is_leading_specifier(
+    src: &[u8],
+    end: usize,
+    prev_sig: u8,
+    prev_word: (usize, usize),
+) -> bool {
+    let prev_word_text = std::str::from_utf8(&src[prev_word.0..prev_word.1]).unwrap_or("");
+    let prev_word_is_type_keyword = matches!(
+        prev_word_text,
+        "class" | "struct" | "union" | "enum" | "namespace"
+    );
+    if prev_word_is_type_keyword {
+        // `class UNITTEST_LINKAGE TestDetails` / `struct API_EXPORT Foo`.
+        return src
+            .get(cpp_skip_ws_and_directives(src, end))
+            .is_some_and(|&b| is_c_ident_start(b));
+    }
+    let prev_word_is_specifier = !prev_word_text.is_empty()
+        && matches!(
+            prev_word_text,
+            "static"
+                | "const"
+                | "constexpr"
+                | "consteval"
+                | "constinit"
+                | "inline"
+                | "virtual"
+                | "explicit"
+                | "friend"
+                | "volatile"
+                | "mutable"
+                | "register"
+                | "extern"
+                | "typename"
+                | "thread_local"
+        );
+    if !(matches!(prev_sig, 0 | b'{' | b'}' | b';' | b':' | b'(' | b',' | b'>')
+        || prev_word_is_specifier)
+    {
+        return false;
+    }
+
+    let mut p = cpp_skip_ws_and_directives(src, end);
+    if !src.get(p).is_some_and(|&b| is_c_ident_start(b)) {
+        return false;
+    }
+    let mut q = p;
+    while q < src.len() && is_c_ident_continue(src[q]) {
+        q += 1;
+    }
+    if is_cpp_macro_like_token(&src[p..q]) {
+        // Specifier chain (`ETL_CONSTEXPR14 ETL_TYPE_DEF_RETURN(...)`) — drop the leading one.
+        return true;
+    }
+    p = cpp_skip_ws_and_directives(src, q);
+    let after_next = src.get(p).copied().unwrap_or(0);
+    if matches!(after_next, b'*' | b'&' | b'<') {
+        return true;
+    }
+    if after_next == b'(' {
+        // `explicit ETL_CONSTEXPR ctor()` and `ETL_CONSTEXPR type_def() : value(...)` need the
+        // macro removed; `static ETL_TYPE value(0);` declares a variable of the macro type and
+        // must stay intact (its call parens are followed by `;`).
+        let explicit_ctor = prev_word_is_specifier
+            && std::str::from_utf8(&src[prev_word.0..prev_word.1])
+                .map(|w| w == "explicit")
+                .unwrap_or(false);
+        if explicit_ctor {
+            return true;
+        }
+        if let Some(close) = find_matching_paren_bytes(src, p) {
+            let mut q = cpp_skip_ws_and_directives(src, close + 1);
+            loop {
+                let next = src.get(q).copied().unwrap_or(0);
+                if matches!(next, b':' | b'{') {
+                    return true;
+                }
+                if next == b';' || next == 0 {
+                    return false;
+                }
+                if is_c_ident_start(next) {
+                    let word_start = q;
+                    while q < src.len() && is_c_ident_continue(src[q]) {
+                        q += 1;
+                    }
+                    if !is_cpp_macro_like_token(&src[word_start..q]) {
+                        return false;
+                    }
+                    let p2 = cpp_skip_ws_and_directives(src, q);
+                    if src.get(p2) == Some(&b'(') {
+                        match find_matching_paren_bytes(src, p2) {
+                            Some(c2) => {
+                                q = cpp_skip_ws_and_directives(src, c2 + 1);
+                                continue;
+                            }
+                            None => return false,
+                        }
+                    }
+                    q = p2;
+                    continue;
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+    if after_next == b':' && src.get(p + 1) == Some(&b':') {
+        return true;
+    }
+    is_c_ident_start(after_next)
+}
+
+/// A C++ `template <...>` parameter list attached to the declaration that follows it.
+struct CppTemplateSpec {
+    /// Normalized parameter list text (`template <typename T, typename U>`).
+    display: String,
+    /// Raw source length of the parameter list, used to decide when it must be collapsed.
+    raw_len: usize,
+}
+
+impl CppTemplateSpec {
+    /// Signature prefix: the real list when short, `template<...>` when it exceeds 80 chars.
+    fn prefix(&self) -> &str {
+        if self.raw_len > 80 || self.display.len() > 80 {
+            "template<...>"
+        } else {
+            &self.display
+        }
+    }
+}
+
+/// Joins an optional namespace/enclosing type chain with a leaf name.
+fn join_cpp_scope(outer: Option<&str>, name: &str) -> String {
+    match outer {
+        Some(o) if !o.is_empty() => format!("{o}::{name}"),
+        _ => name.to_string(),
+    }
+}
+
+/// Strips balanced C++ template argument lists (`ivector<T, typename X>` -> `ivector`).
+/// Operator names (`operator<`, `operator<<`, `operator<=>`) are returned unchanged, and an
+/// unbalanced `<` (comparison, shift) is kept literally.
+fn strip_cpp_template_arguments(raw: &str) -> String {
+    if raw.contains("operator") {
+        return raw.trim().to_string();
+    }
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '<' {
+            let mut depth = 0usize;
+            let mut j = i;
+            while j < chars.len() {
+                match chars[j] {
+                    '<' => depth += 1,
+                    '>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if j < chars.len() {
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out.trim().to_string()
+}
+
 struct ExtractContext<'a> {
     scanned: &'a ScannedFile,
     bytes: &'a [u8],
@@ -766,6 +1586,8 @@ fn walk_ast(
     node: Node<'_>,
     enclosing_type: Option<&str>,
     enclosing_fn: Option<(&str, usize)>,
+    enclosing_namespace: Option<&str>,
+    template_spec: Option<&CppTemplateSpec>,
 ) {
     if node.is_error() || node.is_missing() {
         ctx.parse_errors += 1;
@@ -783,6 +1605,13 @@ fn walk_ast(
     let mut next_enclosing_type: Option<String> = enclosing_type.map(ToOwned::to_owned);
     let mut next_enclosing_fn: Option<(String, usize)> =
         enclosing_fn.map(|(n, l)| (n.to_string(), l));
+    let mut next_enclosing_namespace: Option<String> = enclosing_namespace.map(ToOwned::to_owned);
+    let local_template: Option<CppTemplateSpec> =
+        if ctx.scanned.language == LanguageKind::Cpp && kind == "template_declaration" {
+            extract_cpp_template_spec(ctx, node)
+        } else {
+            None
+        };
 
     match ctx.scanned.language {
         LanguageKind::C | LanguageKind::Cpp => {
@@ -792,8 +1621,11 @@ fn walk_ast(
                 kind,
                 enclosing_type,
                 enclosing_fn,
+                enclosing_namespace,
+                template_spec,
                 &mut next_enclosing_type,
                 &mut next_enclosing_fn,
+                &mut next_enclosing_namespace,
             );
         }
         LanguageKind::Rust => {
@@ -849,6 +1681,7 @@ fn walk_ast(
 
     let active_fn = next_enclosing_fn.as_ref().map(|(n, l)| (n.as_str(), *l));
     let active_type = next_enclosing_type.as_deref();
+    let active_namespace = next_enclosing_namespace.as_deref();
 
     extract_local_var_binding(ctx, node, kind, active_fn);
     extract_fn_ptr_candidates_from_node(ctx, node, kind, active_fn);
@@ -856,7 +1689,18 @@ fn walk_ast(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk_ast(ctx, child, active_type, active_fn);
+        let child_template = match local_template.as_ref() {
+            Some(spec) if child.kind() != "template_parameter_list" => Some(spec),
+            _ => template_spec,
+        };
+        walk_ast(
+            ctx,
+            child,
+            active_type,
+            active_fn,
+            active_namespace,
+            child_template,
+        );
     }
 
     if let Some((prev_types, prev_elems, prev_vars)) = saved_scope {
@@ -888,18 +1732,39 @@ fn is_cpp_method_field_declaration(node: Node<'_>) -> bool {
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_c_cpp_node(
     ctx: &mut ExtractContext<'_>,
     node: Node<'_>,
     kind: &str,
     enclosing_type: Option<&str>,
     enclosing_fn: Option<(&str, usize)>,
+    enclosing_namespace: Option<&str>,
+    template_spec: Option<&CppTemplateSpec>,
     next_enclosing_type: &mut Option<String>,
     next_enclosing_fn: &mut Option<(String, usize)>,
+    next_enclosing_namespace: &mut Option<String>,
 ) {
     match kind {
+        "namespace_definition" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let raw = normalize_whitespace(node_text(name_node, ctx.bytes));
+                let raw = raw.strip_prefix("inline ").unwrap_or(&raw).trim();
+                let cleaned = strip_cpp_template_arguments(raw);
+                if !cleaned.is_empty() && cleaned != "inline" {
+                    *next_enclosing_namespace = Some(join_cpp_scope(enclosing_namespace, &cleaned));
+                }
+            }
+        }
         "function_definition" => {
-            if let Some(sym) = extract_c_cpp_function(ctx, node, enclosing_type, false) {
+            if let Some(sym) = extract_c_cpp_function(
+                ctx,
+                node,
+                enclosing_type,
+                enclosing_namespace,
+                template_spec,
+                false,
+            ) {
                 *next_enclosing_fn = Some((sym.name.clone(), sym.start_line));
                 ctx.symbols.push(sym);
             }
@@ -909,8 +1774,30 @@ fn handle_c_cpp_node(
             if ctx.is_header && is_cpp_method_field_declaration(node) {
                 let text = node_text(node, ctx.bytes);
                 if !text.trim_start().starts_with("typedef") {
-                    if let Some(sym) = extract_c_cpp_function(ctx, node, enclosing_type, true) {
+                    if let Some(sym) = extract_c_cpp_function(
+                        ctx,
+                        node,
+                        enclosing_type,
+                        enclosing_namespace,
+                        template_spec,
+                        true,
+                    ) {
                         ctx.header_prototypes.push(sym);
+                    }
+                }
+            } else if has_descendant_kind(node, "operator_cast") {
+                if let Some(sym) = extract_c_cpp_function(
+                    ctx,
+                    node,
+                    enclosing_type,
+                    enclosing_namespace,
+                    template_spec,
+                    true,
+                ) {
+                    if ctx.is_header {
+                        ctx.header_prototypes.push(sym);
+                    } else {
+                        ctx.symbols.push(sym);
                     }
                 }
             } else if enclosing_fn.is_none() {
@@ -919,15 +1806,29 @@ fn handle_c_cpp_node(
             }
         }
         "field_declaration" => {
-            // C++ method declaration inside class/struct in a header file
-            if ctx.is_header && is_cpp_method_field_declaration(node) {
-                if let Some(sym) = extract_c_cpp_function(ctx, node, enclosing_type, true) {
+            // C++ method declaration inside class/struct in a header file. Nested type
+            // definitions (`class Inner { ... };`) are handled by the specifier branch below.
+            if ctx.is_header
+                && !has_cpp_type_specifier_child(node)
+                && is_cpp_method_field_declaration(node)
+            {
+                if let Some(sym) = extract_c_cpp_function(
+                    ctx,
+                    node,
+                    enclosing_type,
+                    enclosing_namespace,
+                    template_spec,
+                    true,
+                ) {
                     ctx.header_prototypes.push(sym);
                 }
             }
         }
+        "alias_declaration" => {
+            extract_cpp_alias(ctx, node, enclosing_type, enclosing_namespace);
+        }
         "type_definition" => {
-            extract_c_typedef(ctx, node);
+            extract_c_typedef(ctx, node, enclosing_type, enclosing_namespace);
         }
         "struct_specifier" | "union_specifier" | "enum_specifier" | "class_specifier" => {
             let type_kind = match kind {
@@ -936,7 +1837,9 @@ fn handle_c_cpp_node(
                 "enum_specifier" => TypeKind::Enum,
                 _ => TypeKind::Class,
             };
-            if let Some(ty_name) = extract_c_specifier_type(ctx, node, type_kind) {
+            if let Some(ty_name) =
+                extract_c_specifier_type(ctx, node, type_kind, enclosing_type, enclosing_namespace)
+            {
                 *next_enclosing_type = Some(ty_name);
             }
         }
@@ -956,6 +1859,91 @@ fn handle_c_cpp_node(
     }
 }
 
+/// Returns true when a `field_declaration` carries a nested class/struct/union/enum definition.
+fn has_cpp_type_specifier_child(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    let mut found = false;
+    for child in node.children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+        ) {
+            found = true;
+            break;
+        }
+    }
+    found
+}
+
+/// Extracts the `template <...>` prefix attached to a `template_declaration`.
+fn extract_cpp_template_spec(ctx: &ExtractContext<'_>, node: Node<'_>) -> Option<CppTemplateSpec> {
+    let mut decl_start = node.end_byte();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "template_parameter_list" {
+            decl_start = child.start_byte();
+            break;
+        }
+    }
+    if decl_start <= node.start_byte() {
+        return None;
+    }
+    let raw = std::str::from_utf8(ctx.bytes.get(node.start_byte()..decl_start)?).ok()?;
+    let display = normalize_whitespace(raw);
+    if !display.starts_with("template") || !display.contains('<') {
+        return None;
+    }
+    Some(CppTemplateSpec {
+        display,
+        raw_len: raw.trim_end().len(),
+    })
+}
+
+/// Extracts a C++ `using` alias (`using value_type = T;`) as a typedef-kind type.
+fn extract_cpp_alias(
+    ctx: &mut ExtractContext<'_>,
+    node: Node<'_>,
+    enclosing_type: Option<&str>,
+    enclosing_namespace: Option<&str>,
+) {
+    let name_node = node
+        .child_by_field_name("name")
+        .or_else(|| node.named_child(0));
+    let Some(name_node) = name_node else {
+        return;
+    };
+    let name = node_text(name_node, ctx.bytes).trim().to_string();
+    if name.is_empty() || !is_valid_identifier(&name) {
+        return;
+    }
+    let fields_summary = node
+        .child_by_field_name("type")
+        .map(|t| normalize_whitespace(node_text(t, ctx.bytes)))
+        .unwrap_or_default();
+    let start_line = node.start_position().row + 1;
+    let end_line = node.end_position().row + 1;
+    let doc_summary = extract_preceding_doc(ctx.lines, start_line);
+    let scope = enclosing_type
+        .map(ToOwned::to_owned)
+        .or_else(|| enclosing_namespace.map(ToOwned::to_owned));
+    let qualified_name = join_cpp_scope(scope.as_deref(), &name);
+    let type_id = format!("{}::{}", ctx.scanned.rel_path, qualified_name);
+    ctx.types.push(ExtractedType {
+        type_id,
+        name,
+        kind: TypeKind::Typedef,
+        visibility: Visibility::Public,
+        file: ctx.scanned.rel_path.clone(),
+        start_line,
+        end_line,
+        fields_summary,
+        doc_summary,
+        scope: ctx.current_scope(),
+        arch_layer: ctx.current_layer(),
+        section_id: ctx.section_id.to_string(),
+    });
+}
+
 fn extract_decl_header<'a>(node: Node<'_>, bytes: &'a [u8]) -> &'a str {
     let full_text = node_text(node, bytes);
     let header_end = node
@@ -971,14 +1959,47 @@ fn extract_decl_header<'a>(node: Node<'_>, bytes: &'a [u8]) -> &'a str {
 }
 
 fn extract_c_cpp_function(
-    ctx: &ExtractContext<'_>,
+    ctx: &mut ExtractContext<'_>,
     node: Node<'_>,
     enclosing_type: Option<&str>,
+    enclosing_namespace: Option<&str>,
+    template_spec: Option<&CppTemplateSpec>,
     is_prototype: bool,
 ) -> Option<ExtractedSymbol> {
-    let fn_decl = find_first_descendant_of_kind(node, "function_declarator")?;
-    let decl_target = fn_decl.child_by_field_name("declarator").unwrap_or(fn_decl);
-    let raw_decl_name = extract_declarator_name(decl_target, ctx.bytes)?;
+    let fn_decl = find_first_descendant_of_kind(node, "function_declarator");
+    let raw_decl_name = if let Some(fn_decl) = fn_decl {
+        let decl_target = fn_decl.child_by_field_name("declarator").unwrap_or(fn_decl);
+        extract_declarator_name(decl_target, ctx.bytes)?
+    } else {
+        // Conversion operators (`operator bool()`) are `operator_cast` nodes; an out-of-line
+        // definition (`Box<T>::operator bool()`) keeps the qualified name on the enclosing
+        // declarator, which also carries the parameter list.
+        let cast = find_first_descendant_of_kind(node, "operator_cast")?;
+        match node.child_by_field_name("declarator") {
+            Some(decl) if matches!(decl.kind(), "qualified_identifier" | "scoped_identifier") => {
+                let text = normalize_whitespace(node_text(decl, ctx.bytes));
+                let idx = text.rfind("operator").unwrap_or(0);
+                let leaf = &text[idx..];
+                let op_name = if leaf.starts_with("operator()") {
+                    "operator()".to_string()
+                } else {
+                    leaf.split('(').next().unwrap_or(leaf).trim().to_string()
+                };
+                let scope = strip_cpp_template_arguments(
+                    text[..idx]
+                        .trim()
+                        .trim_end_matches(':')
+                        .trim_end_matches(':'),
+                );
+                if scope.is_empty() {
+                    op_name
+                } else {
+                    format!("{scope}::{op_name}")
+                }
+            }
+            _ => extract_declarator_name(cast, ctx.bytes)?,
+        }
+    };
     if raw_decl_name.is_empty()
         || matches!(
             raw_decl_name.as_str(),
@@ -1000,7 +2021,7 @@ fn extract_c_cpp_function(
     // Handle AVR/embedded ISR(VECTOR_NAME) macro-style function definitions
     let (mut name, mut forced_isr) =
         if (raw_decl_name == "ISR" || raw_decl_name == "SIGNAL") && !is_prototype {
-            if let Some(params) = fn_decl.child_by_field_name("parameters") {
+            if let Some(params) = fn_decl.and_then(|n| n.child_by_field_name("parameters")) {
                 let param_txt = node_text(params, ctx.bytes).trim();
                 (format!("{raw_decl_name}{param_txt}"), true)
             } else {
@@ -1010,15 +2031,36 @@ fn extract_c_cpp_function(
             (raw_decl_name, false)
         };
 
-    // Handle C++ out-of-line qualified method definitions: `ClassName::method_name`
+    if ctx.scanned.language == LanguageKind::Cpp
+        && is_cpp_macro_like_token(name.as_bytes())
+        && !forced_isr
+    {
+        // Macro-expanded definitions are syntactically repaired with synthetic declarators in
+        // the parse buffer; they are not real callables.
+        return None;
+    }
+
+    // Handle C++ out-of-line qualified method definitions: `ClassName::method_name`,
+    // `ns::ClassName::method_name`, and template forms (`ivector<T>::push_back`). The enclosing
+    // type stays a class scope (never a bare namespace) so namespaced free functions remain
+    // `fn` symbols while their qualified names still carry the namespace.
     let mut effective_enclosing: Option<String> = enclosing_type.map(ToOwned::to_owned);
+    let mut namespace_scope: Option<String> = enclosing_namespace.map(ToOwned::to_owned);
     if let Some((scope_part, leaf_part)) = name.rsplit_once("::") {
-        let clean_scope = scope_part.trim().to_string();
-        let clean_leaf = leaf_part.trim().to_string();
+        let clean_scope = strip_cpp_template_arguments(scope_part);
+        let clean_leaf = strip_cpp_template_arguments(leaf_part);
         if !clean_scope.is_empty() && !clean_leaf.is_empty() {
-            effective_enclosing = Some(clean_scope);
+            let scope = if clean_scope.contains("::") || enclosing_namespace.is_none() {
+                clean_scope
+            } else {
+                join_cpp_scope(enclosing_namespace, &clean_scope)
+            };
+            effective_enclosing = Some(scope);
+            namespace_scope = None;
             name = clean_leaf;
         }
+    } else {
+        name = strip_cpp_template_arguments(&name);
     }
 
     let start_line = node.start_position().row + 1;
@@ -1049,11 +2091,14 @@ fn extract_c_cpp_function(
     );
 
     let qualified_name = match effective_enclosing.as_deref() {
-        Some(enc) => format!("{enc}::{name}"),
-        None => name.clone(),
+        Some(enc) => join_cpp_scope(Some(enc), &name),
+        None => join_cpp_scope(namespace_scope.as_deref(), &name),
     };
     let symbol_id = format!("{}::{}", ctx.scanned.rel_path, qualified_name);
-    let signature = extract_clean_signature(node, ctx.bytes);
+    let mut signature = extract_clean_signature(node, ctx.bytes);
+    if let Some(spec) = template_spec {
+        signature = truncate_str(&format!("{} {}", spec.prefix(), signature), 160);
+    }
 
     Some(ExtractedSymbol {
         symbol_id,
@@ -1088,7 +2133,12 @@ fn c_decl_header_is_static(decl_header: &str) -> bool {
         })
 }
 
-fn extract_c_typedef(ctx: &mut ExtractContext<'_>, node: Node<'_>) {
+fn extract_c_typedef(
+    ctx: &mut ExtractContext<'_>,
+    node: Node<'_>,
+    enclosing_type: Option<&str>,
+    enclosing_namespace: Option<&str>,
+) {
     let Some(declarator) = node.child_by_field_name("declarator") else {
         return;
     };
@@ -1125,7 +2175,9 @@ fn extract_c_typedef(ctx: &mut ExtractContext<'_>, node: Node<'_>) {
         }
     }
 
-    let type_id = format!("{}::{}", ctx.scanned.rel_path, typedef_name);
+    let type_scope = enclosing_type.or(enclosing_namespace);
+    let qualified_name = join_cpp_scope(type_scope, &typedef_name);
+    let type_id = format!("{}::{}", ctx.scanned.rel_path, qualified_name);
     ctx.types.push(ExtractedType {
         type_id,
         name: typedef_name,
@@ -1146,30 +2198,39 @@ fn extract_c_specifier_type(
     ctx: &mut ExtractContext<'_>,
     node: Node<'_>,
     kind: TypeKind,
+    enclosing_type: Option<&str>,
+    enclosing_namespace: Option<&str>,
 ) -> Option<String> {
     let range = (node.start_byte(), node.end_byte());
+    let raw_name = node
+        .child_by_field_name("name")
+        .map(|n| node_text(n, ctx.bytes).trim().to_string())?;
+    let name = strip_cpp_template_arguments(&raw_name);
     if ctx.handled_type_ranges.contains(&range) {
-        return node
-            .child_by_field_name("name")
-            .map(|n| node_text(n, ctx.bytes).trim().to_string());
+        return Some(name);
     }
 
     // Only emit standalone struct/enum/union/class if it has a body block
-    let body = node.child_by_field_name("body")?;
-    let name_node = node.child_by_field_name("name")?;
-    let name = node_text(name_node, ctx.bytes).trim().to_string();
+    let _body = node.child_by_field_name("body")?;
     if name.is_empty() {
         return None;
     }
+    // A qualified name already carries its own scope (`class ns::Outer::Inner`).
+    let qualified_name = if name.contains("::") {
+        name.clone()
+    } else if let Some(enc) = enclosing_type {
+        join_cpp_scope(Some(enc), &name)
+    } else {
+        join_cpp_scope(enclosing_namespace, &name)
+    };
 
     ctx.handled_type_ranges.insert(range);
     let start_line = node.start_position().row + 1;
     let end_line = node.end_position().row + 1;
     let doc_summary = extract_preceding_doc(ctx.lines, start_line);
     let fields_summary = summarize_c_type_fields(node, ctx.bytes);
-    let _ = body;
 
-    let type_id = format!("{}::{}", ctx.scanned.rel_path, name);
+    let type_id = format!("{}::{}", ctx.scanned.rel_path, qualified_name);
     ctx.types.push(ExtractedType {
         type_id,
         name: name.clone(),
@@ -1185,7 +2246,7 @@ fn extract_c_specifier_type(
         section_id: ctx.section_id.to_string(),
     });
 
-    Some(name)
+    Some(qualified_name)
 }
 
 fn recover_c_field_from_raw_text(
@@ -3044,10 +4105,14 @@ fn classify_symbol_kind(
     }
 
     // 3. Constructors
+    let enclosing_leaf = enclosing_type
+        .and_then(|enc| enc.rsplit("::").next())
+        .unwrap_or("");
     if matches!(
         name,
         "__init__" | "__new__" | "new" | "constructor" | "default"
-    ) || (enclosing_type.is_some() && (name.starts_with("new_") || enclosing_type == Some(name)))
+    ) || (enclosing_type.is_some()
+        && (name.starts_with("new_") || (enclosing_leaf == name && !name.starts_with('~'))))
     {
         return SymbolKind::Constructor;
     }
@@ -4217,6 +5282,13 @@ fn extract_declarator_name(node: Node<'_>, bytes: &[u8]) -> Option<String> {
     match node.kind() {
         "identifier" | "field_identifier" | "type_identifier" | "destructor_name" => {
             Some(node_text(node, bytes).trim().to_string())
+        }
+        "operator_name" | "literal_operator_name" => {
+            Some(normalize_whitespace(node_text(node, bytes)))
+        }
+        "operator_cast" => {
+            let text = node_text(node, bytes);
+            Some(text.split('(').next().unwrap_or(text).trim().to_string())
         }
         "qualified_identifier" | "scoped_identifier" => {
             Some(normalize_whitespace(node_text(node, bytes)))
@@ -5410,5 +6482,211 @@ void baz_init(void) {}
         // Divider-only comment blocks must not become a doc summary.
         assert_eq!(doc("divider_only_init"), "");
         assert_eq!(doc("banner_only_init"), "");
+    }
+
+    #[test]
+    fn test_parse_cpp_templates_namespaces_out_of_line_and_aliases() {
+        let src = r#"#ifndef DEMO_H
+#define DEMO_H
+namespace demo {
+template <typename T>
+class Box {
+public:
+    Box();
+    ~Box();
+    T get() const;
+    void set(T value);
+    Box& operator=(const Box& other);
+    bool operator==(const Box& other) const;
+    T& operator[](size_t i);
+    bool operator<(const Box& other) const;
+    operator bool() const;
+    using value_type = T;
+    class Inner {
+    public:
+        void touch();
+    };
+};
+template <typename T>
+Box<T>::Box() {}
+template <typename T>
+Box<T>::~Box() {}
+template <typename T>
+void Box<T>::set(T value) {}
+template <typename T>
+T Box<T>::get() const { return value; }
+template <typename T>
+T& Box<T>::operator[](size_t i) { return value; }
+template <typename T>
+bool Box<T>::operator==(const Box<T>& other) const { return true; }
+template <typename T>
+Box<T>::operator bool() const { return true; }
+}
+class Outer {
+public:
+    void method();
+};
+void Outer::method() {}
+"#;
+        let scanned = dummy_scanned("demo.h", LanguageKind::Cpp);
+        let unit = parse_source_str(&scanned, src).expect("parse C++ fixture");
+        assert_eq!(
+            unit.parse_errors,
+            0,
+            "fixture must parse cleanly: {:?}",
+            unit.symbols
+                .iter()
+                .map(|s| &s.symbol_id)
+                .collect::<Vec<_>>()
+        );
+
+        let ty = |name: &str| {
+            unit.types
+                .iter()
+                .find(|t| t.name == name && t.kind == TypeKind::Class)
+                .unwrap_or_else(|| panic!("missing class {name}"))
+        };
+        let box_ty = ty("Box");
+        assert_eq!(box_ty.type_id, "demo.h::demo::Box");
+        assert_eq!(box_ty.start_line, 5);
+        let inner_ty = ty("Inner");
+        assert_eq!(inner_ty.type_id, "demo.h::demo::Box::Inner");
+
+        let alias = unit
+            .types
+            .iter()
+            .find(|t| t.name == "value_type")
+            .expect("using alias emitted as a type");
+        assert_eq!(alias.kind, TypeKind::Typedef);
+        assert_eq!(alias.type_id, "demo.h::demo::Box::value_type");
+        assert_eq!(alias.fields_summary, "T");
+
+        let sym = |name: &str| {
+            unit.symbols
+                .iter()
+                .find(|s| s.name == name && s.qualified_name.contains("Box"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing symbol {name}: {:?}",
+                        unit.symbols
+                            .iter()
+                            .map(|s| &s.symbol_id)
+                            .collect::<Vec<_>>()
+                    )
+                })
+        };
+        let set = sym("set");
+        assert_eq!(set.kind, SymbolKind::Method);
+        assert_eq!(set.enclosing_type.as_deref(), Some("demo::Box"));
+        assert_eq!(set.symbol_id, "demo.h::demo::Box::set");
+        assert_eq!(set.start_line, 27);
+
+        let ctor = unit
+            .symbols
+            .iter()
+            .find(|s| s.symbol_id == "demo.h::demo::Box::Box")
+            .expect("constructor extracted");
+        assert_eq!(ctor.kind, SymbolKind::Constructor);
+
+        let dtor = unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "~Box" && s.qualified_name.starts_with("demo::Box"))
+            .expect("destructor extracted");
+        assert_eq!(dtor.kind, SymbolKind::Method);
+        assert!(dtor.signature.contains("~Box"), "{}", dtor.signature);
+
+        for op in ["operator=", "operator==", "operator[]", "operator<"] {
+            assert!(
+                unit.symbols
+                    .iter()
+                    .any(|s| s.name == op && s.enclosing_type.as_deref() == Some("demo::Box")),
+                "missing operator {op}: {:?}",
+                unit.symbols
+                    .iter()
+                    .map(|s| &s.symbol_id)
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            unit.symbols
+                .iter()
+                .any(|s| s.name == "operator bool" || s.name == "operator bool() const"),
+            "conversion operator missing: {:?}",
+            unit.symbols
+                .iter()
+                .map(|s| &s.symbol_id)
+                .collect::<Vec<_>>()
+        );
+
+        let outer = unit
+            .symbols
+            .iter()
+            .find(|s| s.symbol_id == "demo.h::Outer::method")
+            .expect("out-of-line method extracted");
+        assert_eq!(outer.kind, SymbolKind::Method);
+        assert_eq!(outer.enclosing_type.as_deref(), Some("Outer"));
+        assert_eq!(outer.start_line, 41);
+        assert_eq!(outer.end_line, 41);
+        assert!(
+            outer.signature.contains("Outer::method"),
+            "{}",
+            outer.signature
+        );
+
+        let inner_touch = unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "touch")
+            .expect("nested class member prototype");
+        assert_eq!(
+            inner_touch.enclosing_type.as_deref(),
+            Some("demo::Box::Inner")
+        );
+        assert_eq!(inner_touch.symbol_id, "demo.h::demo::Box::Inner::touch");
+    }
+
+    #[test]
+    fn test_cpp_template_parameter_list_collapsed_in_signatures() {
+        let long_params = "typename TParameterOne, typename TParameterTwo, typename TParameterThree, typename TParameterFour";
+        assert!(long_params.len() > 80);
+        let src = format!(
+            "template <{long_params}>\nvoid transform(TParameterOne first, TParameterTwo second, TParameterThree third, TParameterFour fourth) {{}}\n"
+        );
+        let scanned = dummy_scanned("algorithm.h", LanguageKind::Cpp);
+        let unit = parse_source_str(&scanned, &src).expect("parse long template");
+        assert_eq!(unit.parse_errors, 0);
+        let sym = &unit.symbols[0];
+        assert!(
+            sym.signature.starts_with("template<...>"),
+            "signature must collapse long template lists: {}",
+            sym.signature
+        );
+        assert!(!sym.signature.contains(long_params));
+        assert!(sym.signature.len() <= 160, "{}", sym.signature.len());
+
+        let short = "template <typename T>\nvoid id(T value) {}\n";
+        let unit = parse_source_str(&scanned, short).expect("parse short template");
+        let sym = &unit.symbols[0];
+        assert!(
+            sym.signature.starts_with("template <typename T>"),
+            "{}",
+            sym.signature
+        );
+    }
+
+    #[test]
+    fn test_cpp_macro_annotation_normalization_preserves_offsets() {
+        let src = b"class A {\n  void f() ETL_NOEXCEPT_IF((etl::is_nothrow<T>::value)) { ETL_ASSERT(x); }\n};\n";
+        let out = normalize_cpp_macro_annotations(src).expect("normalizer fired");
+        assert_eq!(out.len(), src.len(), "byte offsets must be preserved");
+        assert_eq!(
+            out.iter().filter(|&&b| b == b'\n').count(),
+            src.iter().filter(|&&b| b == b'\n').count(),
+            "line structure must be preserved"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("ETL_NOEXCEPT_IF"), "{text}");
+        assert!(!text.contains("ETL_ASSERT"), "{text}");
     }
 }

@@ -729,12 +729,11 @@ fn resolve_callee_candidates(
         .collect();
     if !same_file.is_empty() {
         if let Some(qual) = effective_qualifier {
-            let q_leaf = qualifier_leaf(qual);
             if let Some(&idx) = same_file.iter().find(|&&idx| {
                 symbols[idx]
                     .enclosing_type
                     .as_deref()
-                    .is_some_and(|et| et.eq_ignore_ascii_case(q_leaf))
+                    .is_some_and(|et| enclosing_matches_qualifier(et, qual))
             }) {
                 return (symbols[idx].symbol_id.clone(), ResolutionTier::SameFile);
             }
@@ -856,7 +855,7 @@ fn resolve_callee_candidates(
                         symbols[idx]
                             .enclosing_type
                             .as_deref()
-                            .is_some_and(|et| et.eq_ignore_ascii_case(caller_ty))
+                            .is_some_and(|et| enclosing_matches_qualifier(et, caller_ty))
                     })
                     .collect();
                 if !matching_type.is_empty() {
@@ -886,7 +885,7 @@ fn resolve_callee_candidates(
                 None => true,
                 Some(et) => caller
                     .enclosing_type
-                    .is_some_and(|ct| ct.eq_ignore_ascii_case(et)),
+                    .is_some_and(|ct| enclosing_matches_qualifier(et, ct)),
             }
         });
     }
@@ -1839,6 +1838,26 @@ fn qualifier_leaf(qualifier: &str) -> &str {
         .trim()
 }
 
+/// True when a symbol's `enclosing_type` answers a call-site qualifier. C++ enclosing types are
+/// namespace-qualified (`etl::ivector`), so the comparison accepts the full qualified name, a
+/// bare leaf (`ivector`), and the namespace leaf of the enclosing type.
+fn enclosing_matches_qualifier(enclosing: &str, qualifier: &str) -> bool {
+    if enclosing.eq_ignore_ascii_case(qualifier) {
+        return true;
+    }
+    let leaf = qualifier_leaf(qualifier);
+    if leaf.is_empty() {
+        return false;
+    }
+    if enclosing.eq_ignore_ascii_case(leaf) {
+        return true;
+    }
+    enclosing
+        .rsplit("::")
+        .next()
+        .is_some_and(|enclosing_leaf| enclosing_leaf.eq_ignore_ascii_case(leaf))
+}
+
 /// True when the qualifier is directly the instance/class receiver (`self`, `cls`, `this`, `super`)
 /// rather than a member attribute chain (`self._queue`), variable, or module name.
 #[inline]
@@ -1883,7 +1902,7 @@ fn qualified_candidate_allowed(
     let q_leaf = qualifier_leaf(qualifier);
     // A method of the type named by the qualifier always answers the call.
     if let Some(enclosing) = sym.enclosing_type.as_deref() {
-        if enclosing.eq_ignore_ascii_case(qualifier) || enclosing.eq_ignore_ascii_case(q_leaf) {
+        if enclosing_matches_qualifier(enclosing, qualifier) {
             return true;
         }
         // If the call site uses an explicit `Type::func()` path or a PascalCase type/namespace

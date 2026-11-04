@@ -1507,6 +1507,16 @@ int plain_compute(plain_sample_t *s, int x);
     let type_out = query_types(&cpp_bundles, "Box", false, 10).expect("query Box type");
     assert!(type_out.contains("pub class `Box`"), "{type_out}");
     assert!(type_out.contains("demo.h:3"), "{type_out}");
+    assert!(
+        type_out.contains("demo.h::demo::Box"),
+        "namespace-qualified type_id expected: {type_out}"
+    );
+    let qualified_type_out =
+        query_types(&cpp_bundles, "demo::Box", false, 10).expect("query demo::Box type");
+    assert!(
+        qualified_type_out.contains("demo.h::demo::Box"),
+        "namespace-qualified lookup expected: {qualified_type_out}"
+    );
 
     // Unrelated edit -> the incremental (stat-only) path must keep the recorded header language,
     // so the language breakdown of the refreshed bundle equals the full build's.
