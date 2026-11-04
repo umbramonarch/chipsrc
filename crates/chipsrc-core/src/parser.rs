@@ -823,6 +823,15 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
     let mut pending_namespace = false;
     let mut pending_class_name: Option<String> = None;
     let mut saw_paren = false;
+    // A `class` keyword inside a template parameter list (`template <class T>`) is not a class
+    // definition; the angle-depth pair tracks that so the function body keeps a Function frame.
+    let mut template_params_pending = false;
+    let mut angle_depth = 0usize;
+    let mut pending_class_from_template = false;
+    // A macro-like token directly after a closing `)` is a trailing annotation only when that
+    // `)` closed a declarator, never when it closed an `if`/`while`/`for`/`switch` header.
+    let mut prev_paren_closed_control = false;
+    let mut paren_control_stack: Vec<bool> = Vec::new();
 
     while i < n {
         let b = src[i];
@@ -972,6 +981,7 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
                 pending_class = true;
                 pending_namespace = false;
                 pending_class_name = None;
+                pending_class_from_template = angle_depth > 0;
             } else if word == b"namespace" {
                 pending_namespace = true;
                 pending_class = false;
@@ -987,18 +997,23 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
             }
             let is_macro = is_cpp_macro_like_token(word);
             if !is_macro && word != b"operator" && word != b"typename" {
+                if word == b"template" {
+                    template_params_pending = true;
+                }
                 prev_sig = word[word.len() - 1];
                 prev_word = (start, i);
                 continue;
             }
 
             let p = cpp_skip_ws_and_directives(src, i);
+            let prev_paren_was_control = prev_paren_closed_control && prev_sig == b')';
+            prev_paren_closed_control = false;
             let prev_word_text = std::str::from_utf8(&src[prev_word.0..prev_word.1]).unwrap_or("");
             let prev_qualifier = matches!(
                 prev_word_text,
                 "const" | "volatile" | "noexcept" | "override" | "final" | "mutable"
             );
-            let prev_control = matches!(prev_word_text, "if" | "while" | "switch" | "for" | "else");
+            let prev_control = matches!(prev_word_text, "if" | "while" | "switch" | "for");
             let statement_start = matches!(prev_sig, 0 | b'{' | b'}' | b';');
 
             let member_operator =
@@ -1048,8 +1063,16 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
                 prev_word = (start, i);
                 continue;
             }
-            if prev_control && src.get(p) == Some(&b'(') {
-                // `if ETL_IF_CONSTEXPR (cond)`: drop the macro keyword, keep the condition.
+            if prev_control
+                && prev_word.1 <= start
+                && src[prev_word.1..start]
+                    .iter()
+                    .all(|b| b.is_ascii_whitespace())
+                && src.get(p) == Some(&b'(')
+            {
+                // `if ETL_IF_CONSTEXPR (cond)`: drop the macro keyword, keep the condition. The
+                // whitespace check keeps `for (;;) TX()` — whose last word is still the header
+                // keyword — from being mistaken for this control-condition macro form.
                 let buf = out.get_or_insert_with(|| src.to_vec());
                 blank_range_preserving_newlines(buf, start, i);
                 prev_sig = b' ';
@@ -1060,7 +1083,9 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
                 if let Some(close) = find_matching_paren_bytes(src, p) {
                     let after_idx = cpp_skip_plain_ws(src, close + 1);
                     let after = src.get(after_idx).copied().unwrap_or(0);
-                    let trailing_annotation = matches!(prev_sig, b')') || prev_qualifier;
+                    let trailing_annotation = (matches!(prev_sig, b')') || prev_qualifier)
+                        && !prev_paren_was_control
+                        && !(in_function_body(&brace_stack) && after != b'{');
                     if trailing_annotation {
                         let buf = out.get_or_insert_with(|| src.to_vec());
                         blank_range_preserving_newlines(buf, start, after_idx);
@@ -1080,11 +1105,53 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
                     // A word (and optional `*`/`&` declarator) directly before the token is a
                     // return type (`void TX() {}`), and the enclosing class name is a constructor
                     // (`class IO { IO() {} };`): both are legitimate callables, never macros.
-                    let prev_word_adjacent = prev_word.1 <= start
+                    let prev_word_is_control_or_specifier = matches!(
+                        prev_word_text,
+                        "if" | "else"
+                            | "while"
+                            | "for"
+                            | "switch"
+                            | "do"
+                            | "return"
+                            | "case"
+                            | "default"
+                            | "goto"
+                            | "sizeof"
+                            | "new"
+                            | "delete"
+                            | "throw"
+                            | "co_return"
+                            | "co_await"
+                            | "co_yield"
+                            | "public"
+                            | "private"
+                            | "protected"
+                    ) || is_cpp_declaration_keyword(
+                        &src[prev_word.0..prev_word.1],
+                    ) || prev_qualifier;
+                    let prev_word_adjacent = !prev_word_text.is_empty()
+                        && prev_word.1 <= start
                         && start > prev_word.1
-                        && src[prev_word.1..start]
-                            .iter()
-                            .all(|b| b.is_ascii_whitespace() || matches!(b, b'*' | b'&'));
+                        && !prev_word_is_control_or_specifier
+                        && {
+                            let gap = &src[prev_word.1..start];
+                            let mut j = 0usize;
+                            let mut adjacent = true;
+                            while j < gap.len() {
+                                match gap[j] {
+                                    b' ' | b'\t' | b'\r' | b'\n' | b'*' | b'&' | b'~' | b'<'
+                                    | b'>' | b',' => j += 1,
+                                    // A lone `:` is an access specifier (`public: MACRO(...)`), not a
+                                    // qualifier: only a `::` scope operator separates a declarator.
+                                    b':' if gap.get(j + 1) == Some(&b':') => j += 2,
+                                    _ => {
+                                        adjacent = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            adjacent
+                        };
                     let constructor_name = brace_stack.iter().rev().find_map(|frame| match frame {
                         BraceCtx::Class(name) => Some(name.as_str()),
                         _ => None,
@@ -1094,7 +1161,21 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
                             && std::str::from_utf8(word)
                                 .is_ok_and(|word| word.eq_ignore_ascii_case(name))
                     });
-                    let is_normal_declarator = prev_word_adjacent || in_constructor_context;
+                    // A qualified or member-access prefix (`IO::IO`, `IO::~IO`, `Box<T>::TX`,
+                    // `device.TX`, `object->TX`) always names a real declarator or call. Comments
+                    // and whitespace between the prefix and the token are skipped first, so a
+                    // doc-comment ending in `.` or `::` cannot masquerade as a member access.
+                    let prefix_end = cpp_skip_ws_and_comments_backwards(src, start);
+                    let qualified_prefix = if prefix_end >= 2
+                        && ((src[prefix_end - 2] == b':' && src[prefix_end - 1] == b':')
+                            || (src[prefix_end - 2] == b'-' && src[prefix_end - 1] == b'>'))
+                    {
+                        true
+                    } else {
+                        prefix_end >= 1 && matches!(src[prefix_end - 1], b'.' | b'~')
+                    };
+                    let is_normal_declarator =
+                        prev_word_adjacent || in_constructor_context || qualified_prefix;
                     if after == b'{' && (statement_start || prev_sig == b'>') {
                         if !is_normal_declarator {
                             // Macro-expanded definition (`TEST_FIXTURE(...) { ... }`,
@@ -1124,7 +1205,13 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
                         saw_paren = true;
                         continue;
                     }
-                    if is_c_ident_start(after) {
+                    if !is_normal_declarator
+                        && is_c_ident_start(after)
+                        && !matches!(
+                            next_word,
+                            b"const" | b"volatile" | b"noexcept" | b"override" | b"final"
+                        )
+                    {
                         let buf = out.get_or_insert_with(|| src.to_vec());
                         if is_cpp_declaration_keyword(next_word) || next_is_macro {
                             // Attribute-like prefix (`MACRO(...) void f()`) before another
@@ -1193,6 +1280,8 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
                     false
                 };
                 if (matches!(prev_sig, b')') || prev_qualifier)
+                    && (!prev_paren_was_control || next == b'{')
+                    && !(in_function_body(&brace_stack) && next != b'{')
                     && (matches!(next, b';' | b'{' | b':' | b',' | b')' | b'=') || next_is_macro)
                 {
                     // Bare trailing annotation macro (`void f() const ETL_NOEXCEPT {`), possibly
@@ -1270,6 +1359,7 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
                 pending_class = false;
                 pending_namespace = false;
                 pending_class_name = None;
+                pending_class_from_template = false;
                 saw_paren = false;
                 brace_stack.push(frame);
             }
@@ -1278,15 +1368,48 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
                 pending_class = false;
                 pending_namespace = false;
                 pending_class_name = None;
+                pending_class_from_template = false;
                 saw_paren = false;
             }
             b';' => {
                 pending_class = false;
                 pending_namespace = false;
                 pending_class_name = None;
+                pending_class_from_template = false;
                 saw_paren = false;
             }
-            b'(' => saw_paren = true,
+            b'(' => {
+                saw_paren = true;
+                // A parameter list before the body (`void f() {`) must not look like a class
+                // declaration, but a base-class argument list (`class P : Base<sizeof(T)> {`)
+                // must not clear the class frame either: only clear while no class name has been
+                // seen yet (e.g. a `class` inside a template parameter list before its `>`).
+                if pending_class_name.is_none() {
+                    pending_class = false;
+                    pending_class_from_template = false;
+                }
+                let prev_word_text =
+                    std::str::from_utf8(&src[prev_word.0..prev_word.1]).unwrap_or("");
+                let control_header = matches!(prev_word_text, "if" | "while" | "for" | "switch")
+                    && prev_word.1 <= i
+                    && src[prev_word.1..i].iter().all(|b| b.is_ascii_whitespace());
+                paren_control_stack.push(control_header);
+            }
+            b')' => {
+                prev_paren_closed_control = paren_control_stack.pop().unwrap_or(false);
+            }
+            b'<' if template_params_pending => {
+                template_params_pending = false;
+                angle_depth += 1;
+            }
+            b'>' if angle_depth > 0 => {
+                angle_depth -= 1;
+                if angle_depth == 0 && pending_class_from_template {
+                    pending_class = false;
+                    pending_class_name = None;
+                    pending_class_from_template = false;
+                }
+            }
             _ => {}
         }
 
@@ -5463,18 +5586,181 @@ fn is_node_mutation_lhs(node: Node<'_>) -> bool {
     false
 }
 
+/// Skips one string literal, character literal, C++ raw string literal, line comment, or block
+/// comment that starts at `i`, returning the index just past it. `None` means `src[i]` starts
+/// ordinary code, so callers can inspect structural bytes without mistaking literal or comment
+/// content for `;`, `(`, `)`, `[`, `]`, `{`, `}`, or `,`.
+fn cpp_skip_literal_or_comment(src: &[u8], i: usize) -> Option<usize> {
+    let n = src.len();
+    match *src.get(i)? {
+        b'"' | b'\'' => {
+            let quote = src[i];
+            let mut j = i + 1;
+            while j < n {
+                match src[j] {
+                    b'\\' => j += 2,
+                    b'\n' => return Some(j + 1),
+                    b if b == quote => return Some(j + 1),
+                    _ => j += 1,
+                }
+            }
+            Some(n)
+        }
+        b'R' if src.get(i + 1) == Some(&b'"') && (i == 0 || !is_c_ident_continue(src[i - 1])) => {
+            // `R"delim(...)delim"`: the delimiter is 0..=16 characters that are not whitespace,
+            // `(`, `)`, or `\`; the payload may contain unbalanced parens and plain `)"`.
+            let delim_start = i + 2;
+            let mut delim_end = delim_start;
+            while delim_end < n
+                && delim_end - delim_start < 16
+                && !matches!(src[delim_end], b'(' | b')' | b'\\')
+                && !src[delim_end].is_ascii_whitespace()
+            {
+                delim_end += 1;
+            }
+            if src.get(delim_end) != Some(&b'(') {
+                // Malformed opener: treat the quote as an ordinary string literal.
+                return cpp_skip_literal_or_comment(src, i + 1);
+            }
+            let delim = &src[delim_start..delim_end];
+            let mut j = delim_end + 1;
+            while j < n {
+                if src[j] == b')'
+                    && src.get(j + 1..j + 1 + delim.len()) == Some(delim)
+                    && src.get(j + 1 + delim.len()) == Some(&b'"')
+                {
+                    return Some(j + 2 + delim.len());
+                }
+                j += 1;
+            }
+            Some(n)
+        }
+        b'/' if src.get(i + 1) == Some(&b'/') => {
+            // A trailing backslash continues the comment onto the next physical line, so neither
+            // LF nor CRLF continuations may expose comment text as code.
+            let mut j = i + 2;
+            while j < n {
+                if src[j] == b'\\' && src.get(j + 1) == Some(&b'\n') {
+                    j += 2;
+                    continue;
+                }
+                if src[j] == b'\\' && src.get(j + 1) == Some(&b'\r') {
+                    j += 2;
+                    if src.get(j) == Some(&b'\n') {
+                        j += 1;
+                    }
+                    continue;
+                }
+                if src[j] == b'\n' {
+                    break;
+                }
+                j += 1;
+            }
+            Some(j)
+        }
+        b'/' if src.get(i + 1) == Some(&b'*') => {
+            let mut j = i + 2;
+            while j + 1 < n {
+                if src[j] == b'*' && src[j + 1] == b'/' {
+                    return Some(j + 2);
+                }
+                j += 1;
+            }
+            Some(n)
+        }
+        _ => None,
+    }
+}
+
+/// Skips whitespace and any complete comment immediately before `end`, moving backwards to the
+/// first code byte. Used to decide whether a token has a qualified/member-access prefix.
+fn cpp_skip_ws_and_comments_backwards(src: &[u8], mut end: usize) -> usize {
+    loop {
+        while end > 0 && src[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            return 0;
+        }
+        if end >= 2 && src[end - 2] == b'*' && src[end - 1] == b'/' {
+            let mut j = end - 2;
+            let mut comment_start = None;
+            while j >= 2 {
+                if src[j - 2] == b'/' && src[j - 1] == b'*' {
+                    comment_start = Some(j - 2);
+                    break;
+                }
+                j -= 1;
+            }
+            match comment_start {
+                Some(start) => {
+                    end = start;
+                    continue;
+                }
+                None => return end,
+            }
+        }
+        // A `//` comment runs to the end of its physical line, so a token preceded only by a
+        // comment line has no code prefix at all.
+        let line_start = src[..end]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |p| p + 1);
+        let line = &src[line_start..end];
+        if let Some(offset) = line.windows(2).position(|w| w == b"//") {
+            if line[..offset].iter().all(|b| b.is_ascii_whitespace()) {
+                end = line_start;
+                continue;
+            }
+        }
+        return end;
+    }
+}
+
+/// Skips whitespace and trailing `/* ... */` block comments backwards from `end`, never below
+/// `floor`.
+fn cpp_skip_ws_and_block_comments_backwards(src: &[u8], mut end: usize, floor: usize) -> usize {
+    loop {
+        while end > floor && src[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end < floor + 2 || src[end - 2] != b'*' || src[end - 1] != b'/' {
+            return end;
+        }
+        let mut j = end - 2;
+        let mut comment_start = None;
+        while j >= floor + 2 {
+            if src[j - 2] == b'/' && src[j - 1] == b'*' {
+                comment_start = Some(j - 2);
+                break;
+            }
+            j -= 1;
+        }
+        match comment_start {
+            Some(start) => end = start,
+            None => return end,
+        }
+    }
+}
+
 /// `true` when a macro invocation's argument list carries a code fragment (a declaration or a
 /// statement) instead of a plain expression list, e.g. `CHECK_THROW(Data data(SIZE + 1), err)` or
 /// `CHECK(data.emplace(x);, err)`.
 ///
-/// Only the top level of the argument list is inspected, and a nested `(` counts as a declaration
-/// only when it directly follows a declarator name preceded by a type specifier, so member and
-/// qualified calls (`obj.method(...)`, `ns::create<T>(...)`) are never mistaken for declarations.
+/// Only the top level of the argument list is inspected, and string/character literals, C++ raw
+/// strings, and comments are skipped first so `TX("x;y")`, `TX(';')`, or `TX(/* ; */ 1)` stay
+/// ordinary calls. A nested `(` counts as a declaration only when it directly follows a declarator
+/// name preceded by a type specifier, so member and qualified calls (`obj.method(...)`,
+/// `ns::create<T>(...)`) are never mistaken for declarations.
 fn cpp_invocation_arguments_are_code(src: &[u8], open: usize, close: usize) -> bool {
     let mut depth = 0usize;
     let mut argument_start = open + 1;
     let mut i = open + 1;
     while i < close {
+        if let Some(next) = cpp_skip_literal_or_comment(src, i) {
+            i = next;
+            continue;
+        }
         match src[i] {
             b'(' => {
                 if depth == 0 && cpp_declaration_before_paren(src, argument_start, i) {
@@ -5495,12 +5781,9 @@ fn cpp_invocation_arguments_are_code(src: &[u8], open: usize, close: usize) -> b
 
 /// `true` when the `(` at `pos` closes a declarator name introduced by a type specifier, i.e. the
 /// argument text `[argument_start, pos)` ends with `<type> <name>` (`Data data`, `T *value`,
-/// `ns::Box<T> box`).
+/// `ns::Box<T> box`). Whitespace and block comments between the name and the paren are skipped.
 fn cpp_declaration_before_paren(src: &[u8], argument_start: usize, pos: usize) -> bool {
-    let mut end = pos;
-    while end > argument_start && src[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
+    let mut end = cpp_skip_ws_and_block_comments_backwards(src, pos, argument_start);
     let name_end = end;
     while end > argument_start && is_c_ident_continue(src[end - 1]) {
         end -= 1;
@@ -5509,10 +5792,7 @@ fn cpp_declaration_before_paren(src: &[u8], argument_start: usize, pos: usize) -
         // No identifier directly before the paren: an expression call, cast, or nested group.
         return false;
     }
-    let mut before = end;
-    while before > argument_start && src[before - 1].is_ascii_whitespace() {
-        before -= 1;
-    }
+    let before = cpp_skip_ws_and_block_comments_backwards(src, end, argument_start);
     if before == argument_start {
         return false;
     }
@@ -7032,6 +7312,196 @@ void Outer::method() {}
         let unit = parse_source_str(&scanned, combined).expect("parse combined normalization");
         assert_eq!(unit.parse_errors, 0);
         assert!(unit.symbols.iter().any(|s| s.name == "g"));
+    }
+
+    /// INT-SCRUT-009: an uppercase method with a trailing cv-qualifier (`void TX() const`) and a
+    /// member call on a const reference (`device.TX()`) must both survive normalization.
+    #[test]
+    fn test_cpp_uppercase_const_method_and_member_call() {
+        let src = "class Device {\npublic:\n    void TX() const {}\n};\nvoid caller(const Device& device) { device.TX(); }\n";
+        let scanned = dummy_scanned("src/device.cpp", LanguageKind::Cpp);
+        let unit = parse_source_str(&scanned, src).expect("parse cv-qualified uppercase method");
+        assert_eq!(unit.parse_errors, 0, "valid C++ must parse cleanly");
+
+        let tx = unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "TX")
+            .unwrap_or_else(|| {
+                panic!(
+                    "Device::TX must be extracted: {:?}",
+                    unit.symbols
+                        .iter()
+                        .map(|s| &s.symbol_id)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(tx.kind, SymbolKind::Method);
+        assert_eq!(tx.enclosing_type.as_deref(), Some("Device"));
+        assert_eq!(tx.symbol_id, "src/device.cpp::Device::TX");
+
+        assert!(
+            unit.raw_calls.iter().any(|c| {
+                c.caller_name == "caller"
+                    && c.callee_name == "TX"
+                    && matches!(
+                        c.receiver_or_qualifier.as_deref(),
+                        Some("device") | Some("Device")
+                    )
+            }),
+            "caller -> device.TX must be extracted: {:?}",
+            unit.raw_calls
+        );
+    }
+
+    /// INT-SCRUT-009: out-of-line uppercase constructors and destructors (`IO::IO()`,
+    /// `IO::~IO()`) must keep their declarations and definitions intact.
+    #[test]
+    fn test_cpp_uppercase_out_of_line_constructor_and_destructor() {
+        let src = "class IO {\npublic:\n    IO();\n    ~IO();\n};\nIO::IO() {}\nIO::~IO() {}\n";
+        let scanned = dummy_scanned("src/io.cpp", LanguageKind::Cpp);
+        let unit = parse_source_str(&scanned, src).expect("parse out-of-line ctor/dtor");
+        assert_eq!(unit.parse_errors, 0, "valid C++ must parse cleanly");
+
+        let ctor = unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "IO" && s.kind == SymbolKind::Constructor && s.start_line == 6)
+            .unwrap_or_else(|| {
+                panic!(
+                    "out-of-line IO::IO must be extracted: {:?}",
+                    unit.symbols
+                        .iter()
+                        .map(|s| (&s.symbol_id, s.kind, s.start_line))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(ctor.enclosing_type.as_deref(), Some("IO"));
+
+        let dtor = unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "~IO" && s.start_line == 7)
+            .unwrap_or_else(|| {
+                panic!(
+                    "out-of-line IO::~IO must be extracted: {:?}",
+                    unit.symbols
+                        .iter()
+                        .map(|s| (&s.symbol_id, s.kind, s.start_line))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(dtor.kind, SymbolKind::Method);
+        assert!(dtor.signature.contains("~IO"), "{}", dtor.signature);
+    }
+
+    /// INT-SCRUT-009: uppercase calls inside control bodies (`if`/`else`/`while`/`do`) are real
+    /// calls, not trailing annotation macros.
+    #[test]
+    fn test_cpp_uppercase_control_body_calls_are_preserved() {
+        let src = "void TX() {}\nvoid caller(bool flag) {\n    if (flag) TX();\n    else TX();\n    while (flag) TX();\n    do TX(); while (flag);\n    for (;;) TX();\n}\n";
+        let scanned = dummy_scanned("src/control.cpp", LanguageKind::Cpp);
+        let unit = parse_source_str(&scanned, src).expect("parse control-body calls");
+        assert_eq!(unit.parse_errors, 0, "valid C++ must parse cleanly");
+
+        let calls = unit
+            .raw_calls
+            .iter()
+            .filter(|c| c.caller_name == "caller" && c.callee_name == "TX")
+            .count();
+        assert!(
+            calls >= 5,
+            "if/else/while/do/for bodies must keep calls, got {calls}: {:?}",
+            unit.raw_calls
+        );
+    }
+
+    /// INT-SCRUT-010: literal and comment bytes inside an argument list never make a real call
+    /// look like a code-fragment macro.
+    #[test]
+    fn test_cpp_uppercase_calls_with_literal_and_comment_arguments_are_preserved() {
+        let src = "void TX(const char* text) {}\nvoid TXI(int value) {}\nvoid caller() {\n    TX(\"x;y\");\n    TX(\"a(b c)\");\n    TX(';');\n    TX(R\"tag(a;b)tag\");\n    TXI(/* ; */ 1);\n    TXI(1 // trailing ; comment\n    );\n}\n";
+        let scanned = dummy_scanned("src/args.cpp", LanguageKind::Cpp);
+        let unit = parse_source_str(&scanned, src).expect("parse literal arguments");
+        assert_eq!(unit.parse_errors, 0, "valid C++ must parse cleanly");
+
+        let tx_calls = unit
+            .raw_calls
+            .iter()
+            .filter(|c| c.caller_name == "caller" && c.callee_name == "TX")
+            .count();
+        assert_eq!(
+            tx_calls, 4,
+            "every literal-bearing TX call must be kept: {:?}",
+            unit.raw_calls
+        );
+        let txi_calls = unit
+            .raw_calls
+            .iter()
+            .filter(|c| c.caller_name == "caller" && c.callee_name == "TXI")
+            .count();
+        assert_eq!(
+            txi_calls, 2,
+            "comment-bearing TXI calls must be kept: {:?}",
+            unit.raw_calls
+        );
+    }
+
+    /// INT-SCRUT-010: the argument classifier must lexically skip literals, raw strings, and
+    /// comments while still recognizing genuine declaration/statement fragments.
+    #[test]
+    fn test_cpp_invocation_argument_lexical_skipping() {
+        fn args_are_code(src: &str) -> bool {
+            let bytes = src.as_bytes();
+            let open = bytes
+                .iter()
+                .position(|&b| b == b'(')
+                .expect("an opening paren");
+            let close = find_matching_paren_bytes(bytes, open).expect("matching paren");
+            cpp_invocation_arguments_are_code(bytes, open, close)
+        }
+
+        for src in [
+            "TX(\"x;y\")",
+            "TX(\"a(b c)\")",
+            "TX(';')",
+            "TX('(')",
+            "TX(/* ; */ 1)",
+            "TX(// ;\n1)",
+            "TX(R\"tag(a;b)tag\")",
+            "TX(R\"(a(b c)d)\")",
+        ] {
+            assert!(
+                !args_are_code(src),
+                "{src} must not be classified as a code fragment"
+            );
+        }
+        for src in [
+            "CHECK_THROW(Data data(SIZE + 1), err)",
+            "CHECK(data.emplace(x);, err)",
+            "CHECK_THROW(Data data /* note */ (SIZE + 1), err)",
+        ] {
+            assert!(
+                args_are_code(src),
+                "{src} must remain a code-fragment macro"
+            );
+        }
+    }
+
+    /// INT-SCRUT-010 guard: genuine code-fragment macros (`CHECK_THROW(Data data(...), err)`) are
+    /// still repaired so the surrounding C++ parses cleanly.
+    #[test]
+    fn test_cpp_code_fragment_macro_repair_is_retained() {
+        let src = "void caller() {\n    CHECK_THROW(Data data(SIZE + 1), err);\n    CHECK(data.emplace(x);, err);\n}\n";
+        let out = normalize_cpp_macro_annotations(src.as_bytes()).expect("normalizer fired");
+        let text = String::from_utf8(out).expect("normalized buffer is UTF-8");
+        assert!(!text.contains("CHECK_THROW"), "{text}");
+        assert!(!text.contains("CHECK(data.emplace"), "{text}");
+
+        let scanned = dummy_scanned("test/demo.cpp", LanguageKind::Cpp);
+        let unit = parse_source_str(&scanned, src).expect("parse code-fragment macros");
+        assert_eq!(unit.parse_errors, 0, "repaired buffer must parse cleanly");
+        assert!(unit.symbols.iter().any(|s| s.name == "caller"));
     }
 
     /// INT-SCRUT-007: a relative nested out-of-line scope keeps its enclosing namespace, while an

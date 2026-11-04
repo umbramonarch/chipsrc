@@ -1357,6 +1357,90 @@ fn noise_probe_rules_end_to_end() {
     );
 }
 
+/// INT-SCRUT-009/010: the four scrutiny round-2 C++ probes keep every uppercase callable and call
+/// edge through the full convert pipeline, with a clean parse.
+#[test]
+fn uppercase_cpp_probes_preserve_symbols_and_calls_end_to_end() {
+    let base = TestTempDir::new("chipsrc_uppercase_probes");
+    let probes: [(&str, &str); 4] = [
+        (
+            "uppercase-const",
+            "class Device {\npublic:\n    void TX() const {}\n};\nvoid caller(const Device& device) { device.TX(); }\n",
+        ),
+        (
+            "uppercase-out-of-line",
+            "class IO {\npublic:\n    IO();\n    ~IO();\n};\nIO::IO() {}\nIO::~IO() {}\n",
+        ),
+        (
+            "uppercase-conditional",
+            "void TX() {}\nvoid caller(bool flag) {\n    if (flag) TX();\n    else TX();\n}\n",
+        ),
+        (
+            "uppercase-args",
+            "void TX(const char* text) {}\nvoid caller() {\n    TX(\"x;y\");\n    TX(\"a(b c)\");\n    TX(';');\n    TX(/* ; */ 1);\n}\n",
+        ),
+    ];
+
+    for (name, source) in probes {
+        let repo_dir = base.0.join(name);
+        fs::create_dir_all(&repo_dir).expect("create probe dir");
+        fs::write(repo_dir.join("test.cpp"), source).expect("write probe source");
+        let bundle_dir = base.0.join(format!("{name}-bundle"));
+        let cfg = ConvertConfig::new(repo_dir, bundle_dir.clone());
+        let bundle = convert_repo(&cfg).unwrap_or_else(|e| panic!("convert {name}: {e}"));
+
+        assert_eq!(
+            bundle.sanity.parse_clean_ratio, 1.0,
+            "{name} must parse cleanly: {:?}",
+            bundle.sanity.warnings
+        );
+
+        let symbols = fs::read_to_string(bundle_dir.join("index").join("symbols.tsv"))
+            .unwrap_or_else(|e| panic!("read {name} symbols.tsv: {e}"));
+        let calls = fs::read_to_string(bundle_dir.join("index").join("calls.tsv"))
+            .unwrap_or_else(|e| panic!("read {name} calls.tsv: {e}"));
+        let call_callees: Vec<&str> = calls
+            .lines()
+            .skip(1)
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| line.split('\t').nth(2))
+            .collect();
+
+        match name {
+            "uppercase-const" => {
+                assert!(
+                    symbols.contains("Device::TX"),
+                    "Device::TX symbol missing: {symbols}"
+                );
+                assert!(
+                    call_callees.contains(&"TX"),
+                    "caller -> device.TX edge missing: {calls}"
+                );
+            }
+            "uppercase-out-of-line" => {
+                assert!(
+                    symbols.contains("IO::IO") && symbols.contains("~IO"),
+                    "out-of-line IO::IO / IO::~IO symbols missing: {symbols}"
+                );
+                assert_eq!(bundle.indexes.symbols.len(), 2, "{}", symbols);
+            }
+            "uppercase-conditional" => {
+                assert!(
+                    call_callees.iter().filter(|c| **c == "TX").count() >= 2,
+                    "if/else TX call edges missing: {calls}"
+                );
+            }
+            "uppercase-args" => {
+                assert!(
+                    call_callees.iter().filter(|c| **c == "TX").count() >= 4,
+                    "literal/comment argument TX call edges missing: {calls}"
+                );
+            }
+            _ => unreachable!("unexpected probe {name}"),
+        }
+    }
+}
+
 /// End-to-end BM25 concept search on a converted bundle: snake_case sub-token ranking, the
 /// automatic multi-token fallback, `--source` gating, and nonsense-query emptiness.
 #[test]
