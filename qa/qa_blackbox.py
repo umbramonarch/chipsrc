@@ -38,6 +38,18 @@ for _mod_name, _suite_key in [
 
 CORE_ORDER = ["real", "sync", "boundary", "focused", "hooks", "dup-content"]
 
+
+def qualify_failed_label(suite_name: str, label: str) -> str:
+    """Namespace a failed label once, never twice.
+
+    Suites such as ``corpus``, ``scale``, and ``sfc`` already prefix their assertion
+    labels with ``"<suite>:"``; prefixing unconditionally would emit
+    ``"corpus: corpus: ..."`` in ``summary.json`` ``failed_labels``.
+    """
+    prefix = f"{suite_name}:"
+    return label if label.startswith(prefix) else f"{prefix} {label}"
+
+
 SUITE_HELP_TEXT = "\n".join(
     [
         "Available suites:",
@@ -277,7 +289,9 @@ def main(argv: list[str] | None = None) -> int:
         s_failed_labels = [
             r["label"] for r in records if r.get("status") == "failed"
         ]
-        all_failed_labels.extend(f"{suite_name}: {lbl}" for lbl in s_failed_labels)
+        all_failed_labels.extend(
+            qualify_failed_label(suite_name, lbl) for lbl in s_failed_labels
+        )
 
         suites_summary[suite_name] = {
             "suite": suite_name,

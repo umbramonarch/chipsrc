@@ -1,0 +1,62 @@
+{
+  "description": "Ten-repository corpus matrix for the qa corpus suite. Each entry names the repository directory under --repos-root (root=repos) or --corpus-root (root=corpus), the vendor mode used for both inspect and convert, and whether the conversion must be serialized by the mission-wide <corpus-root>/validators/.large-convert.lock guard.",
+  "repos": [
+    {
+      "name": "chipsrc",
+      "root": "repos",
+      "vendor_mode": "active"
+    },
+    {
+      "name": "chipdoc",
+      "root": "repos",
+      "vendor_mode": "active"
+    },
+    {
+      "name": "smart_locker",
+      "root": "repos",
+      "vendor_mode": "active"
+    },
+    {
+      "name": "volt_website",
+      "root": "repos",
+      "vendor_mode": "active"
+    },
+    {
+      "name": "beautiful-embedded-c",
+      "root": "repos",
+      "vendor_mode": "active"
+    },
+    {
+      "name": "stock_screener",
+      "root": "repos",
+      "vendor_mode": "active"
+    },
+    {
+      "name": "my-sunshine",
+      "root": "repos",
+      "vendor_mode": "active"
+    },
+    {
+      "name": "work",
+      "root": "repos",
+      "vendor_mode": "active"
+    },
+    {
+      "name": "STM32CubeF4",
+      "root": "corpus",
+      "vendor_mode": "all",
+      "large": true
+    },
+    {
+      "name": "etl",
+      "root": "corpus",
+      "vendor_mode": "active",
+      "large": true
+    }
+  ],
+  "budgets": {
+    "lock_wait_s": 180,
+    "lock_stale_s": 1800,
+    "command_timeout_s": 300
+  }
+}
