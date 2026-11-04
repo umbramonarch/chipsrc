@@ -2480,8 +2480,11 @@ fn stem_concept_term(mut token: String) -> String {
 }
 
 /// Returns the byte length the token keeps when a light suffix is stripped, if any.
+///
+/// Only tokens of at least five characters are stemmed (architecture §6.2), so a four-character
+/// query such as `lens` never collapses onto an unrelated three-character document token (`len`).
 fn concept_suffix_keep_len(token: &str) -> Option<usize> {
-    if token.chars().count() < 4 {
+    if token.chars().count() < 5 {
         return None;
     }
     for suffix in ["ing", "ed"] {
@@ -4607,6 +4610,77 @@ RETRY_LIMIT\tconst\t3\t-\tsrc/misc.rs\t4\tlibs\tfirst_party\t03-src\tMaximum ret
         );
         // Unicode input must never panic and keeps its (lowercased) alphanumeric runs.
         assert_eq!(tokenize_concept("Wörld 中文"), vec!["wörld", "中文"]);
+    }
+
+    /// INT-SCRUT-001: suffix stemming starts at five characters, so a four-character query word
+    /// such as `lens` is never truncated to `len`.
+    #[test]
+    fn tokenize_concept_stems_only_five_char_or_longer_tokens() {
+        // Four characters: never stemmed (the pre-fix code turned `lens` into `len`).
+        for token in ["lens", "len", "cups", "runs", "type"] {
+            assert_eq!(tokenize_concept(token), vec![token], "token={token:?}");
+        }
+        // Five characters and longer: the light suffix rules still apply.
+        assert_eq!(tokenize_concept("items"), vec!["item"]);
+        assert_eq!(tokenize_concept("codes"), vec!["code"]);
+        assert_eq!(tokenize_concept("moved"), vec!["mov"]);
+        assert_eq!(tokenize_concept("moves"), vec!["move"]);
+        assert_eq!(tokenize_concept("digests"), vec!["digest"]);
+    }
+
+    /// INT-SCRUT-001 retrieval regression: a `lens` concept query must not match a document whose
+    /// only tokens contain `len`.
+    #[test]
+    fn concept_query_lens_does_not_match_len_documents() {
+        let tmp = TestTempDir::new("concept_stem_len");
+        let bundle_dir = tmp.0.join("bundle");
+        let index_dir = bundle_dir.join("index");
+        fs::create_dir_all(&index_dir).unwrap();
+        let meta = BundleMetaFile {
+            metadata: RepoMetadata {
+                repo_name: "stem-demo".to_string(),
+                source_root: tmp.0.join("src").display().to_string(),
+                fingerprint: "0123456789abcdef".to_string(),
+                vendor_mode: VendorMode::Active,
+                total_files: 1,
+                first_party_files: 1,
+                symbol_count: 1,
+                section_count: 1,
+                ..Default::default()
+            },
+            sanity: SanityReport::default(),
+        };
+        fs::write(
+            bundle_dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+        fs::write(bundle_dir.join("INDEX.md"), "# stem demo\n").unwrap();
+        fs::write(
+            index_dir.join("symbols.tsv"),
+            "symbol_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tsignature\tpagerank\tin_deg\tout_deg\tarch_layer\tscope\tsection_id\tdoc_summary\thub_score\tauthority_score\n\
+src/test.py::len\tlen\tfn\tpub\tsrc/test.py\t1\t1\tdef len()\t0.001000\t0\t0\tdomain\tfirst_party\t01-src\t\t0.100000\t0.100000\n",
+        )
+        .unwrap();
+        fs::write(
+            index_dir.join("types.tsv"),
+            "type_id\tname\tkind\tvisibility\tfile\tstart_line\tend_line\tfields_summary\tarch_layer\tscope\tsection_id\tdoc_summary\n",
+        )
+        .unwrap();
+        fs::write(
+            index_dir.join("macros.tsv"),
+            "name\tkind\tvalue_or_args\thex_addr\tfile\tline\tarch_layer\tscope\tsection_id\tdescription\n",
+        )
+        .unwrap();
+
+        let bundles = vec![bundle_dir];
+        assert!(
+            concept_search(&bundles, "lens", 10).unwrap().is_empty(),
+            "a four-character `lens` query must not stem to `len`"
+        );
+        let hits = concept_search(&bundles, "len", 10).unwrap();
+        assert_eq!(hits.len(), 1, "the exact `len` query still matches");
+        assert_eq!(hits[0].line, 1);
     }
 
     #[test]

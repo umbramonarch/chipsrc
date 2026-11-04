@@ -330,8 +330,28 @@ fn header_has_cpp_constructs(bytes: &[u8]) -> bool {
     while i < bytes.len() {
         match bytes[i] {
             b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                i = memchr::memchr(b'\n', bytes.get(i + 2..).unwrap_or_default())
-                    .map_or(bytes.len(), |off| i + 2 + off + 1);
+                // A `//` comment also swallows every line continued by a trailing backslash
+                // (`\` before `\n` or before `\r\n`), so C++ marker words on the continued
+                // line are still comment text.
+                let mut j = i + 2;
+                loop {
+                    let Some(offset) = memchr::memchr(b'\n', bytes.get(j..).unwrap_or_default())
+                    else {
+                        j = bytes.len();
+                        break;
+                    };
+                    let newline = j + offset;
+                    let mut last = newline;
+                    if last > j && bytes[last - 1] == b'\r' {
+                        last -= 1;
+                    }
+                    let continued = last > j && bytes[last - 1] == b'\\';
+                    j = newline + 1;
+                    if !continued {
+                        break;
+                    }
+                }
+                i = j;
                 continue;
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
@@ -346,10 +366,32 @@ fn header_has_cpp_constructs(bytes: &[u8]) -> bool {
             b'R' if bytes.get(i + 1) == Some(&b'"')
                 && (i == 0 || !is_c_ident_byte(bytes[i - 1])) =>
             {
-                // C++ raw string literal (`R"(...)"`, `R"delim(...)delim"`): the first `)"` is a
-                // safe upper bound for the cheap heuristic; content is never scanned.
-                i = memchr::memmem::find(bytes.get(i + 2..).unwrap_or_default(), b")\"")
-                    .map_or(bytes.len(), |off| i + 2 + off + 2);
+                // C++ raw string literal (`R"(...)`, `R"delim(...)delim"`): `delim` is 0..=16
+                // characters that are not whitespace, `(`, `)`, or `\`. The closing delimiter
+                // must match exactly, so the content may contain a plain `)"`.
+                let delim_start = i + 2;
+                let mut delim_end = delim_start;
+                while delim_end < bytes.len()
+                    && delim_end - delim_start < 16
+                    && !matches!(bytes[delim_end], b'(' | b')' | b'\\')
+                    && !bytes[delim_end].is_ascii_whitespace()
+                {
+                    delim_end += 1;
+                }
+                if bytes.get(delim_end) != Some(&b'(') {
+                    // Not a well-formed raw string: treat the `"` as an ordinary literal.
+                    i = skip_quoted_literal(bytes, i + 1);
+                    continue;
+                }
+                let mut terminator = Vec::with_capacity(delim_end - delim_start + 2);
+                terminator.push(b')');
+                terminator.extend_from_slice(&bytes[delim_start..delim_end]);
+                terminator.push(b'"');
+                i = memchr::memmem::find(
+                    bytes.get(delim_end + 1..).unwrap_or_default(),
+                    &terminator,
+                )
+                .map_or(bytes.len(), |off| delim_end + 1 + off + terminator.len());
                 continue;
             }
             b':' if bytes.get(i + 1) == Some(&b':') => return true,
@@ -3140,6 +3182,79 @@ mod tests {
                 String::from_utf8_lossy(case)
             );
         }
+    }
+
+    #[test]
+    fn detect_file_language_handles_custom_delimited_raw_strings() {
+        // INT-SCRUT-003: the raw-string terminator must use the actual delimiter, so a custom
+        // delimiter cannot hide following code and an embedded `)"` cannot end the literal early.
+        let cpp_cases: &[&[u8]] = &[
+            b"const char *s = R\"tag(payload)tag\";\nclass Widget {};\n",
+            b"const char *s = R\"tag(has )\" inside)tag\";\nclass Widget {};\n",
+            b"const char *s = R\"(plain content)\";\nclass Widget {};\n",
+        ];
+        for case in cpp_cases {
+            assert_eq!(
+                detect_file_language("include/demo.h", case),
+                Some(LanguageKind::Cpp),
+                "expected C++ for: {}",
+                String::from_utf8_lossy(case)
+            );
+        }
+
+        // C++ marker words inside a custom-delimited raw string stay string content.
+        let content_only: &[&[u8]] = &[
+            b"const char *s = R\"tag(class Fake; namespace demo; a::b)tag\";\nint plain_compute(void);\n",
+            b"const char *s = R\"tag(has )\" inside)tag\";\nint plain_compute(void);\n",
+        ];
+        for case in content_only {
+            assert_eq!(
+                detect_file_language("include/plain.h", case),
+                Some(LanguageKind::C),
+                "expected C for: {}",
+                String::from_utf8_lossy(case)
+            );
+        }
+
+        // A malformed raw-string opener without `(` falls back to ordinary quote skipping.
+        assert_eq!(
+            detect_file_language(
+                "include/plain.h",
+                b"const char *s = R\"no paren here;\nint plain_compute(void);\n"
+            ),
+            Some(LanguageKind::C)
+        );
+    }
+
+    #[test]
+    fn detect_file_language_honors_backslash_continued_line_comments() {
+        // INT-SCRUT-004: a `//` comment continued with a trailing backslash keeps swallowing
+        // lines, so a C++ marker on the continued line is not code. Both LF and CRLF count.
+        let lf = b"// continued comment \\\nclass Fake;\nint plain_compute(void);\n";
+        assert_eq!(
+            detect_file_language("include/plain.h", lf),
+            Some(LanguageKind::C),
+            "LF continuation must stay a comment: {}",
+            String::from_utf8_lossy(lf)
+        );
+        let crlf = b"// continued comment \\\r\nclass Fake;\r\nint plain_compute(void);\r\n";
+        assert_eq!(
+            detect_file_language("include/plain.h", crlf),
+            Some(LanguageKind::C),
+            "CRLF continuation must stay a comment: {}",
+            String::from_utf8_lossy(crlf)
+        );
+
+        // An ordinary comment still ends at the newline, so real C++ code after it is detected.
+        assert_eq!(
+            detect_file_language("include/demo.h", b"// ordinary comment\nclass Widget {};\n"),
+            Some(LanguageKind::Cpp)
+        );
+        // A backslash inside the comment body (not at the line end) does not continue it.
+        assert_eq!(
+            detect_file_language("include/demo.h", b"// path C:\\tmp\\x\nclass Widget {};\n"),
+            Some(LanguageKind::Cpp)
+        );
     }
 
     #[test]

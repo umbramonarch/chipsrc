@@ -629,8 +629,14 @@ impl ParsedFileUnit {
     /// Computes a deterministic 16-character BLAKE3 structural digest over extracted symbols,
     /// types, macros, imports, raw calls, and raw xrefs while excluding line numbers and doc
     /// comments so comment-only or line-shift edits can short-circuit full graph relinking.
+    ///
+    /// The detected language participates in the digest: a `.h` header whose content flips
+    /// between C and C++ changes which declarations the grammar sees and which language labels
+    /// the rendered artifacts carry, so it must never take a digest-no-op short circuit.
     pub fn structural_digest(&self) -> String {
         let mut h = blake3::Hasher::new();
+        h.update(self.scanned.language.as_str().as_bytes());
+        h.update(b"|");
         h.update(self.scanned.scope.as_str().as_bytes());
         h.update(b"|");
         h.update(self.scanned.arch_layer.as_str().as_bytes());

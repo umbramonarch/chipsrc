@@ -310,12 +310,13 @@ fn render_macro_xref_context(m: &ExtractedMacro) -> String {
 
 /// Pure eligibility check for the coordinate-shift tier (Tier 3).
 ///
-/// Every dirty file must keep its structural digest, scope, and architecture layer, must not be
-/// C/C++ (header-prototype doc transfer can change other files' docstrings), and must stay below
-/// the sharder's 1,400-line single-file threshold in both states. Every module group containing a
-/// dirty file must stay below the 3,000-line / 8-file group thresholds, and no files may have been
-/// added or removed. C/C++ is excluded because `merge_c_family_header_prototypes` can propagate a
-/// header docstring into an implementation file that this tier does not rewrite.
+/// Every dirty file must keep its structural digest, detected language, scope, and architecture
+/// layer, must not be C/C++ (header-prototype doc transfer can change other files' docstrings),
+/// and must stay below the sharder's 1,400-line single-file threshold in both states. Every
+/// module group containing a dirty file must stay below the 3,000-line / 8-file group thresholds,
+/// and no files may have been added or removed. C/C++ is excluded because
+/// `merge_c_family_header_prototypes` can propagate a header docstring into an implementation file
+/// that this tier does not rewrite.
 fn coordinate_shift_eligible(
     old_dirty_units: &[ParsedFileUnit],
     new_dirty_units: &[ParsedFileUnit],
@@ -335,6 +336,7 @@ fn coordinate_shift_eligible(
         if old_u.scanned.rel_path != new_u.scanned.rel_path
             || old_u.scanned.scope != new_u.scanned.scope
             || old_u.scanned.arch_layer != new_u.scanned.arch_layer
+            || old_u.scanned.language != new_u.scanned.language
         {
             return false;
         }
@@ -1116,9 +1118,11 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                 // emitter re-packs them canonically) instead of reparsing every file.
                 let reusable = manifest.files.get(&f.rel_path).is_some_and(|entry| {
                     entry.blake3_hash == f.blake3_hash
-                        && prev_stamp_map
-                            .get(f.rel_path.as_str())
-                            .is_none_or(|s| s.scope == f.scope && s.arch_layer == f.arch_layer)
+                        && prev_stamp_map.get(f.rel_path.as_str()).is_none_or(|s| {
+                            s.scope == f.scope
+                                && s.arch_layer == f.arch_layer
+                                && s.language == Some(f.language)
+                        })
                 });
                 if reusable {
                     clean_files.push(f.clone());
@@ -1201,6 +1205,7 @@ pub fn convert_repo(config: &ConvertConfig) -> Result<ConversionBundle> {
                                     |s| {
                                         s.scope == u.scanned.scope
                                             && s.arch_layer == u.scanned.arch_layer
+                                            && s.language == Some(u.scanned.language)
                                     },
                                 )
                                 && old_dirty_units_by_path

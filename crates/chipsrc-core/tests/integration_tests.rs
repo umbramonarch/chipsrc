@@ -1549,3 +1549,83 @@ int plain_compute(plain_sample_t *s, int x);
         .expect("demo.h stamp");
     assert_eq!(demo_stamp.language, Some(LanguageKind::Cpp));
 }
+
+/// INT-SCRUT-002: an edit that flips a `.h` header's detected language (C -> C++) must never take
+/// the digest-no-op (or coordinate-shift) short circuit, and the incrementally refreshed rendered
+/// artifacts must equal a forced rebuild.
+#[test]
+fn header_language_change_matches_forced_rebuild() {
+    let base = TestTempDir::new("chipsrc_header_lang_change");
+    let repo = base.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let header = repo.join("demo.h");
+    fs::write(&header, "\nint compute(void) { return 1; }\n").unwrap();
+
+    let bundle_dir = base.0.join("bundle");
+    let initial = convert_repo(&ConvertConfig::new(repo.clone(), bundle_dir.clone()))
+        .expect("initial convert");
+    assert_eq!(
+        initial
+            .metadata
+            .file_stamps
+            .iter()
+            .find(|s| s.rel_path == "demo.h")
+            .and_then(|s| s.language),
+        Some(LanguageKind::C)
+    );
+
+    let sections_text = |dir: &Path| -> String {
+        let mut bodies: Vec<String> = fs::read_dir(dir.join("sections"))
+            .expect("sections dir")
+            .map(|entry| fs::read_to_string(entry.expect("section entry").path()).unwrap())
+            .collect();
+        bodies.sort();
+        bodies.join("\n")
+    };
+    let c_sections = sections_text(&bundle_dir);
+    assert!(c_sections.contains("`c`"), "{c_sections}");
+    assert!(!c_sections.contains("`cpp`"), "{c_sections}");
+
+    // Same line count and identical symbol coordinates: only the detected language flips.
+    fs::write(
+        &header,
+        "namespace demo {}\nint compute(void) { return 1; }\n",
+    )
+    .unwrap();
+    let refreshed = convert_repo(&ConvertConfig::new(repo.clone(), bundle_dir.clone()))
+        .expect("incremental convert");
+    assert!(!refreshed.cache_hit);
+    assert_ne!(
+        refreshed.metadata.incremental_tier, "digest_noop",
+        "a detected-language change must not short-circuit as digest-noop"
+    );
+    assert_ne!(refreshed.metadata.incremental_tier, "coordinate_shift");
+    assert_eq!(
+        refreshed
+            .metadata
+            .file_stamps
+            .iter()
+            .find(|s| s.rel_path == "demo.h")
+            .and_then(|s| s.language),
+        Some(LanguageKind::Cpp)
+    );
+
+    let incremental_sections = sections_text(&bundle_dir);
+    assert!(
+        incremental_sections.contains("`cpp`"),
+        "incrementally refreshed section must render the detected language: {incremental_sections}"
+    );
+    assert!(
+        !incremental_sections.contains("`c`"),
+        "{incremental_sections}"
+    );
+
+    let mut forced = ConvertConfig::new(repo.clone(), bundle_dir.clone());
+    forced.force = true;
+    convert_repo(&forced).expect("forced convert");
+    assert_eq!(
+        sections_text(&bundle_dir),
+        incremental_sections,
+        "incremental and forced section artifacts must be identical"
+    );
+}

@@ -729,12 +729,24 @@ fn resolve_callee_candidates(
         .collect();
     if !same_file.is_empty() {
         if let Some(qual) = effective_qualifier {
-            if let Some(&idx) = same_file.iter().find(|&&idx| {
+            let qual = qual.trim();
+            // Prefer an exact qualified-name match (`b::Box` over a same-leaf `a::Box`), then a
+            // trailing sub-path or leaf match.
+            let exact_match = same_file.iter().copied().find(|&idx| {
                 symbols[idx]
                     .enclosing_type
                     .as_deref()
-                    .is_some_and(|et| enclosing_matches_qualifier(et, qual))
-            }) {
+                    .is_some_and(|et| et.trim().eq_ignore_ascii_case(qual))
+            });
+            let qualified_match = exact_match.or_else(|| {
+                same_file.iter().copied().find(|&idx| {
+                    symbols[idx]
+                        .enclosing_type
+                        .as_deref()
+                        .is_some_and(|et| enclosing_matches_qualifier(et, qual))
+                })
+            });
+            if let Some(idx) = qualified_match {
                 return (symbols[idx].symbol_id.clone(), ResolutionTier::SameFile);
             }
             // If the call has a concrete non-self qualifier (e.g. `Vec::new()` or `entry.path()`)
@@ -1841,9 +1853,18 @@ fn qualifier_leaf(qualifier: &str) -> &str {
 /// True when a symbol's `enclosing_type` answers a call-site qualifier. C++ enclosing types are
 /// namespace-qualified (`etl::ivector`), so the comparison accepts the full qualified name, a
 /// bare leaf (`ivector`), and the namespace leaf of the enclosing type.
+///
+/// A qualifier that carries an explicit scope path (`b::Box`) must match as a whole path or as a
+/// trailing sub-path: never fall back to leaf-only matching, which would bind
+/// `b::Box::run()` to a conflicting `a::Box::run`.
 fn enclosing_matches_qualifier(enclosing: &str, qualifier: &str) -> bool {
+    let enclosing = enclosing.trim();
+    let qualifier = qualifier.trim();
     if enclosing.eq_ignore_ascii_case(qualifier) {
         return true;
+    }
+    if qualifier.contains("::") {
+        return enclosing_path_ends_with(enclosing, qualifier);
     }
     let leaf = qualifier_leaf(qualifier);
     if leaf.is_empty() {
@@ -1856,6 +1877,23 @@ fn enclosing_matches_qualifier(enclosing: &str, qualifier: &str) -> bool {
         .rsplit("::")
         .next()
         .is_some_and(|enclosing_leaf| enclosing_leaf.eq_ignore_ascii_case(leaf))
+}
+
+/// True when `enclosing` ends with `::{qualifier}` (case-insensitive) and the qualifier is a
+/// strict trailing sub-path (never the whole string; equality is handled by the caller).
+fn enclosing_path_ends_with(enclosing: &str, qualifier: &str) -> bool {
+    let Some(prefix_len) = enclosing.len().checked_sub(qualifier.len()) else {
+        return false;
+    };
+    if prefix_len == 0 {
+        return false;
+    }
+    enclosing
+        .get(prefix_len..)
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(qualifier))
+        && enclosing
+            .get(..prefix_len)
+            .is_some_and(|head| head.ends_with("::"))
 }
 
 /// True when the qualifier is directly the instance/class receiver (`self`, `cls`, `this`, `super`)
@@ -3670,5 +3708,70 @@ mod tests {
         let edge = find_call(&calls, "make_unit");
         assert_eq!(edge.tier, ResolutionTier::SameFile);
         assert_eq!(edge.callee_id, "crates/core/src/lib.rs::make_unit");
+    }
+
+    fn cpp_method_symbol(
+        file: &str,
+        enclosing: &str,
+        name: &str,
+        start_line: usize,
+    ) -> ExtractedSymbol {
+        ExtractedSymbol {
+            symbol_id: format!("{file}::{enclosing}::{name}"),
+            name: name.to_string(),
+            qualified_name: format!("{enclosing}::{name}"),
+            kind: SymbolKind::Method,
+            visibility: Visibility::Public,
+            file: file.to_string(),
+            start_line,
+            end_line: start_line + 1,
+            signature: format!("static void {name}()"),
+            doc_summary: String::new(),
+            enclosing_type: Some(enclosing.to_string()),
+            scope: FileScope::FirstParty,
+            arch_layer: ArchLayer::Core,
+            section_id: "src".to_string(),
+        }
+    }
+
+    /// INT-SCRUT-008: an explicitly scoped call must never bind to a same-leaf method in a
+    /// conflicting namespace, and an exact qualified match wins over suffix/leaf matches.
+    #[test]
+    fn test_explicit_namespace_qualifier_never_binds_conflicting_same_leaf_method() {
+        assert!(!enclosing_matches_qualifier("a::Box", "b::Box"));
+        assert!(enclosing_matches_qualifier("b::Box", "b::Box"));
+        assert!(enclosing_matches_qualifier("ns::b::Box", "b::Box"));
+        assert!(enclosing_matches_qualifier("a::Box", "Box"));
+        assert!(!enclosing_matches_qualifier("a::Box", "b::Box::run"));
+
+        let file = "test.cpp";
+        let unit = sample_unit(
+            file,
+            FileScope::FirstParty,
+            ArchLayer::Core,
+            LanguageKind::Cpp,
+            vec![
+                cpp_method_symbol(file, "a::Box", "run", 2),
+                cpp_method_symbol(file, "b::Box", "run", 6),
+                sample_symbol(
+                    file,
+                    "caller",
+                    9,
+                    FileScope::FirstParty,
+                    ArchLayer::Core,
+                    "src",
+                ),
+            ],
+            Vec::new(),
+            vec![sample_call(file, "caller", 9, "run", Some("b::Box"), 10)],
+        );
+
+        let (_symbols, _types, _macros, calls, _xrefs, _vendor) = resolve_and_link(&[unit]);
+        let edge = find_call(&calls, "run");
+        assert_eq!(
+            edge.callee_id, "test.cpp::b::Box::run",
+            "b::Box::run() must not resolve to a::Box::run"
+        );
+        assert_eq!(edge.tier, ResolutionTier::SameFile);
     }
 }

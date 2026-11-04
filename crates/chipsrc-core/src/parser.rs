@@ -123,7 +123,10 @@ pub fn parse_source_str_with_blueprint(
                 let qualifier_normalized = normalize_c_qualifier_macros(source, blueprint);
                 if scanned.language == LanguageKind::Cpp {
                     match qualifier_normalized {
-                        Some(buf) => normalize_cpp_macro_annotations(&buf),
+                        // Keep the successful C qualifier normalization even when the C++ macro
+                        // pass makes no changes (`or(Some(buf))`), otherwise `__STATIC_INLINE`
+                        // stays in the parse buffer and the file reports false syntax errors.
+                        Some(buf) => normalize_cpp_macro_annotations(&buf).or(Some(buf)),
                         None => normalize_cpp_macro_annotations(source.as_bytes()),
                     }
                 } else {
@@ -764,20 +767,42 @@ fn find_matching_paren_bytes(src: &[u8], open: usize) -> Option<usize> {
     None
 }
 
+/// Brace context tracked by [`normalize_cpp_macro_annotations`] so class-scope macro repair is
+/// never applied to statements or calls inside a function body.
+#[derive(Clone, PartialEq, Eq)]
+enum BraceCtx {
+    /// A `class`/`struct`/`union`/`enum` body carrying the declared type name.
+    Class(String),
+    /// A function/constructor/lambda body (or a nested block inside one).
+    Function,
+    /// Any other brace pair (namespace body, aggregate initializer, ...).
+    Other,
+}
+
+/// `true` when any enclosing brace is a function/constructor/lambda body.
+fn in_function_body(stack: &[BraceCtx]) -> bool {
+    stack
+        .iter()
+        .any(|frame| matches!(frame, BraceCtx::Function))
+}
+
 /// Blanks C++ macro invocations and trailing macro annotations that the C++ grammar cannot parse
 /// (`ETL_NOEXCEPT_IF((...))`, `ETL_ASSERT_OR_RETURN(...)`, `ETL_OVERRIDE`, ...) while preserving
 /// byte offsets and newlines so AST coordinates and extracted slices stay exact.
 ///
 /// The pass is structural rather than name-based, so it stays vendor-neutral:
-/// - a macro-like token in statement position is treated as an empty statement when its
-///   invocation ends at `;` (assertion helpers) and becomes an attribute when a declaration
-///   keyword or another macro follows it,
 /// - a macro-like token directly after a closed declarator or a trailing qualifier
 ///   (`)`, `const`, ...) is a trailing annotation and is blanked,
-/// - a macro invocation in expression position is replaced by a synthetic identifier `qN` so
-///   `int x = MACRO(a);` and `if (MACRO(a))` stay syntactically valid,
+/// - a macro-like token before another declaration (`MACRO(...) void f()`) is an attribute-like
+///   declaration prefix and is blanked,
+/// - at class/namespace/file scope a macro invocation is a macro-expanded member or declaration
+///   fragment (an expression statement would be invalid there): statements and prefixes are
+///   blanked and everything else becomes a synthetic identifier `qN`,
+/// - inside a function body an uppercase invocation is a normal declarator (`void TX() {}`) or
+///   call (`TX();`): spelling alone is not macro evidence, so it is left verbatim,
 /// - macro-expanded definitions (`TEST_FIXTURE(...) { ... }`) become a synthetic function or an
-///   anonymous class depending on whether the body declares access specifiers,
+///   anonymous class depending on whether the body declares access specifiers, unless a return
+///   type or the enclosing class name marks a real function/constructor,
 /// - conditional directives are flattened (`#if`/`#else`/`#endif` blanked) so declarations split
 ///   across branches parse as one; alternative partial declarations keep only the last branch,
 /// - comments, string/character literals, and non-conditional directives are never touched.
@@ -793,6 +818,11 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
     let mut prev_word: (usize, usize) = (0, 0);
     let mut synthetic_counter: usize = 0;
     let mut conditional_branches: Vec<Vec<(usize, usize)>> = Vec::new();
+    let mut brace_stack: Vec<BraceCtx> = Vec::new();
+    let mut pending_class = false;
+    let mut pending_namespace = false;
+    let mut pending_class_name: Option<String> = None;
+    let mut saw_paren = false;
 
     while i < n {
         let b = src[i];
@@ -935,6 +965,26 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
                 i += 1;
             }
             let word = &src[start..i];
+            // Track `class`/`struct`/`union`/`enum`/`namespace` brace contexts: the declared
+            // name identifies constructor declarations, and a function body is where uppercase
+            // invocations are legitimate calls.
+            if matches!(word, b"class" | b"struct" | b"union" | b"enum") {
+                pending_class = true;
+                pending_namespace = false;
+                pending_class_name = None;
+            } else if word == b"namespace" {
+                pending_namespace = true;
+                pending_class = false;
+                pending_class_name = None;
+            } else if (pending_class || pending_namespace)
+                && pending_class_name.is_none()
+                && !matches!(
+                    word,
+                    b"final" | b"alignas" | b"public" | b"private" | b"protected" | b"virtual"
+                )
+            {
+                pending_class_name = Some(String::from_utf8_lossy(word).into_owned());
+            }
             let is_macro = is_cpp_macro_like_token(word);
             if !is_macro && word != b"operator" && word != b"typename" {
                 prev_sig = word[word.len() - 1];
@@ -1011,22 +1061,81 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
                     let after_idx = cpp_skip_plain_ws(src, close + 1);
                     let after = src.get(after_idx).copied().unwrap_or(0);
                     let trailing_annotation = matches!(prev_sig, b')') || prev_qualifier;
-                    let buf = out.get_or_insert_with(|| src.to_vec());
                     if trailing_annotation {
+                        let buf = out.get_or_insert_with(|| src.to_vec());
                         blank_range_preserving_newlines(buf, start, after_idx);
                         i = after_idx;
+                        saw_paren = true;
                         continue;
                     }
+                    // The word after the closing paren decides whether this invocation is an
+                    // attribute-like declaration prefix (`MACRO(...) void f()`).
+                    let next_word_start = cpp_skip_ws_and_directives(src, after_idx);
+                    let mut next_word_end = next_word_start;
+                    while next_word_end < n && is_c_ident_continue(src[next_word_end]) {
+                        next_word_end += 1;
+                    }
+                    let next_word = &src[next_word_start..next_word_end];
+                    let next_is_macro = is_cpp_macro_like_token(next_word);
+                    // A word (and optional `*`/`&` declarator) directly before the token is a
+                    // return type (`void TX() {}`), and the enclosing class name is a constructor
+                    // (`class IO { IO() {} };`): both are legitimate callables, never macros.
+                    let prev_word_adjacent = prev_word.1 <= start
+                        && start > prev_word.1
+                        && src[prev_word.1..start]
+                            .iter()
+                            .all(|b| b.is_ascii_whitespace() || matches!(b, b'*' | b'&'));
+                    let constructor_name = brace_stack.iter().rev().find_map(|frame| match frame {
+                        BraceCtx::Class(name) => Some(name.as_str()),
+                        _ => None,
+                    });
+                    let in_constructor_context = constructor_name.is_some_and(|name| {
+                        !name.is_empty()
+                            && std::str::from_utf8(word)
+                                .is_ok_and(|word| word.eq_ignore_ascii_case(name))
+                    });
+                    let is_normal_declarator = prev_word_adjacent || in_constructor_context;
                     if after == b'{' && (statement_start || prev_sig == b'>') {
-                        // Macro-expanded definition (`TEST_FIXTURE(...) { ... }`,
-                        // `SUITE(...) { ... }`, `ETL_PACKED_CLASS(name) { ... }`).
-                        if cpp_block_has_access_specifier(src, after_idx) {
+                        if !is_normal_declarator {
+                            // Macro-expanded definition (`TEST_FIXTURE(...) { ... }`,
+                            // `SUITE(...) { ... }`, `ETL_PACKED_CLASS(name) { ... }`).
+                            let buf = out.get_or_insert_with(|| src.to_vec());
+                            if cpp_block_has_access_specifier(src, after_idx) {
+                                blank_range_preserving_newlines(buf, start, after_idx);
+                                let take = 5.min(after_idx - start);
+                                buf[start..start + take].copy_from_slice(&b"class"[..take]);
+                                prev_sig = *buf.get(after_idx - 1).unwrap_or(&b' ');
+                            } else {
+                                blank_range_preserving_newlines(buf, start, i);
+                                let label = format!("q{}", synthetic_counter % 1000);
+                                synthetic_counter += 1;
+                                let bytes = label.as_bytes();
+                                let take = bytes.len().min(i - start);
+                                buf[start..start + take].copy_from_slice(&bytes[..take]);
+                                prev_sig = b'0';
+                            }
+                            i = after_idx;
+                            saw_paren = true;
+                            continue;
+                        }
+                        // Real function/constructor definition: keep it verbatim.
+                        i = after_idx;
+                        prev_sig = b')';
+                        saw_paren = true;
+                        continue;
+                    }
+                    if is_c_ident_start(after) {
+                        let buf = out.get_or_insert_with(|| src.to_vec());
+                        if is_cpp_declaration_keyword(next_word) || next_is_macro {
+                            // Attribute-like prefix (`MACRO(...) void f()`) before another
+                            // declaration keyword or macro: drop the prefix, keep the declaration.
                             blank_range_preserving_newlines(buf, start, after_idx);
-                            let take = 5.min(after_idx - start);
-                            buf[start..start + take].copy_from_slice(&b"class"[..take]);
-                            prev_sig = *buf.get(after_idx - 1).unwrap_or(&b' ');
+                            prev_sig = b' ';
                         } else {
-                            blank_range_preserving_newlines(buf, start, i);
+                            // The invocation expands to a type/declarator prefix
+                            // (`ETL_TYPE_DEF_RETURN(...) operator+=`) or a declaration name: a
+                            // synthetic identifier keeps the following declaration parseable.
+                            blank_range_preserving_newlines(buf, start, after_idx);
                             let label = format!("q{}", synthetic_counter % 1000);
                             synthetic_counter += 1;
                             let bytes = label.as_bytes();
@@ -1037,17 +1146,20 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
                         i = after_idx;
                         continue;
                     }
-                    if statement_start {
-                        let next_word_start = cpp_skip_ws_and_directives(src, after_idx);
-                        let mut next_word_end = next_word_start;
-                        while next_word_end < n && is_c_ident_continue(src[next_word_end]) {
-                            next_word_end += 1;
-                        }
-                        let next_word = &src[next_word_start..next_word_end];
-                        let next_is_macro = is_cpp_macro_like_token(next_word);
-                        let blank_statement = matches!(after, b';' | b'}')
-                            || (is_c_ident_start(after)
-                                && (is_cpp_declaration_keyword(next_word) || next_is_macro));
+                    // A macro that takes a code fragment (a declaration or a statement) as an
+                    // argument — `CHECK_THROW(Data data(SIZE + 1), err)` — is a statement macro,
+                    // not a normal call, even inside a function body.
+                    let code_fragment_arguments =
+                        statement_start && cpp_invocation_arguments_are_code(src, p, close);
+                    if !is_normal_declarator
+                        && (!in_function_body(&brace_stack) || code_fragment_arguments)
+                    {
+                        // Class / namespace / file scope: an expression statement is invalid
+                        // there, so an uppercase invocation is a macro-expanded member or a
+                        // declaration fragment. Blank statement macros/prefixes; name everything
+                        // else `qN` so the surrounding declaration stays parseable.
+                        let buf = out.get_or_insert_with(|| src.to_vec());
+                        let blank_statement = statement_start && matches!(after, b';' | b'}');
                         blank_range_preserving_newlines(buf, start, after_idx);
                         if !blank_statement {
                             let label = format!("q{}", synthetic_counter % 1000);
@@ -1062,16 +1174,11 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
                         i = after_idx;
                         continue;
                     }
-                    // Expression / initializer / condition position: an identifier keeps the
-                    // surrounding declaration or expression syntactically valid.
-                    blank_range_preserving_newlines(buf, start, after_idx);
-                    let label = format!("q{}", synthetic_counter % 1000);
-                    synthetic_counter += 1;
-                    let bytes = label.as_bytes();
-                    let take = bytes.len().min(i - start);
-                    buf[start..start + take].copy_from_slice(&bytes[..take]);
-                    prev_sig = *bytes.last().unwrap_or(&b'0');
+                    // A normal declarator (`void TX() {}`) or call (`TX();`,
+                    // `ETL_ASSERT(x);`): an uppercase spelling alone is not macro evidence.
                     i = after_idx;
+                    prev_sig = b')';
+                    saw_paren = true;
                     continue;
                 }
             } else {
@@ -1148,6 +1255,39 @@ fn normalize_cpp_macro_annotations(src: &[u8]) -> Option<Vec<u8>> {
             i += 2;
             prev_sig = b' ';
             continue;
+        }
+
+        // Track brace contexts so class-scope macro repair never touches a function body.
+        match b {
+            b'{' => {
+                let frame = if pending_class {
+                    BraceCtx::Class(pending_class_name.take().unwrap_or_default())
+                } else if pending_namespace || !saw_paren {
+                    BraceCtx::Other
+                } else {
+                    BraceCtx::Function
+                };
+                pending_class = false;
+                pending_namespace = false;
+                pending_class_name = None;
+                saw_paren = false;
+                brace_stack.push(frame);
+            }
+            b'}' => {
+                brace_stack.pop();
+                pending_class = false;
+                pending_namespace = false;
+                pending_class_name = None;
+                saw_paren = false;
+            }
+            b';' => {
+                pending_class = false;
+                pending_namespace = false;
+                pending_class_name = None;
+                saw_paren = false;
+            }
+            b'(' => saw_paren = true,
+            _ => {}
         }
 
         prev_sig = b;
@@ -1467,6 +1607,33 @@ fn join_cpp_scope(outer: Option<&str>, name: &str) -> String {
     match outer {
         Some(o) if !o.is_empty() => format!("{o}::{name}"),
         _ => name.to_string(),
+    }
+}
+
+/// Composes an out-of-line definition's written scope with its enclosing `namespace`.
+///
+/// C++ resolves the first name of a relative nested-name-specifier against the enclosing
+/// scope, so `Outer::Inner::tag` written inside `namespace qa_demo` denotes
+/// `qa_demo::Outer::Inner::tag` and must not lose the namespace. Absolute scopes
+/// (`::Outer::Inner`), a scope that already equals the namespace, and a scope that already
+/// starts with `"{ns}::"` are kept as written.
+fn compose_cpp_enclosing_scope(enclosing_namespace: Option<&str>, clean_scope: &str) -> String {
+    let scope = clean_scope.trim();
+    let Some(ns) = enclosing_namespace
+        .map(str::trim)
+        .filter(|ns| !ns.is_empty())
+    else {
+        return scope.trim_start_matches("::").to_string();
+    };
+    let already_qualified = scope.starts_with("::")
+        || scope == ns
+        || scope
+            .strip_prefix(ns)
+            .is_some_and(|rest| rest.starts_with("::"));
+    if already_qualified {
+        scope.trim_start_matches("::").to_string()
+    } else {
+        format!("{ns}::{scope}")
     }
 }
 
@@ -1958,6 +2125,21 @@ fn extract_decl_header<'a>(node: Node<'_>, bytes: &'a [u8]) -> &'a str {
     split_at_top_level_brace(slice)
 }
 
+/// `true` when a declarator node ends in the middle of an identifier in the original source.
+///
+/// [`normalize_cpp_macro_annotations`] rewrites a macro-expanded definition's name to a short
+/// synthetic `qN` label in the parse buffer, so the resulting node covers only `qN` bytes while
+/// the source still holds the longer macro identifier. A real declarator (`TX`, `IO`, ...) ends
+/// exactly at the identifier boundary, which keeps legitimate uppercase callables.
+fn declarator_is_buffer_repair(node: Node<'_>, bytes: &[u8]) -> bool {
+    let start = node.start_byte();
+    let end = node.end_byte();
+    start < end
+        && end < bytes.len()
+        && is_c_ident_continue(bytes[end])
+        && bytes[start..end].iter().all(|b| is_c_ident_continue(*b))
+}
+
 fn extract_c_cpp_function(
     ctx: &mut ExtractContext<'_>,
     node: Node<'_>,
@@ -2031,13 +2213,18 @@ fn extract_c_cpp_function(
             (raw_decl_name, false)
         };
 
-    if ctx.scanned.language == LanguageKind::Cpp
-        && is_cpp_macro_like_token(name.as_bytes())
-        && !forced_isr
-    {
-        // Macro-expanded definitions are syntactically repaired with synthetic declarators in
-        // the parse buffer; they are not real callables.
-        return None;
+    if ctx.scanned.language == LanguageKind::Cpp && !forced_isr {
+        // Macro-expanded definitions are syntactically repaired with a short synthetic `qN`
+        // declarator in the parse buffer, so their declarator node ends inside the original
+        // (longer) macro identifier. A real `TX` or `IO` declarator ends exactly at the
+        // identifier boundary: uppercase spelling alone is never macro evidence.
+        let decl_node = fn_decl
+            .and_then(|n| n.child_by_field_name("declarator"))
+            .or(fn_decl)
+            .unwrap_or(node);
+        if declarator_is_buffer_repair(decl_node, ctx.bytes) {
+            return None;
+        }
     }
 
     // Handle C++ out-of-line qualified method definitions: `ClassName::method_name`,
@@ -2050,12 +2237,10 @@ fn extract_c_cpp_function(
         let clean_scope = strip_cpp_template_arguments(scope_part);
         let clean_leaf = strip_cpp_template_arguments(leaf_part);
         if !clean_scope.is_empty() && !clean_leaf.is_empty() {
-            let scope = if clean_scope.contains("::") || enclosing_namespace.is_none() {
-                clean_scope
-            } else {
-                join_cpp_scope(enclosing_namespace, &clean_scope)
-            };
-            effective_enclosing = Some(scope);
+            effective_enclosing = Some(compose_cpp_enclosing_scope(
+                enclosing_namespace,
+                &clean_scope,
+            ));
             namespace_scope = None;
             name = clean_leaf;
         }
@@ -5278,6 +5463,73 @@ fn is_node_mutation_lhs(node: Node<'_>) -> bool {
     false
 }
 
+/// `true` when a macro invocation's argument list carries a code fragment (a declaration or a
+/// statement) instead of a plain expression list, e.g. `CHECK_THROW(Data data(SIZE + 1), err)` or
+/// `CHECK(data.emplace(x);, err)`.
+///
+/// Only the top level of the argument list is inspected, and a nested `(` counts as a declaration
+/// only when it directly follows a declarator name preceded by a type specifier, so member and
+/// qualified calls (`obj.method(...)`, `ns::create<T>(...)`) are never mistaken for declarations.
+fn cpp_invocation_arguments_are_code(src: &[u8], open: usize, close: usize) -> bool {
+    let mut depth = 0usize;
+    let mut argument_start = open + 1;
+    let mut i = open + 1;
+    while i < close {
+        match src[i] {
+            b'(' => {
+                if depth == 0 && cpp_declaration_before_paren(src, argument_start, i) {
+                    return true;
+                }
+                depth += 1;
+            }
+            b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b';' if depth == 0 => return true,
+            b',' if depth == 0 => argument_start = i + 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `true` when the `(` at `pos` closes a declarator name introduced by a type specifier, i.e. the
+/// argument text `[argument_start, pos)` ends with `<type> <name>` (`Data data`, `T *value`,
+/// `ns::Box<T> box`).
+fn cpp_declaration_before_paren(src: &[u8], argument_start: usize, pos: usize) -> bool {
+    let mut end = pos;
+    while end > argument_start && src[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let name_end = end;
+    while end > argument_start && is_c_ident_continue(src[end - 1]) {
+        end -= 1;
+    }
+    if end == name_end {
+        // No identifier directly before the paren: an expression call, cast, or nested group.
+        return false;
+    }
+    let mut before = end;
+    while before > argument_start && src[before - 1].is_ascii_whitespace() {
+        before -= 1;
+    }
+    if before == argument_start {
+        return false;
+    }
+    let previous = src[before - 1];
+    if previous == b'.' || previous == b':' {
+        // Member access or qualified path (`obj.method(`, `ns::create(`): a normal call.
+        return false;
+    }
+    if previous == b'>' && before >= 2 && src[before - 2] == b'-' {
+        // `obj->method(`: a normal call through a pointer.
+        return false;
+    }
+    previous.is_ascii_alphanumeric()
+        || previous == b'_'
+        || matches!(previous, b'>' | b'*' | b'&' | b']')
+}
+
 fn extract_declarator_name(node: Node<'_>, bytes: &[u8]) -> Option<String> {
     match node.kind() {
         "identifier" | "field_identifier" | "type_identifier" | "destructor_name" => {
@@ -6687,6 +6939,158 @@ void Outer::method() {}
         );
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("ETL_NOEXCEPT_IF"), "{text}");
-        assert!(!text.contains("ETL_ASSERT"), "{text}");
+        // A macro call in statement position is valid C++ call syntax, so it is kept verbatim:
+        // blanking every uppercase invocation would erase real calls such as `TX();`.
+        assert!(text.contains("ETL_ASSERT(x);"), "{text}");
+    }
+
+    /// INT-SCRUT-005: uppercase spelling alone is not macro evidence. Real C++ functions,
+    /// constructors, and calls must survive normalization and extraction.
+    #[test]
+    fn test_cpp_uppercase_functions_constructors_and_calls_are_preserved() {
+        let src = "void TX() {}\nclass IO {\npublic:\n    IO() {}\n};\nvoid caller() { TX(); IO object; }\n";
+        let scanned = dummy_scanned("src/demo.cpp", LanguageKind::Cpp);
+        let unit = parse_source_str(&scanned, src).expect("parse uppercase C++");
+        assert_eq!(unit.parse_errors, 0, "valid C++ must parse cleanly");
+
+        let tx = unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "TX")
+            .expect("TX function must be extracted");
+        assert_eq!(tx.kind, SymbolKind::Function);
+        assert_eq!(tx.symbol_id, "src/demo.cpp::TX");
+
+        let ctor = unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "IO" && s.kind == SymbolKind::Constructor)
+            .expect("IO constructor must be extracted");
+        assert_eq!(ctor.enclosing_type.as_deref(), Some("IO"));
+        assert!(
+            unit.types.iter().any(|t| t.name == "IO"),
+            "the IO class must still be indexed: {:?}",
+            unit.types.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+
+        assert!(
+            unit.raw_calls.iter().any(|c| {
+                c.caller_name == "caller"
+                    && c.callee_name == "TX"
+                    && c.receiver_or_qualifier.is_none()
+            }),
+            "caller -> TX must be extracted: {:?}",
+            unit.raw_calls
+        );
+        assert!(
+            unit.symbols.iter().any(|s| s.name == "caller"),
+            "caller must be extracted"
+        );
+    }
+
+    /// INT-SCRUT-005: macro-expanded definitions still become synthetic `qN` placeholders and
+    /// must not surface as symbols named after the macro.
+    #[test]
+    fn test_cpp_macro_expanded_definition_placeholders_are_skipped() {
+        let src = "TEST_FIXTURE(Sample) {\n    void helper() {}\n}\n";
+        let scanned = dummy_scanned("test/demo.cpp", LanguageKind::Cpp);
+        let unit = parse_source_str(&scanned, src).expect("parse macro-expanded fixture");
+        assert!(
+            !unit.symbols.iter().any(|s| s.name == "TEST_FIXTURE"
+                || s.name == "TE"
+                || (s.name.starts_with('q')
+                    && s.name.len() > 1
+                    && s.name[1..].bytes().all(|b| b.is_ascii_digit()))),
+            "macro-expanded placeholders must not be extracted: {:?}",
+            unit.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// INT-SCRUT-006: the C qualifier-normalization buffer must survive when the C++ annotation
+    /// pass makes no further changes. Cover first-only, second-only, and combined normalization.
+    #[test]
+    fn test_cpp_normalization_keeps_successful_qualifier_buffer() {
+        let scanned = dummy_scanned("src/qualifier.cpp", LanguageKind::Cpp);
+
+        // First-only: `__STATIC_INLINE` is rewritten by the C pass; the C++ pass is a no-op
+        // (the remaining uppercase text is the `#define` line, which it skips).
+        let first_only =
+            "#define __STATIC_INLINE static inline\n__STATIC_INLINE int fast_op(void) { return 1; }\n";
+        let unit = parse_source_str(&scanned, first_only).expect("parse first-only normalization");
+        assert_eq!(unit.parse_errors, 0, "qualifier normalization must survive");
+        assert!(unit.symbols.iter().any(|s| s.name == "fast_op"));
+
+        // Second-only: no qualifier macro; the C++ annotation pass does the work.
+        let second_only = "class A {\n    void f() ETL_NOEXCEPT_IF((true)) {}\n};\n";
+        let unit =
+            parse_source_str(&scanned, second_only).expect("parse second-only normalization");
+        assert_eq!(unit.parse_errors, 0);
+        assert!(unit.symbols.iter().any(|s| s.name == "f"));
+
+        // Combined: both passes change the buffer.
+        let combined = "#define __STATIC_INLINE static inline\n__STATIC_INLINE void g() ETL_NOEXCEPT_IF((true)) { ETL_ASSERT(x); }\n";
+        let unit = parse_source_str(&scanned, combined).expect("parse combined normalization");
+        assert_eq!(unit.parse_errors, 0);
+        assert!(unit.symbols.iter().any(|s| s.name == "g"));
+    }
+
+    /// INT-SCRUT-007: a relative nested out-of-line scope keeps its enclosing namespace, while an
+    /// already namespace-qualified or absolute scope is not prefixed twice.
+    #[test]
+    fn test_cpp_nested_out_of_line_scope_keeps_namespace() {
+        let src = "namespace qa_demo {\n\
+\n\
+Outer::Outer(int seed) : value_(seed) {}\n\
+\n\
+int Outer::value() const { return value_; }\n\
+\n\
+Outer::Inner::Inner(int tag) : tag_(tag) {}\n\
+\n\
+int Outer::Inner::tag() const { return tag_; }\n\
+\n\
+int qa_demo::Outer::Inner::qualified_tag() const { return 0; }\n\
+\n\
+}  // namespace qa_demo\n";
+        let scanned = dummy_scanned("src/qa_shapes.cpp", LanguageKind::Cpp);
+        let unit = parse_source_str(&scanned, src).expect("parse nested out-of-line scopes");
+
+        let tag = unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "tag")
+            .expect("nested tag must be extracted");
+        assert_eq!(tag.enclosing_type.as_deref(), Some("qa_demo::Outer::Inner"));
+        assert_eq!(
+            tag.symbol_id,
+            "src/qa_shapes.cpp::qa_demo::Outer::Inner::tag"
+        );
+
+        let ctor = unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "Inner" && s.kind == SymbolKind::Constructor)
+            .expect("nested constructor must be extracted");
+        assert_eq!(
+            ctor.symbol_id,
+            "src/qa_shapes.cpp::qa_demo::Outer::Inner::Inner"
+        );
+
+        let value = unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "value")
+            .expect("Outer::value must be extracted");
+        assert_eq!(value.enclosing_type.as_deref(), Some("qa_demo::Outer"));
+
+        let qualified = unit
+            .symbols
+            .iter()
+            .find(|s| s.name == "qualified_tag")
+            .expect("namespace-qualified definition must be extracted");
+        assert_eq!(
+            qualified.enclosing_type.as_deref(),
+            Some("qa_demo::Outer::Inner"),
+            "an already namespace-qualified scope must not be prefixed twice"
+        );
     }
 }

@@ -70,7 +70,7 @@
       "kind": "method",
       "file": "src/qa_shapes.cpp",
       "start_line": 20,
-      "symbol_id_contains": "Outer::Inner::tag"
+      "symbol_id_contains": "qa_demo::Outer::Inner::tag"
     },
     "operator": {
       "file": "src/qa_shapes.cpp",
