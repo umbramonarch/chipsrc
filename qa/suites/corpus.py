@@ -21,6 +21,7 @@ Repositories that are absent from ``--repos-root`` / ``--corpus-root`` are recor
 """
 from pathlib import Path
 import json
+import os
 import shutil
 import subprocess
 
@@ -99,6 +100,45 @@ def _git_snapshot(repo_path: Path) -> dict:
         "exit": proc.returncode,
         "stdout": proc.stdout.replace("\r\n", "\n"),
     }
+
+
+def _tree_signature(root: Path) -> dict:
+    """Cheap file-count/size/newest-mtime signature for trees without git history.
+
+    `my-sunshine` is not a git repository, so an identical `git status` failure snapshot
+    would not prove the conversion left it alone. The signature makes the pollution check
+    real for such trees: any created, deleted, resized, or rewritten file changes it.
+    """
+    files = 0
+    total_bytes = 0
+    newest_ns = 0
+    newest_path = ""
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name != ".git")
+        for name in filenames:
+            path = Path(dirpath) / name
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            files += 1
+            total_bytes += stat.st_size
+            if stat.st_mtime_ns > newest_ns:
+                newest_ns = stat.st_mtime_ns
+                newest_path = str(path.relative_to(root)).replace("\\", "/")
+    return {
+        "file_count": files,
+        "total_bytes": total_bytes,
+        "newest_mtime_ns": newest_ns,
+        "newest_path": newest_path,
+    }
+
+
+def _source_signature(repo_path: Path, git_snapshot: dict) -> dict:
+    """Prefer `git status --porcelain`; fall back to a tree signature without git history."""
+    if git_snapshot.get("exit") == 0:
+        return {"kind": "git", "stdout": git_snapshot.get("stdout") or ""}
+    return {"kind": "tree", "signature": _tree_signature(repo_path)}
 
 
 def _language_tuples(entries: object) -> dict[str, tuple[int, int]]:
@@ -286,6 +326,7 @@ def _run_repo(ctx: HarnessContext, spec: dict) -> None:
     if bundle.exists():
         shutil.rmtree(bundle, ignore_errors=True)
     git_before = _git_snapshot(source)
+    tree_before = _source_signature(source, git_before)
 
     cold = ctx.run(
         f"corpus: {repo} cold convert",
@@ -341,15 +382,17 @@ def _run_repo(ctx: HarnessContext, spec: dict) -> None:
 
     if unchanged_label is not None:
         git_after = _git_snapshot(source)
+        tree_after = _source_signature(source, git_after)
         ctx.check(
             unchanged_label,
-            git_before == git_after,
+            tree_before == tree_after,
             {
                 "repo": repo,
                 "git_exit": [git_before.get("exit"), git_after.get("exit")],
-                "before": str(git_before.get("stdout") or "")[:500],
-                "after": str(git_after.get("stdout") or "")[:500],
-                "changed": git_before != git_after,
+                "signature_kind": tree_before["kind"],
+                "before": tree_before,
+                "after": tree_after,
+                "changed": tree_before != tree_after,
             },
         )
 
