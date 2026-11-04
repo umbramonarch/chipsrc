@@ -4,8 +4,8 @@ description: >-
   Index, auto-synchronize, and query C, C++, Rust, Python, TypeScript, and JavaScript source
   repositories using the `chipsrc` CLI. Use this skill whenever exploring a codebase, looking
   up function/method/ISR signatures, struct/enum/trait definitions, static callers/callees,
-  `#define` register macros, MMIO hex addresses, or hardware peripheral usage, instead of
-  reading entire source files into context or running blind multi-turn greps.
+  `#define` register macros, MMIO hex addresses, hardware peripheral usage, or a natural-language
+  concept, instead of reading entire source files into context or running blind multi-turn greps.
 ---
 
 # `chipsrc` — Agent Code Intelligence CLI
@@ -19,16 +19,17 @@ facts in a **single CLI call**.
 ## 1. Check Workspace, Inspect, & Ensure Bundles Exist
 
 Before running multi-turn `Grep` + `Read` loops, check which bundles exist or ensure the target
-repository is indexed. `chipsrc` caches per-file AST extractions in `output/<repo>/cache/`:
-stat-only BLAKE3 stamp hits return in **<2 ms**, comment-only edits short-circuit in **<25 ms**,
-and single-file structural edits incrementally re-parse only the modified file in **<50 ms**:
+repository is indexed. `chipsrc` caches per-file AST extractions in `output/<repo>/cache/`
+(path-keyed shards; repositories over 500 files use 256-unit packs). A stat-only stamp check
+answers `CACHE HIT` in single-digit milliseconds on a small repository and about 175 ms on a
+12,471-file corpus; a 1-file structural edit syncs in under 100 ms on a 123-file repository;
+coordinates-only edits skip call-graph relinking entirely:
 
 ```bash
 # List all indexed codebase bundles in ./output and their live freshness (FRESH vs STALE)
 chipsrc status
 chipsrc status --sync
 chipsrc status --check          # Exit 2 when any bundle is STALE (CI check)
-```
 
 # Inspect language breakdown, first-party vs vendor SDK file counts, architectural layers, and Onboarding Digest
 chipsrc inspect .
@@ -67,7 +68,10 @@ running `chipsrc ensure . -o output/`:
 
 Every `chipsrc` query command automatically runs `auto_refresh_bundles` before querying (unless
 `--no-sync` is passed), ensuring any edited, added, or deleted source files are incrementally
-re-indexed on the fly:
+re-indexed on the fly. If another process holds `cache/.lock`, the refresh waits at most 150 ms
+and then answers from the consistent on-disk bundle instead of blocking. Pass `--no-sync` for
+pure query latency (for example ~45 ms instead of ~200 ms on a 12k-file corpus); on an incomplete
+bundle it exits non-zero naming the missing `index/*.tsv` rather than returning `[]`:
 
 ```bash
 # 1. Function / Method / ISR Signature & Inline Source Body Lookup (-s / --show)
@@ -82,7 +86,8 @@ chipsrc callees ensure_repo --show
 chipsrc path main lock_actuator
 chipsrc impact lock_actuator
 
-# 3. Struct / Enum / Union / Trait / Interface Layout Lookup (-s / --show)
+# 3. Struct / Enum / Union / Trait / Class Template Layout Lookup (-s / --show)
+# C++ out-of-line methods and namespaces are indexed too: `type ivector`, `sym etl::ivector::push_back`
 chipsrc type ConvertConfig
 chipsrc type GPIO_TypeDef --show
 
@@ -103,4 +108,9 @@ chipsrc section "drvs" --show
 # 7. Parallel SIMD + Regex Search Across All Indexed Bundles
 chipsrc search "BLAKE3" --compact
 chipsrc search "MODER" --kind macros -i
+
+# 8. Deterministic BM25 concept search when you do not know the identifier
+#    (--kind concept; multi-token queries with zero literal/regex hits fall back automatically)
+chipsrc search "vendor mode" --kind concept --json --no-sync
+chipsrc search "debounce button interrupt" --json
 ```

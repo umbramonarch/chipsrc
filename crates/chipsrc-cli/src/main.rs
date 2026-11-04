@@ -53,7 +53,8 @@ enum Commands {
         timings: bool,
     },
 
-    /// Ensure one or more repositories are indexed and incrementally synchronized (`<2ms` on cache hit)
+    /// Ensure one or more repositories are indexed and incrementally synchronized
+    /// (stat-only cache hit; 1-file structural sync under 100 ms on a 123-file repo)
     Ensure {
         /// Repository paths to ensure (defaults to `.`)
         repos: Vec<PathBuf>,
