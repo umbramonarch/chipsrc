@@ -37,7 +37,7 @@
       "vendor_mode": "active"
     },
     {
-      "name": "work",
+      "name": "chiparch",
       "root": "repos",
       "vendor_mode": "active"
     },
