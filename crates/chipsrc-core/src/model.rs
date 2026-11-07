@@ -37,10 +37,20 @@ impl LanguageKind {
             "rs" => Some(Self::Rust),
             "py" | "pyi" => Some(Self::Python),
             "ts" | "mts" | "cts" => Some(Self::TypeScript),
-            "tsx" => Some(Self::Tsx),
+            "tsx" | "astro" | "vue" | "svelte" => Some(Self::Tsx),
             "js" | "mjs" | "cjs" => Some(Self::JavaScript),
             "jsx" => Some(Self::Jsx),
             _ => None,
+        }
+    }
+
+    /// Returns the language family group ID (C/C++ = 0, Rust = 1, Python = 2, TS/JS/SFC = 3).
+    pub fn language_family(self) -> u8 {
+        match self {
+            Self::C | Self::Cpp => 0,
+            Self::Rust => 1,
+            Self::Python => 2,
+            Self::TypeScript | Self::Tsx | Self::JavaScript | Self::Jsx => 3,
         }
     }
 }
@@ -49,8 +59,11 @@ impl LanguageKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileScope {
+    #[serde(alias = "first-party", alias = "firstparty")]
     FirstParty,
+    #[serde(alias = "vendor", alias = "vendor-sdk", alias = "vendorsdk")]
     VendorSdk,
+    #[serde(alias = "tests")]
     Test,
 }
 
@@ -62,23 +75,45 @@ impl FileScope {
             Self::Test => "test",
         }
     }
+
+    /// Inverse of [`FileScope::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "first_party" => Some(Self::FirstParty),
+            "vendor_sdk" => Some(Self::VendorSdk),
+            "test" => Some(Self::Test),
+            _ => None,
+        }
+    }
 }
 
 /// Canonical architectural layer detected from repository path structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchLayer {
+    #[serde(alias = "application", alias = "apps")]
     App,
+    #[serde(alias = "board", alias = "platform")]
     Bsp,
+    #[serde(alias = "drvs", alias = "drv", alias = "driver")]
     Drivers,
+    #[serde(alias = "cfg", alias = "configs")]
     Config,
+    #[serde(alias = "lib", alias = "utils", alias = "common")]
     Libs,
+    #[serde(alias = "models", alias = "entities")]
     Domain,
+    #[serde(alias = "service")]
     Services,
+    #[serde(alias = "routes", alias = "frontend", alias = "web")]
     Api,
+    #[serde(alias = "engine", alias = "kernel")]
     Core,
+    #[serde(alias = "bin", alias = "tools")]
     Cli,
+    #[serde(alias = "vendor", alias = "hal", alias = "vendor-hal")]
     VendorHal,
+    #[serde(alias = "test")]
     Tests,
     Other,
 }
@@ -102,8 +137,7 @@ impl ArchLayer {
         }
     }
 
-    /// Numeric layer rank (higher = higher level orchestration, lower = lower level primitive/driver)
-    /// used to detect upward architectural layer dependency violations.
+    /// Numeric layer rank used to detect upward architectural layer dependency violations.
     pub fn rank(self) -> u8 {
         match self {
             Self::Cli | Self::Api | Self::App => 5,
@@ -113,6 +147,26 @@ impl ArchLayer {
             Self::Config | Self::Libs => 1,
             Self::VendorHal => 0,
             Self::Tests | Self::Other => 3,
+        }
+    }
+
+    /// Inverse of [`ArchLayer::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "app" => Some(Self::App),
+            "bsp" => Some(Self::Bsp),
+            "drvs" => Some(Self::Drivers),
+            "config" => Some(Self::Config),
+            "libs" => Some(Self::Libs),
+            "domain" => Some(Self::Domain),
+            "services" => Some(Self::Services),
+            "api" => Some(Self::Api),
+            "core" => Some(Self::Core),
+            "cli" => Some(Self::Cli),
+            "vendor_hal" => Some(Self::VendorHal),
+            "tests" => Some(Self::Tests),
+            "other" => Some(Self::Other),
+            _ => None,
         }
     }
 }
@@ -138,6 +192,18 @@ impl SymbolKind {
             Self::Entrypoint => "entrypoint",
         }
     }
+
+    /// Inverse of [`SymbolKind::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "fn" => Some(Self::Function),
+            "method" => Some(Self::Method),
+            "isr" => Some(Self::Isr),
+            "ctor" => Some(Self::Constructor),
+            "entrypoint" => Some(Self::Entrypoint),
+            _ => None,
+        }
+    }
 }
 
 /// Symbol or type visibility modifier.
@@ -159,6 +225,18 @@ impl Visibility {
             Self::Protected => "prot",
             Self::Internal => "internal",
             Self::Static => "static",
+        }
+    }
+
+    /// Inverse of [`Visibility::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "pub" => Some(Self::Public),
+            "priv" => Some(Self::Private),
+            "prot" => Some(Self::Protected),
+            "internal" => Some(Self::Internal),
+            "static" => Some(Self::Static),
+            _ => None,
         }
     }
 }
@@ -190,6 +268,21 @@ impl TypeKind {
             Self::TypeAlias => "type_alias",
         }
     }
+
+    /// Inverse of [`TypeKind::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "struct" => Some(Self::Struct),
+            "enum" => Some(Self::Enum),
+            "union" => Some(Self::Union),
+            "trait" => Some(Self::Trait),
+            "interface" => Some(Self::Interface),
+            "class" => Some(Self::Class),
+            "typedef" => Some(Self::Typedef),
+            "type_alias" => Some(Self::TypeAlias),
+            _ => None,
+        }
+    }
 }
 
 /// Kind of macro, compile-time constant, or MMIO register construct.
@@ -215,6 +308,20 @@ impl MacroKind {
             Self::Bitmask => "bitmask",
             Self::RegisterAccess => "reg_access",
             Self::LinkerSection => "linker_section",
+        }
+    }
+
+    /// Inverse of [`MacroKind::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "macro" => Some(Self::ObjectMacro),
+            "fn_macro" => Some(Self::FunctionMacro),
+            "const" => Some(Self::Constant),
+            "mmio_addr" => Some(Self::MmioAddress),
+            "bitmask" => Some(Self::Bitmask),
+            "reg_access" => Some(Self::RegisterAccess),
+            "linker_section" => Some(Self::LinkerSection),
+            _ => None,
         }
     }
 }
@@ -243,6 +350,26 @@ impl ResolutionTier {
 
     pub fn is_resolved(self) -> bool {
         !matches!(self, Self::ExternalOrMacro)
+    }
+
+    /// High-confidence call resolution tiers eligible for scoring and metrics.
+    pub fn is_high_confidence(self) -> bool {
+        matches!(
+            self,
+            Self::SameFile | Self::ImportResolved | Self::UniqueGlobal
+        )
+    }
+
+    /// Inverse of [`ResolutionTier::as_str`] for index-table round-trips.
+    pub fn parse_label(label: &str) -> Option<Self> {
+        match label.trim() {
+            "same_file" => Some(Self::SameFile),
+            "import_resolved" => Some(Self::ImportResolved),
+            "unique_global" => Some(Self::UniqueGlobal),
+            "ambiguous_name" => Some(Self::AmbiguousName),
+            "external_or_macro" => Some(Self::ExternalOrMacro),
+            _ => None,
+        }
     }
 }
 
@@ -281,6 +408,8 @@ pub struct ScannedFile {
     pub arch_layer: ArchLayer,
     pub size_bytes: u64,
     pub mtime_secs: u64,
+    #[serde(default)]
+    pub mtime_nanos: u32,
     pub blake3_hash: String,
     pub line_count: usize,
 }
@@ -288,87 +417,140 @@ pub struct ScannedFile {
 /// Extracted function, method, constructor, entrypoint, or ISR definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedSymbol {
+    #[serde(default, skip_serializing)]
     pub symbol_id: String,
+    #[serde(rename = "n", alias = "name")]
     pub name: String,
+    #[serde(rename = "q", alias = "qualified_name")]
     pub qualified_name: String,
+    #[serde(rename = "k", alias = "kind")]
     pub kind: SymbolKind,
+    #[serde(rename = "v", alias = "visibility")]
     pub visibility: Visibility,
+    #[serde(default, skip_serializing)]
     pub file: String,
+    #[serde(rename = "s", alias = "start_line")]
     pub start_line: usize,
+    #[serde(rename = "e", alias = "end_line")]
     pub end_line: usize,
+    #[serde(rename = "g", alias = "signature")]
     pub signature: String,
+    #[serde(rename = "d", alias = "doc_summary")]
     pub doc_summary: String,
+    #[serde(rename = "t", alias = "enclosing_type")]
     pub enclosing_type: Option<String>,
+    #[serde(rename = "c", alias = "scope")]
     pub scope: FileScope,
+    #[serde(rename = "a", alias = "arch_layer")]
     pub arch_layer: ArchLayer,
+    #[serde(rename = "i", alias = "section_id")]
     pub section_id: String,
 }
 
 /// Extracted struct, enum, union, trait, interface, class, or typedef definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedType {
+    #[serde(rename = "i", alias = "type_id")]
     pub type_id: String,
+    #[serde(rename = "n", alias = "name")]
     pub name: String,
+    #[serde(rename = "k", alias = "kind")]
     pub kind: TypeKind,
+    #[serde(rename = "v", alias = "visibility")]
     pub visibility: Visibility,
+    #[serde(default, skip_serializing)]
     pub file: String,
+    #[serde(rename = "s", alias = "start_line")]
     pub start_line: usize,
+    #[serde(rename = "e", alias = "end_line")]
     pub end_line: usize,
+    #[serde(rename = "f", alias = "fields_summary")]
     pub fields_summary: String,
+    #[serde(rename = "d", alias = "doc_summary")]
     pub doc_summary: String,
+    #[serde(rename = "c", alias = "scope")]
     pub scope: FileScope,
+    #[serde(rename = "a", alias = "arch_layer")]
     pub arch_layer: ArchLayer,
+    #[serde(rename = "t", alias = "section_id")]
     pub section_id: String,
 }
 
 /// Extracted `#define` macro, compile-time constant, hex MMIO address, bitmask, or hardware register access.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedMacro {
+    #[serde(rename = "n", alias = "name")]
     pub name: String,
+    #[serde(rename = "k", alias = "kind")]
     pub kind: MacroKind,
+    #[serde(rename = "v", alias = "value_or_args")]
     pub value_or_args: String,
+    #[serde(rename = "h", alias = "hex_addr")]
     pub hex_addr: Option<String>,
+    #[serde(default, skip_serializing)]
     pub file: String,
+    #[serde(rename = "l", alias = "line")]
     pub line: usize,
+    #[serde(rename = "c", alias = "scope")]
     pub scope: FileScope,
+    #[serde(rename = "a", alias = "arch_layer")]
     pub arch_layer: ArchLayer,
+    #[serde(rename = "t", alias = "section_id")]
     pub section_id: String,
+    #[serde(rename = "d", alias = "description")]
     pub description: String,
 }
 
 /// Extracted import, `use`, or `#include` directive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractedImport {
+    #[serde(default, skip_serializing)]
     pub file: String,
+    #[serde(rename = "l", alias = "line")]
     pub line: usize,
+    #[serde(rename = "p", alias = "raw_path")]
     pub raw_path: String,
+    #[serde(rename = "i", alias = "imported_names")]
     pub imported_names: Vec<String>,
+    #[serde(rename = "s", alias = "is_system")]
     pub is_system: bool,
 }
 
 /// Unresolved syntactic call expression attributed to its enclosing function/method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawCallSite {
+    #[serde(default, skip_serializing)]
     pub caller_file: String,
+    #[serde(rename = "n", alias = "caller_name")]
     pub caller_name: String,
+    #[serde(rename = "s", alias = "caller_start_line")]
     pub caller_start_line: usize,
+    #[serde(rename = "c", alias = "callee_name")]
     pub callee_name: String,
+    #[serde(rename = "r", alias = "receiver_or_qualifier")]
     pub receiver_or_qualifier: Option<String>,
+    #[serde(rename = "l", alias = "call_line")]
     pub call_line: usize,
 }
 
 /// Raw cross-reference occurrence extracted from a file AST.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawXrefSite {
+    #[serde(default, skip_serializing)]
     pub file: String,
+    #[serde(rename = "l", alias = "line")]
     pub line: usize,
+    #[serde(rename = "e", alias = "enclosing_symbol")]
     pub enclosing_symbol: Option<String>,
+    #[serde(rename = "n", alias = "target_name")]
     pub target_name: String,
+    #[serde(rename = "c", alias = "category")]
     pub category: String,
+    #[serde(rename = "x", alias = "context")]
     pub context: String,
 }
 
-/// Complete AST extraction output for a single file, cached in `cache.json` for incremental rebuilds.
+/// Complete AST extraction output for a single file, cached in `cache/` for incremental rebuilds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedFileUnit {
     pub scanned: ScannedFile,
@@ -381,20 +563,288 @@ pub struct ParsedFileUnit {
     pub parse_errors: usize,
 }
 
-/// Persistent per-file AST cache stored in `output/<stem>/cache.json` so incremental code edits re-parse only changed files.
+impl ParsedFileUnit {
+    /// Restores per-file path fields on symbols, types, macros, calls, and xrefs.
+    pub fn restore_per_file_fields(&mut self) {
+        let rel_path = self.scanned.rel_path.as_str();
+        if rel_path.is_empty() {
+            return;
+        }
+        for s in &mut self.symbols {
+            if s.file.is_empty() {
+                s.file = rel_path.to_string();
+            }
+            if s.symbol_id.is_empty() {
+                s.symbol_id = format!("{}::{}", s.file, s.qualified_name);
+            }
+        }
+        for t in &mut self.types {
+            if t.file.is_empty() {
+                t.file = rel_path.to_string();
+            }
+        }
+        for m in &mut self.macros {
+            if m.file.is_empty() {
+                m.file = rel_path.to_string();
+            }
+        }
+        for imp in &mut self.imports {
+            if imp.file.is_empty() {
+                imp.file = rel_path.to_string();
+            }
+        }
+        for c in &mut self.raw_calls {
+            if c.caller_file.is_empty() {
+                c.caller_file = rel_path.to_string();
+            }
+        }
+        for x in &mut self.raw_xrefs {
+            if x.file.is_empty() {
+                x.file = rel_path.to_string();
+            }
+        }
+    }
+
+    /// Computes a deterministic 16-character BLAKE3 structural digest over extracted AST entities.
+    pub fn structural_digest(&self) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(self.scanned.language.as_str().as_bytes());
+        h.update(b"|");
+        h.update(self.scanned.scope.as_str().as_bytes());
+        h.update(b"|");
+        h.update(self.scanned.arch_layer.as_str().as_bytes());
+        h.update(b"\n");
+        for s in &self.symbols {
+            h.update(b"S:");
+            h.update(s.name.as_bytes());
+            h.update(b"|");
+            h.update(s.kind.as_str().as_bytes());
+            h.update(b"|");
+            h.update(s.visibility.as_str().as_bytes());
+            h.update(b"|");
+            h.update(s.signature.as_bytes());
+            h.update(b"|");
+            if let Some(ref et) = s.enclosing_type {
+                h.update(et.as_bytes());
+            }
+            h.update(b"|");
+            h.update(s.scope.as_str().as_bytes());
+            h.update(b"\n");
+        }
+        for t in &self.types {
+            h.update(b"T:");
+            h.update(t.name.as_bytes());
+            h.update(b"|");
+            h.update(t.kind.as_str().as_bytes());
+            h.update(b"|");
+            h.update(t.visibility.as_str().as_bytes());
+            h.update(b"|");
+            h.update(t.fields_summary.as_bytes());
+            h.update(b"\n");
+        }
+        for m in &self.macros {
+            h.update(b"M:");
+            h.update(m.name.as_bytes());
+            h.update(b"|");
+            h.update(m.kind.as_str().as_bytes());
+            h.update(b"|");
+            h.update(m.value_or_args.as_bytes());
+            h.update(b"\n");
+        }
+        for imp in &self.imports {
+            h.update(b"I:");
+            h.update(imp.raw_path.as_bytes());
+            h.update(b"|");
+            for name in &imp.imported_names {
+                h.update(name.as_bytes());
+                h.update(b",");
+            }
+            h.update(b"\n");
+        }
+        for c in &self.raw_calls {
+            h.update(b"C:");
+            h.update(c.caller_name.as_bytes());
+            h.update(b"|");
+            h.update(c.callee_name.as_bytes());
+            h.update(b"|");
+            if let Some(ref q) = c.receiver_or_qualifier {
+                h.update(q.as_bytes());
+            }
+            h.update(b"\n");
+        }
+        for x in &self.raw_xrefs {
+            h.update(b"X:");
+            h.update(x.target_name.as_bytes());
+            h.update(b"|");
+            h.update(x.category.as_bytes());
+            h.update(b"|");
+            if let Some(ref es) = x.enclosing_symbol {
+                h.update(es.as_bytes());
+            }
+            h.update(b"\n");
+        }
+        h.finalize().to_hex()[..16].to_string()
+    }
+}
+
+/// Entry in `cache/manifest.json` pointing to a per-file AST shard (`cache/<shard_key>.json`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheShardEntry {
+    pub blake3_hash: String,
+    pub shard: String,
+    #[serde(default)]
+    pub structural_digest: String,
+}
+
+impl CacheShardEntry {
+    /// Computes a deterministic 16-hex-character BLAKE3 shard key from `rel_path` and `blake3_hash`.
+    pub fn shard_key(rel_path: &str, blake3_hash: &str) -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(rel_path.as_bytes());
+        h.update(b"\0");
+        h.update(blake3_hash.as_bytes());
+        h.finalize().to_hex()[..16].to_string()
+    }
+
+    /// Formats the relative bundle shard path (`cache/<shard_key>.json`) for `(rel_path, blake3_hash)`.
+    pub fn shard_rel_path(rel_path: &str, blake3_hash: &str) -> String {
+        format!("cache/{}.json", Self::shard_key(rel_path, blake3_hash))
+    }
+}
+
+/// Number of per-file cache units grouped into one packed shard on large repositories.
+pub const CACHE_PACK_UNITS: usize = 256;
+
+/// Repository source file count threshold above which packed shards are used.
+pub const CACHE_PACK_FILE_THRESHOLD: usize = 500;
+
+/// File-name prefix of a packed cache shard.
+pub const CACHE_PACK_PREFIX: &str = "pack-";
+
+/// Returns `true` when `shard` (a bundle-relative path or bare file name) names a packed shard.
+pub fn is_packed_cache_shard(shard: &str) -> bool {
+    shard
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| name.starts_with(CACHE_PACK_PREFIX))
+}
+
+/// Computes the deterministic file name of the packed shard holding the given `(rel_path, blake3_hash)` pairs.
+pub fn cache_pack_file_name<'a, I>(pairs: I) -> String
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut sorted: Vec<(&str, &str)> = pairs.into_iter().collect();
+    sorted.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    for (rel_path, blake3_hash) in sorted {
+        hasher.update(rel_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(blake3_hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    format!(
+        "{CACHE_PACK_PREFIX}{}.json",
+        &hasher.finalize().to_hex()[..16]
+    )
+}
+
+/// Computes the deterministic packed shard file name for a chunk of parsed units.
+pub fn cache_pack_shard_name(units: &[&ParsedFileUnit]) -> String {
+    cache_pack_file_name(units.iter().map(|unit| {
+        (
+            unit.scanned.rel_path.as_str(),
+            unit.scanned.blake3_hash.as_str(),
+        )
+    }))
+}
+
+/// Per-file cache manifest stored at `output/<stem>/cache/manifest.json` (schema `2.1.0`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheManifest {
+    pub schema_version: String,
+    pub repo_root: String,
+    pub vendor_mode: VendorMode,
+    #[serde(default)]
+    pub fingerprint: String,
+    #[serde(default)]
+    pub blueprint_hash: String,
+    pub files: BTreeMap<String, CacheShardEntry>,
+}
+
+/// Persistent per-file AST cache stored in `output/<stem>/cache/` so incremental code edits re-parse only changed files.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IncrementalAstCache {
     pub schema_version: String,
     pub repo_root: String,
     pub vendor_mode: VendorMode,
+    #[serde(default)]
+    pub fingerprint: String,
+    #[serde(default)]
+    pub blueprint_hash: String,
     pub files: BTreeMap<String, ParsedFileUnit>,
 }
 
-/// Symbol enriched with deterministic PageRank, degree centrality, and SCC cycle info.
+/// Custom MMIO hex address range defined in `.chipsrc.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MmioAddressRange {
+    pub start: String,
+    pub end: String,
+    #[serde(alias = "description")]
+    pub name: String,
+}
+
+fn deserialize_c_qualifiers<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum QualifiersRepr {
+        List(Vec<String>),
+        Map(BTreeMap<String, String>),
+    }
+
+    match Option::<QualifiersRepr>::deserialize(deserializer)? {
+        Some(QualifiersRepr::List(v)) => Ok(v),
+        Some(QualifiersRepr::Map(m)) => Ok(m.into_keys().collect()),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Agent-once repository onboarding blueprint (`.chipsrc.json`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepoBlueprint {
+    /// Path prefix -> FileScope ("first_party" | "vendor_sdk" | "test")
+    pub scopes: BTreeMap<String, FileScope>,
+    /// Path prefix -> ArchLayer ("app", "bsp", "drvs", "config", "libs", "domain", "services", "api", "core", "cli", "vendor_hal", "tests")
+    pub layers: BTreeMap<String, ArchLayer>,
+    /// Path prefix -> custom module shard slug/path (e.g. "packages/ui" -> "packages-ui")
+    pub shards: BTreeMap<String, String>,
+    /// Additional directories or glob prefixes to ignore
+    pub ignore_dirs: Vec<String>,
+    /// Additional C/C++ storage/attribute qualifier macros to strip before declarators
+    #[serde(deserialize_with = "deserialize_c_qualifiers")]
+    pub c_qualifiers: Vec<String>,
+    /// Additional function names or attributes to classify as entrypoints
+    pub entrypoints: Vec<String>,
+    /// Additional function names or attributes to classify as hardware ISRs
+    pub isr_patterns: Vec<String>,
+    /// Custom MMIO hex address ranges (e.g. RISC-V `0x10000000`..`0x1FFFFFFF`)
+    pub mmio_ranges: Vec<MmioAddressRange>,
+}
+
+/// Symbol enriched with deterministic PageRank, HITS hub/authority scores, degree centrality, and SCC cycle info.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RankedSymbol {
     pub symbol: ExtractedSymbol,
     pub pagerank: f64,
+    #[serde(default)]
+    pub hub_score: f64,
+    #[serde(default)]
+    pub authority_score: f64,
     pub in_degree: usize,
     pub out_degree: usize,
     pub is_god_node: bool,
@@ -498,6 +948,58 @@ pub struct BundleIndexes {
     pub vendor_surface: VendorSurfaceSummary,
 }
 
+/// Identity of a linked symbol inside `cache/graph_state.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphSymbolRef {
+    pub symbol_id: String,
+    pub start_line: usize,
+}
+
+/// Per-symbol graph annotations that cannot be re-derived from the AST alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SymbolGraphState {
+    pub symbol_id: String,
+    pub start_line: usize,
+    pub pagerank: f64,
+    #[serde(default)]
+    pub hub_score: f64,
+    #[serde(default)]
+    pub authority_score: f64,
+    pub in_degree: usize,
+    pub out_degree: usize,
+    #[serde(default)]
+    pub is_god_node: bool,
+    #[serde(default)]
+    pub is_entrypoint: bool,
+    #[serde(default)]
+    pub scc_id: Option<usize>,
+}
+
+/// Reconstructible linked-graph state persisted at `cache/graph_state.json`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GraphStateFile {
+    pub schema_version: String,
+    #[serde(default)]
+    pub fingerprint: String,
+    #[serde(default)]
+    pub vendor_mode: VendorMode,
+    #[serde(default)]
+    pub symbols: Vec<SymbolGraphState>,
+    #[serde(default)]
+    pub god_nodes: Vec<GraphSymbolRef>,
+    #[serde(default)]
+    pub entrypoints: Vec<GraphSymbolRef>,
+    #[serde(default)]
+    pub layer_edges: Vec<LayerDependencyEdge>,
+    #[serde(default)]
+    pub cycles: Vec<CyclicCluster>,
+    #[serde(default)]
+    pub vendor_surface: VendorSurfaceSummary,
+}
+
+/// Name of the persisted linked-graph state file inside a bundle's `cache/` directory.
+pub const GRAPH_STATE_FILE: &str = "graph_state.json";
+
 /// Per-language file and line count breakdown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LanguageStat {
@@ -506,6 +1008,24 @@ pub struct LanguageStat {
     pub lines: usize,
     pub first_party_files: usize,
     pub vendor_files: usize,
+}
+
+/// Lightweight per-file freshness stamp stored in `meta.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStamp {
+    pub rel_path: String,
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub mtime_secs: u64,
+    #[serde(default)]
+    pub mtime_nanos: u32,
+    #[serde(default)]
+    pub line_count: usize,
+    pub blake3_hash: String,
+    pub scope: FileScope,
+    pub arch_layer: ArchLayer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<LanguageKind>,
 }
 
 /// Repository-level metadata serialized in `meta.json`.
@@ -530,8 +1050,24 @@ pub struct RepoMetadata {
     pub god_node_count: usize,
     pub entrypoint_count: usize,
     pub elapsed_ms: u64,
+    #[serde(default)]
+    pub scan_ms: u64,
+    #[serde(default)]
+    pub parse_ms: u64,
+    #[serde(default)]
+    pub link_ms: u64,
+    #[serde(default)]
+    pub graph_ms: u64,
+    #[serde(default)]
+    pub shard_ms: u64,
+    #[serde(default)]
+    pub emit_ms: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub incremental_tier: String,
     pub incremental_reused_files: usize,
     pub incremental_reparsed_files: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_stamps: Vec<FileStamp>,
 }
 
 /// Conversion health and token-efficiency report serialized in `meta.json`.
@@ -553,6 +1089,12 @@ pub struct BundleMetaFile {
     pub sanity: SanityReport,
 }
 
+/// Default maximum source file size (4 MiB) indexed by `chipsrc`.
+pub const DEFAULT_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Current schema version for `cache/manifest.json` (`IncrementalAstCache`).
+pub const CACHE_SCHEMA_VERSION: &str = "2.1.0";
+
 /// Configuration for repository conversion / indexing.
 #[derive(Debug, Clone)]
 pub struct ConvertConfig {
@@ -560,6 +1102,7 @@ pub struct ConvertConfig {
     pub output_dir: PathBuf,
     pub single_file: bool,
     pub force: bool,
+    pub auto_sync: bool,
     pub vendor_mode: VendorMode,
     pub max_file_bytes: u64,
 }
@@ -571,8 +1114,9 @@ impl ConvertConfig {
             output_dir,
             single_file: false,
             force: false,
+            auto_sync: false,
             vendor_mode: VendorMode::Active,
-            max_file_bytes: 4 * 1024 * 1024, // 4 MiB default per-file cap
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
         }
     }
 }
@@ -602,6 +1146,16 @@ pub struct InspectReport {
     pub total_lines: usize,
     pub languages: Vec<LanguageStat>,
     pub detected_layers: Vec<String>,
+    #[serde(default)]
+    pub has_blueprint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blueprint_error: Option<String>,
+    #[serde(default)]
+    pub unclassified_dirs: Vec<String>,
+    #[serde(default)]
+    pub detected_workspaces: Vec<String>,
+    #[serde(default)]
+    pub candidate_c_macros: Vec<String>,
 }
 
 /// Single search hit across TSV indexes or section shards.
@@ -624,4 +1178,6 @@ pub struct BundleStatusEntry {
     pub changed_files_count: usize,
     pub symbol_count: usize,
     pub section_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
