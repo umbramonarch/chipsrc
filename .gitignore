@@ -2,19 +2,32 @@
 /target/
 **/*.rs.bk
 
-# Python bytecode cache (hooks / scripts)
+# Python bytecode & test caches
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Generated output directories
+# Generated bundles, QA results, and sandboxes
 /output/
 /out/
+/qa/results/
+/qa/bundles/
+/qa/fixture-bundles/
+/qa/sandboxes/
+*.tmp
+.lock
 
-# Environment & IDE
+# Environment, local agent state & IDEs
 .env
+.env.*
 .vscode/
 .idea/
+.claude/
+.factory/
 *.swp
+*.swo
 *.log
 .DS_Store
 Thumbs.db
