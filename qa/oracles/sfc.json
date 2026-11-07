@@ -1,0 +1,35 @@
+{
+  "description": "Standalone JSX, Vue, and Svelte single-file component fixtures for the qa sfc suite: checked-in file names, golden component coordinates (1-based lines in the checked-in sources), and the mutation literals the suite prepends before renaming or shifting each component.",
+  "fixture": {
+    "name": "sfc",
+    "files": [
+      "QaBadge.svelte",
+      "QaCounter.jsx",
+      "QaPanel.vue"
+    ],
+    "components": {
+      "jsx": {
+        "file": "QaCounter.jsx",
+        "name": "QaCounter",
+        "start_line": 8,
+        "end_line": 17
+      },
+      "vue": {
+        "file": "QaPanel.vue",
+        "name": "QaPanel",
+        "start_line": 13,
+        "end_line": 13
+      },
+      "svelte": {
+        "file": "QaBadge.svelte",
+        "name": "QaBadge",
+        "start_line": 5,
+        "end_line": 7
+      }
+    },
+    "jsx_rename_suffix": "Qaval",
+    "jsx_prepend_line": "// qa-release-validation shift",
+    "sfc_prepend_line": "<!-- qa-release-validation shift -->",
+    "sfc_prepend_lines": 3
+  }
+}

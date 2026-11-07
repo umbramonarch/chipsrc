@@ -1,0 +1,44 @@
+{
+  "description": "Golden values for the qa concept suite: deterministic BM25 ranking, camelCase/snake_case sub-tokenization, automatic multi-token fallback, nonsense emptiness, determinism, latency, and limit handling on the chipsrc bundle.",
+  "repo": "chipsrc",
+  "queries": {
+    "ranking": "structural digest short circuit",
+    "ranking_name": "structural_digest",
+    "ranking_file": "crates/chipsrc-core/src/model.rs",
+    "ranking_top_n": 5,
+    "two_token": "structural digest",
+    "two_token_name": "structural_digest",
+    "camel": "vendor mode",
+    "camel_name": "VendorMode",
+    "camel_file": "crates/chipsrc-core/src/model.rs",
+    "fallback_graph": "tarjan strongly connected cycle detection",
+    "fallback_graph_name": "analyze_graph",
+    "fallback_graph_file": "crates/chipsrc-core/src/graph.rs",
+    "fallback_structural": "structural digest short circuit",
+    "fallback_structural_name": "structural_digest",
+    "fallback_structural_file": "crates/chipsrc-core/src/model.rs",
+    "nonsense_multi": "xyzzy plugh frobnicate",
+    "nonsense_single": "zzzznosuchtoken"
+  },
+  "budgets": {
+    "concept_compute_ms": 30,
+    "timing_runs": 3,
+    "spawn_runs": 3,
+    "determinism_runs": 5
+  },
+  "limits": {
+    "limit_three": 3,
+    "single": 1,
+    "join_limit": 50,
+    "default_max": 50
+  },
+  "hit_kinds": ["symbol", "type", "macro"],
+  "expected_index_tables": [
+    "calls.tsv",
+    "macros.tsv",
+    "sections.tsv",
+    "symbols.tsv",
+    "types.tsv",
+    "xref.tsv"
+  ]
+}
