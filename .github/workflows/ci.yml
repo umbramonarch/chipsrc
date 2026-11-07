@@ -33,5 +33,5 @@ jobs:
       - name: Run Clippy linter
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run workspace unit & integration tests
+      - name: Run workspace E2E integration tests
         run: cargo test --workspace --verbose
