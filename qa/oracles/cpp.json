@@ -1,0 +1,95 @@
+{
+  "description": "C++ coverage golden values for the qa cpp suite against checked-in fixture constructs.",
+  "fixture": {
+    "name": "cpp",
+    "files": [
+      "include/qa_shapes.h",
+      "include/plain_c.h",
+      "src/qa_shapes.cpp",
+      "src/plain_c.c"
+    ],
+    "header": "include/qa_shapes.h",
+    "implementation": "src/qa_shapes.cpp",
+    "plain_header": "include/plain_c.h",
+    "plain_implementation": "src/plain_c.c",
+    "total_files": 4,
+    "languages": {
+      "c": 2,
+      "cpp": 2
+    },
+    "namespace": "qa_demo",
+    "template_type": {
+      "name": "Box",
+      "kinds": ["class", "struct"],
+      "file": "include/qa_shapes.h",
+      "type_id_contains": "qa_demo::Box",
+      "start_line": 35,
+      "min_end_line": 53
+    },
+    "nested_type": {
+      "name": "Inner",
+      "kinds": ["class", "struct"],
+      "file": "include/qa_shapes.h",
+      "type_id_contains": "qa_demo::Outer::Inner",
+      "start_line": 19
+    },
+    "alias": {
+      "name": "ShapeId",
+      "kind": "typedef",
+      "file": "include/qa_shapes.h",
+      "start_line": 55
+    },
+    "plain_type": {
+      "name": "plain_c_sample_t",
+      "kind": "struct",
+      "file": "include/plain_c.h",
+      "start_line": 10
+    },
+    "ctor": {
+      "name": "Outer",
+      "kind": "ctor",
+      "file": "src/qa_shapes.cpp",
+      "start_line": 8,
+      "symbol_id_contains": "qa_demo::Outer::Outer"
+    },
+    "dtor": {
+      "name": "~Outer",
+      "file": "src/qa_shapes.cpp",
+      "start_line": 10,
+      "signature_contains": "~Outer"
+    },
+    "out_of_line": {
+      "name": "value",
+      "kind": "method",
+      "file": "src/qa_shapes.cpp",
+      "start_line": 12,
+      "symbol_id_contains": "Outer::value"
+    },
+    "nested_out_of_line": {
+      "name": "tag",
+      "kind": "method",
+      "file": "src/qa_shapes.cpp",
+      "start_line": 20,
+      "symbol_id_contains": "qa_demo::Outer::Inner::tag"
+    },
+    "operator": {
+      "file": "src/qa_shapes.cpp",
+      "start_line": 14,
+      "signature_contains": "operator+"
+    },
+    "template_operator": {
+      "name": "operator[]",
+      "file": "include/qa_shapes.h",
+      "start_line": 41,
+      "signature_prefix": "template<...>"
+    },
+    "plain_symbol": {
+      "name": "plain_c_compute",
+      "kind": "fn",
+      "file": "src/plain_c.c",
+      "start_line": 7
+    },
+    "comment_only_identifiers": ["Fake", "demo", "thing"],
+    "template_signature_max_len": 160
+  }
+}

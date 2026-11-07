@@ -1,0 +1,19 @@
+{
+  "fixture_name": "dup-content",
+  "alpha_file": "alpha/mod.py",
+  "beta_file": "beta/mod.py",
+  "gamma_file": "gamma/mod.py",
+  "delta_file": "delta/mod.py",
+  "initial_modules": [
+    "alpha",
+    "beta"
+  ],
+  "deleted_module": "gamma",
+  "probe_symbol": "duplicate_probe",
+  "renamed_symbol": "alpha_only_probe",
+  "type_name": "DuplicateShape",
+  "expected_initial_files": 2,
+  "expected_added_files": 4,
+  "expected_reparsed_on_edit": 1,
+  "expected_reused_on_edit": 1
+}

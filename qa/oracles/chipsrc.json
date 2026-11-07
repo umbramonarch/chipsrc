@@ -1,0 +1,43 @@
+{
+  "repo": "chipsrc",
+  "sym_query": "convert_repo",
+  "sym_file": "crates/chipsrc-core/src/lib.rs",
+  "sym_sig_contains": "ConvertConfig",
+  "type_query": "ConvertConfig",
+  "type_field_contains": "vendor_mode",
+  "expected_callee": "scan_repository",
+  "caller_expected": "convert_repo",
+  "macro_query": "CACHE_SCHEMA_VERSION",
+  "macro_value_contains": "2.1.0",
+  "xref_query": "ConvertConfig",
+  "inline_source_symbol": "ensure_repo",
+  "inline_source_contains": "convert_repo",
+  "section_query": "scanner",
+  "section_contains": "scan_repository",
+  "search_query": "ConvertConfig",
+  "search_limit": 5,
+  "search_kinds": [
+    "source",
+    "symbols",
+    "types",
+    "calls",
+    "macros",
+    "xref",
+    "sections"
+  ],
+  "regex_pattern": "fn\\s+convert_repo",
+  "regex_min_hits": 1,
+  "max_limit_probe": 1,
+  "limit_probe_queries": [
+    ["sym", "convert"],
+    ["callers", "scan_repository"],
+    ["callees", "convert_repo"],
+    ["type", "Config"],
+    ["search", "ConvertConfig"]
+  ],
+  "unknown_symbol": "qa_no_such_symbol_038d",
+  "fixture_bundles": ["cpp", "dup-content", "sfc"],
+  "negative_limit_arg": "-1",
+  "literal_fallback_query": "[",
+  "literal_fallback_limit": 1
+}
