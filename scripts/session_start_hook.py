@@ -1,77 +1,14 @@
 #!/usr/bin/env python3
-"""SessionStart hook for the chipsrc Claude Code plugin.
-
-Scans the workspace in <15ms for indexed chipsrc codebase bundles (`output/*/meta.json`)
-and source repositories, optionally refreshing existing bundles via `chipsrc ensure`
-and injecting a compact orientation summary into the session context so the agent
-immediately knows which codebase bundles and 1-turn code intelligence commands are ready.
-"""
-
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 
-IGNORED_DIRS = {
-    ".git",
-    "target",
-    "node_modules",
-    "bin",
-    "output",
-    "dist",
-    "build",
-    ".claude",
-    ".factory",
-    ".venv",
-    "venv",
-}
-
-SOURCE_EXTENSIONS = {
-    ".c",
-    ".h",
-    ".cc",
-    ".cpp",
-    ".cxx",
-    ".hpp",
-    ".hh",
-    ".hxx",
-    ".inl",
-    ".rs",
-    ".py",
-    ".pyi",
-    ".ts",
-    ".mts",
-    ".cts",
-    ".tsx",
-    ".js",
-    ".mjs",
-    ".cjs",
-    ".jsx",
-}
-
-
-def find_chipsrc_binary(project_dir: Path) -> str | None:
-    env_bin = os.environ.get("CHIPSRC_BIN")
-    if env_bin and Path(env_bin).is_file():
-        return env_bin
-
-    which_bin = shutil.which("chipsrc")
-    if which_bin:
-        return which_bin
-
-    plugin_root = Path(os.environ.get("CLAUDE_PLUGIN_ROOT", project_dir)).resolve()
-    exe_names = ["chipsrc.exe", "chipsrc"] if os.name == "nt" else ["chipsrc"]
-    for base in (project_dir, plugin_root):
-        for profile in ("release", "debug"):
-            for exe in exe_names:
-                candidate = base / "target" / profile / exe
-                if candidate.is_file():
-                    return str(candidate)
-    return None
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _hook_common import IGNORED_DIRS, SOURCE_EXTENSIONS, find_chipsrc_binary
 
 
 def find_bundles(root: Path) -> list[dict]:
@@ -148,31 +85,17 @@ def refresh_existing_bundles(project_dir: Path, bundles: list[dict]) -> None:
     binary = find_chipsrc_binary(project_dir)
     if not binary or not bundles:
         return
-    output_root = project_dir / "output"
-    for b in bundles:
-        source_root = b.get("source_root") or str(project_dir)
-        vendor_mode = b.get("vendor_mode") or "active"
-        if not Path(source_root).is_dir():
-            continue
-        try:
-            subprocess.run(
-                [
-                    binary,
-                    "ensure",
-                    str(source_root),
-                    "-o",
-                    str(output_root),
-                    "--vendor-mode",
-                    str(vendor_mode),
-                ],
-                cwd=str(project_dir),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-                check=False,
-            )
-        except Exception:
-            continue
+    try:
+        subprocess.run(
+            [binary, "status", str(project_dir), "--sync"],
+            cwd=str(project_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return
 
 
 def main() -> int:
@@ -187,21 +110,30 @@ def main() -> int:
         return 0
 
     lines: list[str] = ["[chipsrc] Source Code & Hardware Cross-Reference Intelligence active:"]
+    has_blueprint = (project_dir / ".chipsrc.json").is_file()
     if bundles:
         summary = ", ".join(
             f"`{b['path']}` ({b['files']} files, {b['symbols']} syms, {b['types']} types, "
             f"{b['calls']} calls, {b['macros']} macros/MMIO, sanity {b['score']}/100)"
             for b in bundles
         )
-        lines.append(f"- Indexed codebase bundles ready (auto-synced via `cache.json`): {summary}")
+        lines.append(f"- Indexed codebase bundles ready (auto-synced via `cache/`): {summary}")
     else:
-        lines.append(
-            "- Unindexed source repository detected (run `chipsrc ensure . -o output` to build the Agent Codebase Bundle)."
-        )
+        if has_blueprint:
+            lines.append(
+                "- Unindexed source repository with `.chipsrc.json` blueprint detected "
+                "(run `chipsrc ensure . -o output` to build the Agent Codebase Bundle)."
+            )
+        else:
+            lines.append(
+                "- Unindexed source repository detected: run `chipsrc inspect .` first; if an Onboarding Digest appears, "
+                "write a root `.chipsrc.json` blueprint once, then run `chipsrc ensure . -o output`."
+            )
 
     lines.append(
         "- Prefer 1-turn CLI queries over blind Grep/Read loops (all queries auto-refresh changed files): "
         "`chipsrc sym <name> [-s]`, `chipsrc callers <fn>`, `chipsrc callees <fn>`, "
+        "`chipsrc path <from> <to>`, `chipsrc impact <fn>`, "
         "`chipsrc type <name> [-s]`, `chipsrc macro|reg|mmio <name|0xHEX>`, "
         "`chipsrc xref <symbol>`, `chipsrc section [query] [-s]`, `chipsrc search <pattern>`."
     )
